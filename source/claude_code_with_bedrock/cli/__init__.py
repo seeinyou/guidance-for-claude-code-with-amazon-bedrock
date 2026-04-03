@@ -28,6 +28,8 @@ from .commands.quota import (
     QuotaListCommand,
     QuotaSetDefaultCommand,
     QuotaSetGroupCommand,
+    QuotaSetOrgCommand,
+    QuotaSetPricingCommand,
     QuotaSetUserCommand,
     QuotaShowCommand,
     QuotaUnblockCommand,
@@ -77,6 +79,8 @@ def create_application() -> Application:
     application.add(QuotaUnblockCommand())
     application.add(QuotaExportCommand())
     application.add(QuotaImportCommand())
+    application.add(QuotaSetOrgCommand())
+    application.add(QuotaSetPricingCommand())
 
     return application
 

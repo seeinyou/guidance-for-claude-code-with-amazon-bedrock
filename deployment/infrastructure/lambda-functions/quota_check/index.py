@@ -68,6 +68,11 @@ def lambda_handler(event, context):
                 "message": "JWT token does not contain email claim" + (" - quota check skipped" if allow_missing_email else " - access denied for security")
             })
 
+        # 0. Check org-wide limits first (blocks ALL users if exceeded)
+        org_block = check_org_limits()
+        if org_block:
+            return build_response(200, org_block)
+
         # 1. Resolve the effective quota policy for this user
         policy = resolve_quota_for_user(email, groups)
 
@@ -121,12 +126,21 @@ def lambda_handler(event, context):
                 "message": "Access granted - enforcement mode is alert-only"
             })
 
-        # 5. Check limits (monthly, daily)
+        # 5. Check limits (monthly, daily — tokens and cost)
         monthly_tokens = usage.get("total_tokens", 0)
         daily_tokens = usage.get("daily_tokens", 0)
+        estimated_cost = usage.get("estimated_cost", 0)
+        daily_cost = usage.get("daily_cost", 0)
 
         monthly_limit = policy.get("monthly_token_limit", 0)
         daily_limit = policy.get("daily_token_limit")
+        monthly_cost_limit = policy.get("monthly_cost_limit")
+        daily_cost_limit = policy.get("daily_cost_limit")
+
+        policy_ref = {
+            "type": policy.get("policy_type"),
+            "identifier": policy.get("identifier")
+        }
 
         # Check monthly token limit
         if monthly_limit > 0 and monthly_tokens >= monthly_limit:
@@ -135,12 +149,21 @@ def lambda_handler(event, context):
                 "reason": "monthly_exceeded",
                 "enforcement_mode": enforcement_mode,
                 "usage": usage_summary,
-                "policy": {
-                    "type": policy.get("policy_type"),
-                    "identifier": policy.get("identifier")
-                },
+                "policy": policy_ref,
                 "unblock_status": {"is_unblocked": False},
                 "message": f"Monthly quota exceeded: {int(monthly_tokens):,} / {int(monthly_limit):,} tokens ({monthly_tokens/monthly_limit*100:.1f}%). Contact your administrator for assistance."
+            })
+
+        # Check monthly cost limit
+        if monthly_cost_limit and monthly_cost_limit > 0 and estimated_cost >= monthly_cost_limit:
+            return build_response(200, {
+                "allowed": False,
+                "reason": "monthly_cost_exceeded",
+                "enforcement_mode": enforcement_mode,
+                "usage": usage_summary,
+                "policy": policy_ref,
+                "unblock_status": {"is_unblocked": False},
+                "message": f"Monthly cost quota exceeded: ${estimated_cost:,.2f} / ${monthly_cost_limit:,.2f} ({estimated_cost/monthly_cost_limit*100:.1f}%). Contact your administrator for assistance."
             })
 
         # Check daily token limit (if configured)
@@ -150,12 +173,21 @@ def lambda_handler(event, context):
                 "reason": "daily_exceeded",
                 "enforcement_mode": enforcement_mode,
                 "usage": usage_summary,
-                "policy": {
-                    "type": policy.get("policy_type"),
-                    "identifier": policy.get("identifier")
-                },
+                "policy": policy_ref,
                 "unblock_status": {"is_unblocked": False},
                 "message": f"Daily quota exceeded: {int(daily_tokens):,} / {int(daily_limit):,} tokens ({daily_tokens/daily_limit*100:.1f}%). Quota resets at UTC midnight."
+            })
+
+        # Check daily cost limit
+        if daily_cost_limit and daily_cost_limit > 0 and daily_cost >= daily_cost_limit:
+            return build_response(200, {
+                "allowed": False,
+                "reason": "daily_cost_exceeded",
+                "enforcement_mode": enforcement_mode,
+                "usage": usage_summary,
+                "policy": policy_ref,
+                "unblock_status": {"is_unblocked": False},
+                "message": f"Daily cost quota exceeded: ${daily_cost:,.2f} / ${daily_cost_limit:,.2f} ({daily_cost/daily_cost_limit*100:.1f}%). Quota resets at UTC midnight."
             })
 
         # All checks passed - access allowed
@@ -297,6 +329,8 @@ def get_policy(policy_type: str, identifier: str) -> dict | None:
             "identifier": item.get("identifier"),
             "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
             "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
+            "monthly_cost_limit": float(item["monthly_cost_limit"]) if item.get("monthly_cost_limit") else None,
+            "daily_cost_limit": float(item["daily_cost_limit"]) if item.get("daily_cost_limit") else None,
             "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
             "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
             "enforcement_mode": item.get("enforcement_mode", "alert"),
@@ -359,16 +393,20 @@ def get_user_usage(email: str) -> dict:
                 "daily_date": current_date,
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "cache_tokens": 0
+                "cache_tokens": 0,
+                "estimated_cost": 0.0,
+                "daily_cost": 0.0,
             }
 
         # Check if daily tokens need to be reset (different day)
         daily_date = item.get("daily_date")
         daily_tokens = float(item.get("daily_tokens", 0))
+        daily_cost = float(item.get("daily_cost", 0))
 
         if daily_date != current_date:
-            # Day has changed, daily tokens should be 0 for the new day
+            # Day has changed, daily tokens and cost should be 0 for the new day
             daily_tokens = 0
+            daily_cost = 0.0
 
         return {
             "total_tokens": float(item.get("total_tokens", 0)),
@@ -376,7 +414,9 @@ def get_user_usage(email: str) -> dict:
             "daily_date": daily_date,
             "input_tokens": float(item.get("input_tokens", 0)),
             "output_tokens": float(item.get("output_tokens", 0)),
-            "cache_tokens": float(item.get("cache_tokens", 0))
+            "cache_tokens": float(item.get("cache_tokens", 0)),
+            "estimated_cost": float(item.get("estimated_cost", 0)),
+            "daily_cost": daily_cost,
         }
     except Exception as e:
         print(f"Error getting usage for {email}: {e}")
@@ -386,28 +426,44 @@ def get_user_usage(email: str) -> dict:
             "daily_date": current_date,
             "input_tokens": 0,
             "output_tokens": 0,
-            "cache_tokens": 0
+            "cache_tokens": 0,
+            "estimated_cost": 0.0,
+            "daily_cost": 0.0,
         }
 
 
 def build_usage_summary(usage: dict, policy: dict) -> dict:
-    """Build usage summary with percentages."""
+    """Build usage summary with percentages including cost data."""
     monthly_tokens = usage.get("total_tokens", 0)
     daily_tokens = usage.get("daily_tokens", 0)
+    estimated_cost = usage.get("estimated_cost", 0)
+    daily_cost = usage.get("daily_cost", 0)
 
     monthly_limit = policy.get("monthly_token_limit", 0)
     daily_limit = policy.get("daily_token_limit")
+    monthly_cost_limit = policy.get("monthly_cost_limit")
+    daily_cost_limit = policy.get("daily_cost_limit")
 
     summary = {
         "monthly_tokens": int(monthly_tokens),
         "monthly_limit": monthly_limit,
         "monthly_percent": round(monthly_tokens / monthly_limit * 100, 1) if monthly_limit > 0 else 0,
-        "daily_tokens": int(daily_tokens)
+        "daily_tokens": int(daily_tokens),
+        "estimated_cost": round(estimated_cost, 2),
+        "daily_cost": round(daily_cost, 2),
     }
 
     if daily_limit:
         summary["daily_limit"] = daily_limit
         summary["daily_percent"] = round(daily_tokens / daily_limit * 100, 1) if daily_limit > 0 else 0
+
+    if monthly_cost_limit:
+        summary["monthly_cost_limit"] = monthly_cost_limit
+        summary["monthly_cost_percent"] = round(estimated_cost / monthly_cost_limit * 100, 1) if monthly_cost_limit > 0 else 0
+
+    if daily_cost_limit:
+        summary["daily_cost_limit"] = daily_cost_limit
+        summary["daily_cost_percent"] = round(daily_cost / daily_cost_limit * 100, 1) if daily_cost_limit > 0 else 0
 
     return summary
 
@@ -416,3 +472,84 @@ def get_user_usage_summary(email: str, policy: dict) -> dict:
     """Get user usage and build summary in one call."""
     usage = get_user_usage(email)
     return build_usage_summary(usage, policy)
+
+
+# ---- Organization-wide quota check ----
+
+import time
+
+_org_policy_cache = None
+_org_policy_cache_time = 0
+ORG_POLICY_CACHE_TTL = 60  # seconds
+
+
+def get_org_policy() -> dict | None:
+    """Get org policy with 60s in-memory cache."""
+    global _org_policy_cache, _org_policy_cache_time
+    now = time.time()
+    if _org_policy_cache is not None and (now - _org_policy_cache_time) < ORG_POLICY_CACHE_TTL:
+        return _org_policy_cache
+
+    policy = get_policy("org", "global")
+    _org_policy_cache = policy
+    _org_policy_cache_time = now
+    return policy
+
+
+def get_org_usage() -> dict:
+    """Get org aggregate usage for current month."""
+    now = datetime.now(timezone.utc)
+    sk = f"MONTH#{now.strftime('%Y-%m')}"
+    try:
+        response = quota_table.get_item(Key={"pk": "ORG#global", "sk": sk})
+        item = response.get("Item")
+        if not item:
+            return {"total_tokens": 0, "estimated_cost": 0.0}
+        return {
+            "total_tokens": float(item.get("total_tokens", 0)),
+            "estimated_cost": float(item.get("estimated_cost", 0)),
+            "user_count": int(item.get("user_count", 0)),
+        }
+    except Exception as e:
+        print(f"Error getting org usage: {e}")
+        return {"total_tokens": 0, "estimated_cost": 0.0}
+
+
+def check_org_limits() -> dict | None:
+    """Check org-wide limits. Returns block response dict if exceeded, None if OK."""
+    org_policy = get_org_policy()
+    if not org_policy or not org_policy.get("enabled", True):
+        return None
+
+    if org_policy.get("enforcement_mode", "alert") != "block":
+        return None
+
+    org_usage = get_org_usage()
+    total_tokens = org_usage.get("total_tokens", 0)
+    estimated_cost = org_usage.get("estimated_cost", 0)
+    monthly_limit = org_policy.get("monthly_token_limit", 0)
+    monthly_cost_limit = org_policy.get("monthly_cost_limit")
+
+    if monthly_limit > 0 and total_tokens >= monthly_limit:
+        return {
+            "allowed": False,
+            "reason": "org_monthly_tokens_exceeded",
+            "enforcement_mode": "block",
+            "usage": {"org_total_tokens": int(total_tokens), "org_monthly_limit": monthly_limit},
+            "policy": {"type": "org", "identifier": "global"},
+            "unblock_status": None,
+            "message": f"Organization-wide monthly token quota exceeded: {int(total_tokens):,} / {int(monthly_limit):,} tokens. All users are blocked. Contact your administrator."
+        }
+
+    if monthly_cost_limit and monthly_cost_limit > 0 and estimated_cost >= monthly_cost_limit:
+        return {
+            "allowed": False,
+            "reason": "org_monthly_cost_exceeded",
+            "enforcement_mode": "block",
+            "usage": {"org_estimated_cost": round(estimated_cost, 2), "org_monthly_cost_limit": monthly_cost_limit},
+            "policy": {"type": "org", "identifier": "global"},
+            "unblock_status": None,
+            "message": f"Organization-wide monthly cost quota exceeded: ${estimated_cost:,.2f} / ${monthly_cost_limit:,.2f}. All users are blocked. Contact your administrator."
+        }
+
+    return None

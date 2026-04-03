@@ -65,6 +65,11 @@ class Profile:
     quota_fail_mode: str = "open"  # "open" (allow on error) or "closed" (deny on error)
     quota_check_interval: int = 30  # Minutes between quota re-checks (0 = every request)
 
+    # Admin panel configuration (for landing-page distribution with quota monitoring)
+    admin_panel_enabled: bool = False  # Enable admin quota management UI on landing page
+    admin_emails: str = ""  # Comma-separated admin email addresses
+    admin_group_name: str = ""  # IdP group name for admin access
+
     # Federation configuration
     federation_type: str = "cognito"  # "cognito" or "direct"
     federated_role_arn: str | None = None  # ARN for Direct STS federation

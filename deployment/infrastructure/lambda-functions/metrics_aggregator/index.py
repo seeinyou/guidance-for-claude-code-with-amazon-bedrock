@@ -20,6 +20,7 @@ LOG_GROUP = os.environ.get("METRICS_LOG_GROUP", "/aws/lambda/bedrock-claude-logs
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "ClaudeCodeMetrics")
 QUOTA_TABLE = os.environ.get("QUOTA_TABLE")  # Optional - only set if quota monitoring is enabled
 POLICIES_TABLE = os.environ.get("POLICIES_TABLE")  # Optional - for fine-grained quotas
+PRICING_TABLE = os.environ.get("PRICING_TABLE")  # Optional - for cost-based quotas
 ENABLE_FINEGRAINED_QUOTAS = os.environ.get("ENABLE_FINEGRAINED_QUOTAS", "false").lower() == "true"
 AGGREGATION_WINDOW = 5  # minutes
 
@@ -27,6 +28,78 @@ AGGREGATION_WINDOW = 5  # minutes
 table = dynamodb.Table(METRICS_TABLE)
 quota_table = dynamodb.Table(QUOTA_TABLE) if QUOTA_TABLE else None
 policies_table = dynamodb.Table(POLICIES_TABLE) if POLICIES_TABLE else None
+pricing_table = dynamodb.Table(PRICING_TABLE) if PRICING_TABLE else None
+
+# In-memory pricing cache (refreshed each invocation)
+_pricing_cache = {}
+
+
+def load_pricing_cache():
+    """Load all model pricing from DynamoDB into memory for this invocation."""
+    global _pricing_cache
+    _pricing_cache = {}
+
+    if not pricing_table:
+        return
+
+    try:
+        response = pricing_table.scan()
+        for item in response.get("Items", []):
+            model_id = item.get("model_id")
+            if model_id:
+                _pricing_cache[model_id] = {
+                    "input_per_1m": Decimal(str(item.get("input_per_1m", "0"))),
+                    "output_per_1m": Decimal(str(item.get("output_per_1m", "0"))),
+                    "cache_read_per_1m": Decimal(str(item.get("cache_read_per_1m", "0"))),
+                    "cache_write_per_1m": Decimal(str(item.get("cache_write_per_1m", "0"))),
+                }
+
+        # Handle pagination
+        while "LastEvaluatedKey" in response:
+            response = pricing_table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            for item in response.get("Items", []):
+                model_id = item.get("model_id")
+                if model_id:
+                    _pricing_cache[model_id] = {
+                        "input_per_1m": Decimal(str(item.get("input_per_1m", "0"))),
+                        "output_per_1m": Decimal(str(item.get("output_per_1m", "0"))),
+                        "cache_read_per_1m": Decimal(str(item.get("cache_read_per_1m", "0"))),
+                        "cache_write_per_1m": Decimal(str(item.get("cache_write_per_1m", "0"))),
+                    }
+
+        print(f"Loaded pricing for {len(_pricing_cache)} models")
+    except Exception as e:
+        print(f"Error loading pricing cache: {str(e)}")
+
+
+def get_model_pricing(model_id):
+    """Get pricing for a model, falling back to DEFAULT entry."""
+    if model_id in _pricing_cache:
+        return _pricing_cache[model_id]
+
+    # Try partial match (strip version suffix, cross-region prefix)
+    for cached_id in _pricing_cache:
+        if cached_id in model_id or model_id in cached_id:
+            return _pricing_cache[cached_id]
+
+    # Fall back to DEFAULT
+    return _pricing_cache.get("DEFAULT")
+
+
+def calculate_cost(input_tokens, output_tokens, cache_tokens, model_id=None):
+    """Calculate estimated cost from token counts and model pricing."""
+    pricing = get_model_pricing(model_id) if model_id else _pricing_cache.get("DEFAULT")
+
+    if not pricing:
+        return Decimal("0")
+
+    cost = (
+        Decimal(str(input_tokens)) * pricing["input_per_1m"]
+        + Decimal(str(output_tokens)) * pricing["output_per_1m"]
+        + Decimal(str(cache_tokens)) * pricing["cache_read_per_1m"]
+    ) / Decimal("1000000")
+
+    return cost.quantize(Decimal("0.000001"))
 
 
 def lambda_handler(event, context):
@@ -34,6 +107,10 @@ def lambda_handler(event, context):
     Aggregate logs from the last 5 minutes and publish to CloudWatch Metrics.
     """
     print(f"Starting metrics aggregation for log group: {LOG_GROUP}")
+
+    # Load pricing data for cost calculation
+    if pricing_table:
+        load_pricing_cache()
 
     # Calculate time window
     end_time = datetime.now(timezone.utc)
@@ -858,6 +935,10 @@ def update_quota_table(timestamp, user_details):
             if tokens_to_add <= 0:
                 continue
 
+            # Calculate cost for this window's tokens
+            model_id = user.get("model")
+            window_cost = calculate_cost(input_tokens, output_tokens, cache_tokens, model_id)
+
             pk = f"USER#{user_email}"
             sk = f"MONTH#{current_month}"
 
@@ -869,12 +950,10 @@ def update_quota_table(timestamp, user_details):
 
                 # Determine if we need to reset daily tokens
                 if existing_daily_date != current_date:
-                    # New day - reset daily tokens
-                    daily_tokens_expr = ":tokens"
+                    # New day - reset daily tokens and daily cost
                     daily_reset = True
                 else:
                     # Same day - add to existing
-                    daily_tokens_expr = "daily_tokens + :tokens"
                     daily_reset = False
 
                 # Build update expression with all enhanced fields
@@ -882,11 +961,13 @@ def update_quota_table(timestamp, user_details):
                     ADD total_tokens :tokens,
                         input_tokens :input_tokens,
                         output_tokens :output_tokens,
-                        cache_tokens :cache_tokens
+                        cache_tokens :cache_tokens,
+                        estimated_cost :cost
                     SET last_updated = :updated,
                         #ttl = :ttl,
                         email = :email,
-                        daily_date = :daily_date
+                        daily_date = :daily_date,
+                        first_seen = if_not_exists(first_seen, :updated)
                 """
 
                 expr_attr_values = {
@@ -894,6 +975,7 @@ def update_quota_table(timestamp, user_details):
                     ":input_tokens": Decimal(str(input_tokens)),
                     ":output_tokens": Decimal(str(output_tokens)),
                     ":cache_tokens": Decimal(str(cache_tokens)),
+                    ":cost": window_cost,
                     ":updated": timestamp.isoformat().replace("+00:00", "Z"),
                     ":ttl": ttl,
                     ":email": user_email,
@@ -902,13 +984,13 @@ def update_quota_table(timestamp, user_details):
 
                 expr_attr_names = {"#ttl": "ttl"}
 
-                # Handle daily tokens based on date change
+                # Handle daily tokens and cost based on date change
                 if daily_reset:
-                    update_expr += ", daily_tokens = :tokens"
+                    update_expr += ", daily_tokens = :tokens, daily_cost = :cost, daily_cost_date = :daily_date"
                 else:
                     update_expr = update_expr.replace(
                         "ADD total_tokens :tokens",
-                        "ADD total_tokens :tokens, daily_tokens :tokens"
+                        "ADD total_tokens :tokens, daily_tokens :tokens, daily_cost :cost"
                     )
 
                 # Add groups if available (for fine-grained quotas)
@@ -925,12 +1007,72 @@ def update_quota_table(timestamp, user_details):
                 )
 
                 daily_note = " (daily reset)" if daily_reset else ""
+                cost_note = f", +${window_cost}" if window_cost > 0 else ""
                 print(
-                    f"Updated quota for {user_email}: +{tokens_to_add:,.0f} tokens for {current_month}{daily_note}"
+                    f"Updated quota for {user_email}: +{tokens_to_add:,.0f} tokens{cost_note} for {current_month}{daily_note}"
                 )
 
             except Exception as e:
                 print(f"Error updating quota for {user_email}: {str(e)}")
 
+        # Update org-wide aggregate after processing all users
+        update_org_aggregate(current_month, ttl, timestamp)
+
     except Exception as e:
         print(f"Error in update_quota_table: {str(e)}")
+
+
+def update_org_aggregate(current_month, ttl, timestamp):
+    """
+    Sum all per-user usage for the current month into a single ORG#global record.
+    This powers organization-wide quota limits.
+    """
+    try:
+        sk = f"MONTH#{current_month}"
+        total_tokens = Decimal("0")
+        total_input = Decimal("0")
+        total_output = Decimal("0")
+        total_cache = Decimal("0")
+        total_cost = Decimal("0")
+        user_count = 0
+
+        # Scan for all USER# records for this month
+        scan_kwargs = {
+            "FilterExpression": "sk = :sk AND begins_with(pk, :prefix)",
+            "ExpressionAttributeValues": {":sk": sk, ":prefix": "USER#"},
+        }
+        while True:
+            response = quota_table.scan(**scan_kwargs)
+            for item in response.get("Items", []):
+                total_tokens += Decimal(str(item.get("total_tokens", 0)))
+                total_input += Decimal(str(item.get("input_tokens", 0)))
+                total_output += Decimal(str(item.get("output_tokens", 0)))
+                total_cache += Decimal(str(item.get("cache_tokens", 0)))
+                total_cost += Decimal(str(item.get("estimated_cost", "0")))
+                user_count += 1
+
+            if "LastEvaluatedKey" in response:
+                scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+            else:
+                break
+
+        # Write the org aggregate record
+        quota_table.put_item(
+            Item={
+                "pk": "ORG#global",
+                "sk": sk,
+                "total_tokens": total_tokens,
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+                "cache_tokens": total_cache,
+                "estimated_cost": total_cost,
+                "user_count": user_count,
+                "last_updated": timestamp.isoformat().replace("+00:00", "Z"),
+                "ttl": ttl,
+            }
+        )
+        cost_note = f", ${total_cost}" if total_cost > 0 else ""
+        print(f"Updated org aggregate: {total_tokens:,.0f} tokens{cost_note} across {user_count} users for {current_month}")
+
+    except Exception as e:
+        print(f"Error updating org aggregate: {str(e)}")

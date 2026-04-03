@@ -7,6 +7,7 @@ import csv
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import boto3
@@ -127,6 +128,34 @@ def _parse_tokens(value: str) -> int:
     return int(value)
 
 
+def _parse_cost(value: str) -> Decimal:
+    """Parse cost value, stripping optional $ prefix.
+
+    Args:
+        value: Cost value string (e.g., "100", "$100", "10.50").
+
+    Returns:
+        Decimal cost value.
+
+    Raises:
+        ValueError: If value cannot be parsed.
+    """
+    value = value.strip().lstrip("$")
+    return Decimal(value)
+
+
+def _print_policy_summary(console: Console, policy) -> None:
+    """Print policy summary after create/update."""
+    console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
+    if policy.daily_token_limit:
+        console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
+    if policy.monthly_cost_limit is not None:
+        console.print(f"  Monthly cost limit: ${policy.monthly_cost_limit}")
+    if policy.daily_cost_limit is not None:
+        console.print(f"  Daily cost limit: ${policy.daily_cost_limit}")
+    console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+
+
 class QuotaSetUserCommand(Command):
     """Set quota policy for a specific user."""
 
@@ -141,6 +170,8 @@ class QuotaSetUserCommand(Command):
         option("profile", description="Configuration profile", flag=False, default=None),
         option("monthly-limit", "m", description="Monthly token limit (e.g., 300M, 1B)", flag=False),
         option("daily-limit", "d", description="Daily token limit (e.g., 15M)", flag=False),
+        option("monthly-cost-limit", None, description="Monthly cost limit in dollars (e.g., 100, $100)", flag=False),
+        option("daily-cost-limit", None, description="Daily cost limit in dollars (e.g., 10, $10)", flag=False),
         option("enforcement", "e", description="Enforcement mode: 'alert' (default) or 'block'", flag=False),
         option("disabled", description="Create policy in disabled state", flag=True),
     ]
@@ -184,6 +215,25 @@ class QuotaSetUserCommand(Command):
                 console.print(f"[red]Invalid daily limit: {daily_limit_str}[/red]")
                 return 1
 
+        # Parse cost limits
+        monthly_cost_limit = None
+        monthly_cost_str = self.option("monthly-cost-limit")
+        if monthly_cost_str:
+            try:
+                monthly_cost_limit = _parse_cost(monthly_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid monthly cost limit: {monthly_cost_str}[/red]")
+                return 1
+
+        daily_cost_limit = None
+        daily_cost_str = self.option("daily-cost-limit")
+        if daily_cost_str:
+            try:
+                daily_cost_limit = _parse_cost(daily_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid daily cost limit: {daily_cost_str}[/red]")
+                return 1
+
         # Parse enforcement mode
         enforcement_mode = EnforcementMode.ALERT
         enforcement_str = self.option("enforcement")
@@ -204,14 +254,13 @@ class QuotaSetUserCommand(Command):
                 identifier=email,
                 monthly_token_limit=monthly_limit,
                 daily_token_limit=daily_limit,
+                monthly_cost_limit=monthly_cost_limit,
+                daily_cost_limit=daily_cost_limit,
                 enforcement_mode=enforcement_mode,
                 enabled=enabled,
             )
             console.print(f"[green]Created user quota policy for {email}[/green]")
-            console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
-            if policy.daily_token_limit:
-                console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
-            console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+            _print_policy_summary(console, policy)
             return 0
 
         except PolicyAlreadyExistsError:
@@ -222,14 +271,13 @@ class QuotaSetUserCommand(Command):
                     identifier=email,
                     monthly_token_limit=monthly_limit,
                     daily_token_limit=daily_limit,
+                    monthly_cost_limit=monthly_cost_limit,
+                    daily_cost_limit=daily_cost_limit,
                     enforcement_mode=enforcement_mode,
                     enabled=enabled,
                 )
                 console.print(f"[yellow]Updated existing user quota policy for {email}[/yellow]")
-                console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
-                if policy.daily_token_limit:
-                    console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
-                console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+                _print_policy_summary(console, policy)
                 return 0
             except QuotaPolicyError as e:
                 console.print(f"[red]Failed to update policy: {e}[/red]")
@@ -254,6 +302,8 @@ class QuotaSetGroupCommand(Command):
         option("profile", description="Configuration profile", flag=False, default=None),
         option("monthly-limit", "m", description="Monthly token limit (e.g., 300M, 1B)", flag=False),
         option("daily-limit", "d", description="Daily token limit (e.g., 15M)", flag=False),
+        option("monthly-cost-limit", None, description="Monthly cost limit in dollars (e.g., 100, $100)", flag=False),
+        option("daily-cost-limit", None, description="Daily cost limit in dollars (e.g., 10, $10)", flag=False),
         option("enforcement", "e", description="Enforcement mode: 'alert' (default) or 'block'", flag=False),
         option("disabled", description="Create policy in disabled state", flag=True),
     ]
@@ -291,6 +341,25 @@ class QuotaSetGroupCommand(Command):
                 console.print(f"[red]Invalid daily limit: {daily_limit_str}[/red]")
                 return 1
 
+        # Parse cost limits
+        monthly_cost_limit = None
+        monthly_cost_str = self.option("monthly-cost-limit")
+        if monthly_cost_str:
+            try:
+                monthly_cost_limit = _parse_cost(monthly_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid monthly cost limit: {monthly_cost_str}[/red]")
+                return 1
+
+        daily_cost_limit = None
+        daily_cost_str = self.option("daily-cost-limit")
+        if daily_cost_str:
+            try:
+                daily_cost_limit = _parse_cost(daily_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid daily cost limit: {daily_cost_str}[/red]")
+                return 1
+
         # Parse enforcement mode
         enforcement_mode = EnforcementMode.ALERT
         enforcement_str = self.option("enforcement")
@@ -311,14 +380,13 @@ class QuotaSetGroupCommand(Command):
                 identifier=group,
                 monthly_token_limit=monthly_limit,
                 daily_token_limit=daily_limit,
+                monthly_cost_limit=monthly_cost_limit,
+                daily_cost_limit=daily_cost_limit,
                 enforcement_mode=enforcement_mode,
                 enabled=enabled,
             )
             console.print(f"[green]Created group quota policy for '{group}'[/green]")
-            console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
-            if policy.daily_token_limit:
-                console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
-            console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+            _print_policy_summary(console, policy)
             return 0
 
         except PolicyAlreadyExistsError:
@@ -329,14 +397,13 @@ class QuotaSetGroupCommand(Command):
                     identifier=group,
                     monthly_token_limit=monthly_limit,
                     daily_token_limit=daily_limit,
+                    monthly_cost_limit=monthly_cost_limit,
+                    daily_cost_limit=daily_cost_limit,
                     enforcement_mode=enforcement_mode,
                     enabled=enabled,
                 )
                 console.print(f"[yellow]Updated existing group quota policy for '{group}'[/yellow]")
-                console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
-                if policy.daily_token_limit:
-                    console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
-                console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+                _print_policy_summary(console, policy)
                 return 0
             except QuotaPolicyError as e:
                 console.print(f"[red]Failed to update policy: {e}[/red]")
@@ -357,6 +424,8 @@ class QuotaSetDefaultCommand(Command):
         option("profile", description="Configuration profile", flag=False, default=None),
         option("monthly-limit", "m", description="Monthly token limit (e.g., 300M, 1B)", flag=False),
         option("daily-limit", "d", description="Daily token limit (e.g., 15M)", flag=False),
+        option("monthly-cost-limit", None, description="Monthly cost limit in dollars (e.g., 100, $100)", flag=False),
+        option("daily-cost-limit", None, description="Daily cost limit in dollars (e.g., 10, $10)", flag=False),
         option("enforcement", "e", description="Enforcement mode: 'alert' (default) or 'block'", flag=False),
         option("disabled", description="Create policy in disabled state", flag=True),
     ]
@@ -393,6 +462,25 @@ class QuotaSetDefaultCommand(Command):
                 console.print(f"[red]Invalid daily limit: {daily_limit_str}[/red]")
                 return 1
 
+        # Parse cost limits
+        monthly_cost_limit = None
+        monthly_cost_str = self.option("monthly-cost-limit")
+        if monthly_cost_str:
+            try:
+                monthly_cost_limit = _parse_cost(monthly_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid monthly cost limit: {monthly_cost_str}[/red]")
+                return 1
+
+        daily_cost_limit = None
+        daily_cost_str = self.option("daily-cost-limit")
+        if daily_cost_str:
+            try:
+                daily_cost_limit = _parse_cost(daily_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid daily cost limit: {daily_cost_str}[/red]")
+                return 1
+
         # Parse enforcement mode
         enforcement_mode = EnforcementMode.ALERT
         enforcement_str = self.option("enforcement")
@@ -413,14 +501,13 @@ class QuotaSetDefaultCommand(Command):
                 identifier="default",
                 monthly_token_limit=monthly_limit,
                 daily_token_limit=daily_limit,
+                monthly_cost_limit=monthly_cost_limit,
+                daily_cost_limit=daily_cost_limit,
                 enforcement_mode=enforcement_mode,
                 enabled=enabled,
             )
             console.print("[green]Created default quota policy[/green]")
-            console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
-            if policy.daily_token_limit:
-                console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
-            console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+            _print_policy_summary(console, policy)
             return 0
 
         except PolicyAlreadyExistsError:
@@ -431,14 +518,109 @@ class QuotaSetDefaultCommand(Command):
                     identifier="default",
                     monthly_token_limit=monthly_limit,
                     daily_token_limit=daily_limit,
+                    monthly_cost_limit=monthly_cost_limit,
+                    daily_cost_limit=daily_cost_limit,
                     enforcement_mode=enforcement_mode,
                     enabled=enabled,
                 )
                 console.print("[yellow]Updated existing default quota policy[/yellow]")
-                console.print(f"  Monthly limit: {_format_tokens(policy.monthly_token_limit)}")
-                if policy.daily_token_limit:
-                    console.print(f"  Daily limit: {_format_tokens(policy.daily_token_limit)}")
-                console.print(f"  Enforcement: {policy.enforcement_mode.value}")
+                _print_policy_summary(console, policy)
+                return 0
+            except QuotaPolicyError as e:
+                console.print(f"[red]Failed to update policy: {e}[/red]")
+                return 1
+
+        except QuotaPolicyError as e:
+            console.print(f"[red]Failed to create policy: {e}[/red]")
+            return 1
+
+
+class QuotaSetOrgCommand(Command):
+    """Set organization-wide quota limit across all users."""
+
+    name = "quota set-org"
+    description = "Set organization-wide quota limit across all users"
+
+    options = [
+        option("profile", description="Configuration profile", flag=False, default=None),
+        option("monthly-limit", "m", description="Monthly token limit (e.g., 1B)", flag=False),
+        option("monthly-cost-limit", None, description="Monthly cost limit in dollars (e.g., 5000)", flag=False),
+        option("enforcement", "e", description="Enforcement mode: 'alert' (default) or 'block'", flag=False),
+        option("disabled", description="Create policy in disabled state", flag=True),
+    ]
+
+    def handle(self) -> int:
+        """Execute the command."""
+        console = Console()
+        config = Config.load()
+        profile_name = self.option("profile") or config.active_profile
+        profile = config.get_profile(profile_name)
+
+        if not profile:
+            console.print(f"[red]Profile '{profile_name}' not found.[/red]")
+            return 1
+
+        monthly_limit_str = self.option("monthly-limit")
+        monthly_cost_str = self.option("monthly-cost-limit")
+
+        if not monthly_limit_str and not monthly_cost_str:
+            console.print("[red]At least one of --monthly-limit or --monthly-cost-limit is required[/red]")
+            return 1
+
+        monthly_limit = 0
+        if monthly_limit_str:
+            try:
+                monthly_limit = _parse_tokens(monthly_limit_str)
+            except ValueError:
+                console.print(f"[red]Invalid monthly limit: {monthly_limit_str}[/red]")
+                return 1
+
+        monthly_cost_limit = None
+        if monthly_cost_str:
+            try:
+                monthly_cost_limit = _parse_cost(monthly_cost_str)
+            except Exception:
+                console.print(f"[red]Invalid monthly cost limit: {monthly_cost_str}[/red]")
+                return 1
+
+        enforcement_mode = EnforcementMode.ALERT
+        enforcement_str = self.option("enforcement")
+        if enforcement_str:
+            enforcement_str = enforcement_str.lower().strip()
+            if enforcement_str == "block":
+                enforcement_mode = EnforcementMode.BLOCK
+            elif enforcement_str != "alert":
+                console.print(f"[red]Invalid enforcement mode: {enforcement_str}. Use 'alert' or 'block'.[/red]")
+                return 1
+
+        enabled = not self.option("disabled")
+
+        try:
+            manager = _get_quota_manager(profile)
+            policy = manager.create_policy(
+                policy_type=PolicyType.ORG,
+                identifier="global",
+                monthly_token_limit=monthly_limit,
+                monthly_cost_limit=monthly_cost_limit,
+                enforcement_mode=enforcement_mode,
+                enabled=enabled,
+            )
+            console.print("[green]Created organization-wide quota policy[/green]")
+            _print_policy_summary(console, policy)
+            return 0
+
+        except PolicyAlreadyExistsError:
+            try:
+                policy = manager.update_policy(
+                    policy_type=PolicyType.ORG,
+                    identifier="global",
+                    monthly_token_limit=monthly_limit,
+                    monthly_cost_limit=monthly_cost_limit,
+                    enforcement_mode=enforcement_mode,
+                    enabled=enabled,
+                )
+                console.print("[yellow]Updated existing organization-wide quota policy[/yellow]")
+                _print_policy_summary(console, policy)
                 return 0
             except QuotaPolicyError as e:
                 console.print(f"[red]Failed to update policy: {e}[/red]")
@@ -477,7 +659,7 @@ class QuotaListCommand(Command):
             try:
                 policy_type = PolicyType(type_filter.lower())
             except ValueError:
-                console.print(f"[red]Invalid policy type: {type_filter}. Use 'user', 'group', or 'default'.[/red]")
+                console.print(f"[red]Invalid policy type: {type_filter}. Use 'user', 'group', 'default', or 'org'.[/red]")
                 return 1
 
         try:
@@ -500,6 +682,8 @@ class QuotaListCommand(Command):
             table.add_column("Identifier")
             table.add_column("Monthly Limit", justify="right")
             table.add_column("Daily Limit", justify="right")
+            table.add_column("Monthly Cost", justify="right")
+            table.add_column("Daily Cost", justify="right")
             table.add_column("Enforcement")
             table.add_column("Status")
 
@@ -507,12 +691,16 @@ class QuotaListCommand(Command):
                 status = "[green]Enabled[/green]" if policy.enabled else "[dim]Disabled[/dim]"
                 daily = _format_tokens(policy.daily_token_limit) if policy.daily_token_limit else "-"
                 enforcement = "[red]block[/red]" if policy.enforcement_mode.value == "block" else "alert"
+                monthly_cost = f"${policy.monthly_cost_limit}" if policy.monthly_cost_limit is not None else "-"
+                daily_cost = f"${policy.daily_cost_limit}" if policy.daily_cost_limit is not None else "-"
 
                 table.add_row(
                     policy.policy_type.value,
                     policy.identifier,
                     _format_tokens(policy.monthly_token_limit),
                     daily,
+                    monthly_cost,
+                    daily_cost,
                     enforcement,
                     status,
                 )
@@ -558,7 +746,7 @@ class QuotaDeleteCommand(Command):
         try:
             policy_type = PolicyType(type_str.lower())
         except ValueError:
-            console.print(f"[red]Invalid policy type: {type_str}. Use 'user', 'group', or 'default'.[/red]")
+            console.print(f"[red]Invalid policy type: {type_str}. Use 'user', 'group', 'default', or 'org'.[/red]")
             return 1
 
         if not self.option("force"):
@@ -648,6 +836,10 @@ class QuotaShowCommand(Command):
             table.add_row("Monthly Token Limit", _format_tokens(policy.monthly_token_limit))
             if policy.daily_token_limit:
                 table.add_row("Daily Token Limit", _format_tokens(policy.daily_token_limit))
+            if policy.monthly_cost_limit is not None:
+                table.add_row("Monthly Cost Limit", f"${policy.monthly_cost_limit}")
+            if policy.daily_cost_limit is not None:
+                table.add_row("Daily Cost Limit", f"${policy.daily_cost_limit}")
             table.add_row("Warning (80%)", _format_tokens(policy.warning_threshold_80))
             table.add_row("Critical (90%)", _format_tokens(policy.warning_threshold_90))
 
@@ -1023,7 +1215,7 @@ class QuotaExportCommand(Command):
             try:
                 policy_type = PolicyType(type_filter.lower())
             except ValueError:
-                console.print(f"[red]Invalid policy type: {type_filter}. Use 'user', 'group', or 'default'.[/red]")
+                console.print(f"[red]Invalid policy type: {type_filter}. Use 'user', 'group', 'default', or 'org'.[/red]")
                 return 1
 
         try:
@@ -1072,7 +1264,7 @@ class QuotaExportCommand(Command):
         from io import StringIO
 
         output = StringIO()
-        fieldnames = ["type", "identifier", "monthly_token_limit", "daily_token_limit", "enforcement_mode", "enabled"]
+        fieldnames = ["type", "identifier", "monthly_token_limit", "daily_token_limit", "monthly_cost_limit", "daily_cost_limit", "enforcement_mode", "enabled"]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         for policy in policies:
@@ -1133,7 +1325,7 @@ class QuotaImportCommand(Command):
             try:
                 filter_policy_type = PolicyType(type_filter.lower())
             except ValueError:
-                console.print(f"[red]Invalid policy type: {type_filter}. Use 'user', 'group', or 'default'.[/red]")
+                console.print(f"[red]Invalid policy type: {type_filter}. Use 'user', 'group', 'default', or 'org'.[/red]")
                 return 1
 
         # Check file exists
@@ -1259,3 +1451,169 @@ class QuotaImportCommand(Command):
         console.print(f"  Updated: {results['updated']}")
         console.print(f"  Skipped: {results['skipped']}")
         console.print(f"  Errors:  {len(results['errors'])}")
+
+
+# Default pricing for Claude models on Bedrock (per 1M tokens in USD)
+DEFAULT_BEDROCK_PRICING = {
+    "anthropic.claude-sonnet-4-20250514-v1:0": {
+        "input_per_1m": "3.00", "output_per_1m": "15.00",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+    },
+    "anthropic.claude-opus-4-20250514-v1:0": {
+        "input_per_1m": "15.00", "output_per_1m": "75.00",
+        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
+    },
+    "anthropic.claude-opus-4-6-v1:0": {
+        "input_per_1m": "15.00", "output_per_1m": "75.00",
+        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
+    },
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "input_per_1m": "0.80", "output_per_1m": "4.00",
+        "cache_read_per_1m": "0.08", "cache_write_per_1m": "1.00",
+    },
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": {
+        "input_per_1m": "3.00", "output_per_1m": "15.00",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+    },
+    "anthropic.claude-3-5-haiku-20241022-v1:0": {
+        "input_per_1m": "0.80", "output_per_1m": "4.00",
+        "cache_read_per_1m": "0.08", "cache_write_per_1m": "1.00",
+    },
+    "DEFAULT": {
+        "input_per_1m": "3.00", "output_per_1m": "15.00",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+    },
+}
+
+
+class QuotaSetPricingCommand(Command):
+    """Populate the BedrockPricing DynamoDB table with model prices."""
+
+    name = "quota set-pricing"
+    description = "Set model pricing for cost-based quotas"
+
+    options = [
+        option("profile", "p", description="Configuration profile", flag=False, default=None),
+        option("table", "t", description="Pricing table name (default: BedrockPricing)", flag=False, default="BedrockPricing"),
+        option("model", None, description="Set pricing for a specific model ID", flag=False),
+        option("input-price", None, description="Input price per 1M tokens (e.g., 3.00)", flag=False),
+        option("output-price", None, description="Output price per 1M tokens (e.g., 15.00)", flag=False),
+        option("cache-read-price", None, description="Cache read price per 1M tokens", flag=False),
+        option("cache-write-price", None, description="Cache write price per 1M tokens", flag=False),
+        option("defaults", None, description="Load default Bedrock pricing for Claude models", flag=True),
+        option("list", "l", description="List current pricing", flag=True),
+    ]
+
+    def handle(self) -> int:
+        """Execute the command."""
+        console = Console()
+        config = Config.load()
+        profile_name = self.option("profile") or config.active_profile
+        profile = config.get_profile(profile_name)
+
+        if not profile:
+            console.print(f"[red]Profile '{profile_name}' not found.[/red]")
+            return 1
+
+        table_name = self.option("table")
+        dynamodb = boto3.resource("dynamodb", region_name=profile.aws_region)
+        pricing_table = dynamodb.Table(table_name)
+
+        # List current pricing
+        if self.option("list"):
+            return self._list_pricing(console, pricing_table)
+
+        # Load defaults
+        if self.option("defaults"):
+            return self._load_defaults(console, pricing_table)
+
+        # Set pricing for a specific model
+        model_id = self.option("model")
+        if not model_id:
+            console.print("[red]Specify --model to set pricing for a model, or --defaults to load default prices[/red]")
+            return 1
+
+        input_price = self.option("input-price")
+        output_price = self.option("output-price")
+
+        if not input_price or not output_price:
+            console.print("[red]--input-price and --output-price are required[/red]")
+            return 1
+
+        try:
+            item = {
+                "model_id": model_id,
+                "input_per_1m": Decimal(input_price),
+                "output_per_1m": Decimal(output_price),
+                "cache_read_per_1m": Decimal(self.option("cache-read-price") or "0"),
+                "cache_write_per_1m": Decimal(self.option("cache-write-price") or "0"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            pricing_table.put_item(Item=item)
+            console.print(f"[green]Set pricing for {model_id}[/green]")
+            console.print(f"  Input: ${input_price}/1M  Output: ${output_price}/1M")
+            return 0
+        except Exception as e:
+            console.print(f"[red]Failed to set pricing: {e}[/red]")
+            return 1
+
+    def _load_defaults(self, console: Console, pricing_table) -> int:
+        """Load default pricing for all known Claude models."""
+        try:
+            count = 0
+            for model_id, prices in DEFAULT_BEDROCK_PRICING.items():
+                item = {
+                    "model_id": model_id,
+                    "input_per_1m": Decimal(prices["input_per_1m"]),
+                    "output_per_1m": Decimal(prices["output_per_1m"]),
+                    "cache_read_per_1m": Decimal(prices["cache_read_per_1m"]),
+                    "cache_write_per_1m": Decimal(prices["cache_write_per_1m"]),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                pricing_table.put_item(Item=item)
+                count += 1
+
+            console.print(f"[green]Loaded default pricing for {count} models[/green]")
+            return 0
+        except Exception as e:
+            console.print(f"[red]Failed to load defaults: {e}[/red]")
+            return 1
+
+    def _list_pricing(self, console: Console, pricing_table) -> int:
+        """List current model pricing."""
+        try:
+            response = pricing_table.scan()
+            items = response.get("Items", [])
+
+            if not items:
+                console.print("[yellow]No pricing data found. Use --defaults to load default prices.[/yellow]")
+                return 0
+
+            console.print(
+                Panel.fit(
+                    "[bold cyan]Bedrock Model Pricing[/bold cyan]",
+                    border_style="cyan",
+                )
+            )
+
+            table = Table(box=box.SIMPLE)
+            table.add_column("Model ID")
+            table.add_column("Input/1M", justify="right")
+            table.add_column("Output/1M", justify="right")
+            table.add_column("Cache Read/1M", justify="right")
+            table.add_column("Cache Write/1M", justify="right")
+
+            for item in sorted(items, key=lambda x: x.get("model_id", "")):
+                table.add_row(
+                    item.get("model_id", ""),
+                    f"${item.get('input_per_1m', 0)}",
+                    f"${item.get('output_per_1m', 0)}",
+                    f"${item.get('cache_read_per_1m', 0)}",
+                    f"${item.get('cache_write_per_1m', 0)}",
+                )
+
+            console.print(table)
+            return 0
+        except Exception as e:
+            console.print(f"[red]Failed to list pricing: {e}[/red]")
+            return 1

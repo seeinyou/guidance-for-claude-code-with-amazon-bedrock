@@ -614,6 +614,7 @@ class PolicyType(str, Enum):
     USER = "user"
     GROUP = "group"
     DEFAULT = "default"
+    ORG = "org"
 
 
 class EnforcementMode(str, Enum):
@@ -640,9 +641,17 @@ class QuotaPolicy:
     # Optional limits
     daily_token_limit: int | None = None
 
+    # Cost limits (in dollars)
+    monthly_cost_limit: Decimal | None = None  # e.g. Decimal("100.00") = $100/month
+    daily_cost_limit: Decimal | None = None  # e.g. Decimal("10.00") = $10/day
+
     # Thresholds (auto-calculated from monthly_token_limit if not provided)
     warning_threshold_80: int | None = None
     warning_threshold_90: int | None = None
+
+    # Cost thresholds (auto-calculated from monthly_cost_limit if not provided)
+    cost_warning_threshold_80: Decimal | None = None
+    cost_warning_threshold_90: Decimal | None = None
 
     # Enforcement (Phase 1: alert only, Phase 2: block support)
     enforcement_mode: EnforcementMode = EnforcementMode.ALERT
@@ -658,6 +667,11 @@ class QuotaPolicy:
             self.warning_threshold_80 = int(self.monthly_token_limit * 0.8)
         if self.warning_threshold_90 is None:
             self.warning_threshold_90 = int(self.monthly_token_limit * 0.9)
+        if self.monthly_cost_limit is not None:
+            if self.cost_warning_threshold_80 is None:
+                self.cost_warning_threshold_80 = Decimal(str(self.monthly_cost_limit)) * Decimal("0.8")
+            if self.cost_warning_threshold_90 is None:
+                self.cost_warning_threshold_90 = Decimal(str(self.monthly_cost_limit)) * Decimal("0.9")
 
     def to_dynamodb_item(self) -> dict[str, Any]:
         """Convert policy to DynamoDB item format."""
@@ -675,6 +689,15 @@ class QuotaPolicy:
 
         if self.daily_token_limit is not None:
             item["daily_token_limit"] = self.daily_token_limit
+
+        if self.monthly_cost_limit is not None:
+            item["monthly_cost_limit"] = str(self.monthly_cost_limit)
+        if self.daily_cost_limit is not None:
+            item["daily_cost_limit"] = str(self.daily_cost_limit)
+        if self.cost_warning_threshold_80 is not None:
+            item["cost_warning_threshold_80"] = str(self.cost_warning_threshold_80)
+        if self.cost_warning_threshold_90 is not None:
+            item["cost_warning_threshold_90"] = str(self.cost_warning_threshold_90)
 
         if self.created_at:
             item["created_at"] = self.created_at.isoformat()
@@ -695,8 +718,12 @@ class QuotaPolicy:
             identifier=item["identifier"],
             monthly_token_limit=int(item["monthly_token_limit"]),
             daily_token_limit=int(item["daily_token_limit"]) if item.get("daily_token_limit") else None,
+            monthly_cost_limit=Decimal(item["monthly_cost_limit"]) if item.get("monthly_cost_limit") else None,
+            daily_cost_limit=Decimal(item["daily_cost_limit"]) if item.get("daily_cost_limit") else None,
             warning_threshold_80=int(item.get("warning_threshold_80", 0)),
             warning_threshold_90=int(item.get("warning_threshold_90", 0)),
+            cost_warning_threshold_80=Decimal(item["cost_warning_threshold_80"]) if item.get("cost_warning_threshold_80") else None,
+            cost_warning_threshold_90=Decimal(item["cost_warning_threshold_90"]) if item.get("cost_warning_threshold_90") else None,
             enforcement_mode=EnforcementMode(item.get("enforcement_mode", "alert")),
             enabled=item.get("enabled", True),
             created_at=datetime.fromisoformat(item["created_at"]) if item.get("created_at") else None,
@@ -729,6 +756,8 @@ class UserQuotaUsage:
 
     # Cost tracking
     estimated_cost: Decimal = field(default_factory=lambda: Decimal("0"))
+    daily_cost: Decimal = field(default_factory=lambda: Decimal("0"))
+    daily_cost_date: str | None = None  # YYYY-MM-DD, resets when day changes
 
     # Policy attribution
     applied_policy_type: PolicyType | None = None
@@ -737,6 +766,7 @@ class UserQuotaUsage:
 
     # Metadata
     last_updated: datetime | None = None
+    first_seen: str | None = None  # ISO timestamp of first appearance
 
     def to_dynamodb_item(self) -> dict[str, Any]:
         """Convert usage to DynamoDB item format."""
@@ -750,7 +780,11 @@ class UserQuotaUsage:
             "output_tokens": self.output_tokens,
             "cache_tokens": self.cache_tokens,
             "estimated_cost": str(self.estimated_cost),
+            "daily_cost": str(self.daily_cost),
         }
+
+        if self.daily_cost_date:
+            item["daily_cost_date"] = self.daily_cost_date
 
         if self.daily_date:
             item["daily_date"] = self.daily_date
@@ -767,6 +801,9 @@ class UserQuotaUsage:
         if self.last_updated:
             item["last_updated"] = self.last_updated.isoformat()
 
+        if self.first_seen:
+            item["first_seen"] = self.first_seen
+
         return item
 
     @classmethod
@@ -782,8 +819,11 @@ class UserQuotaUsage:
             output_tokens=int(item.get("output_tokens", 0)),
             cache_tokens=int(item.get("cache_tokens", 0)),
             estimated_cost=Decimal(item.get("estimated_cost", "0")),
+            daily_cost=Decimal(item.get("daily_cost", "0")),
+            daily_cost_date=item.get("daily_cost_date"),
             applied_policy_type=PolicyType(item["applied_policy_type"]) if item.get("applied_policy_type") else None,
             applied_policy_id=item.get("applied_policy_id"),
             groups=item.get("groups", []),
             last_updated=datetime.fromisoformat(item["last_updated"]) if item.get("last_updated") else None,
+            first_seen=item.get("first_seen"),
         )

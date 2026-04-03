@@ -128,6 +128,24 @@ Resources:
         - Key: Purpose
           Value: User quota monitoring and alerts
 
+  # DynamoDB table for Bedrock model pricing (for cost-based quotas)
+  BedrockPricing:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BedrockPricing
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: model_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: model_id
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: BedrockPricing
+        - Key: Purpose
+          Value: Model pricing data for cost-based quota enforcement
+
   # SNS Topic for quota alerts
   QuotaAlertTopic:
     Type: AWS::SNS::Topic
@@ -177,6 +195,12 @@ Resources:
                   - !Sub '${QuotaPolicies.Arn}/index/*'
               - Effect: Allow
                 Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BedrockPricing.Arn
+              - Effect: Allow
+                Action:
                   - sns:Publish
                 Resource: !Ref QuotaAlertTopic
 
@@ -203,6 +227,7 @@ Resources:
           DAILY_ENFORCEMENT_MODE: !Ref DailyEnforcementMode
           MONTHLY_ENFORCEMENT_MODE: !Ref MonthlyEnforcementMode
           ENABLE_FINEGRAINED_QUOTAS: !Ref EnableFinegrainedQuotas
+          PRICING_TABLE: !Ref BedrockPricing
       Code: ./lambda-functions/quota_monitor/
 
   # EventBridge Rule to run quota monitor every 15 minutes
@@ -256,6 +281,12 @@ Resources:
                   - !GetAtt UserQuotaMetrics.Arn
                   - !GetAtt QuotaPolicies.Arn
                   - !Sub '${QuotaPolicies.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BedrockPricing.Arn
 
   # Lambda function for real-time quota checking
   QuotaCheckFunction:
@@ -276,6 +307,7 @@ Resources:
           DAILY_TOKEN_LIMIT: !Ref DailyTokenLimit
           DAILY_ENFORCEMENT_MODE: !Ref DailyEnforcementMode
           MONTHLY_ENFORCEMENT_MODE: !Ref MonthlyEnforcementMode
+          PRICING_TABLE: !Ref BedrockPricing
       Code: ./lambda-functions/quota_check/
 
   # HTTP API Gateway (v2 - cheaper and faster than REST API)
@@ -372,6 +404,12 @@ Resources:
             Resource:
               - !GetAtt QuotaPolicies.Arn
               - !Sub '${QuotaPolicies.Arn}/index/*'
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Scan
+            Resource:
+              - !GetAtt BedrockPricing.Arn
       Roles:
         - !Ref MetricsAggregatorRoleName
 
@@ -399,6 +437,18 @@ Outputs:
     Value: !GetAtt QuotaPolicies.Arn
     Export:
       Name: !Sub '${AWS::StackName}-PoliciesTableArn'
+
+  PricingTableName:
+    Description: Name of the BedrockPricing DynamoDB table
+    Value: !Ref BedrockPricing
+    Export:
+      Name: !Sub '${AWS::StackName}-PricingTableName'
+
+  PricingTableArn:
+    Description: ARN of the BedrockPricing DynamoDB table
+    Value: !GetAtt BedrockPricing.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PricingTableArn'
 
   QuotaAlertTopicArn:
     Description: SNS Topic ARN for quota alerts - subscribe to this for notifications

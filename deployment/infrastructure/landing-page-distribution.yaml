@@ -109,12 +109,50 @@ Parameters:
     Default: 'initial'
     Description: Timestamp to force custom resource re-execution on every deployment (auto-populated by deploy command)
 
+  # Admin panel parameters
+  EnableAdminPanel:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable admin quota management panel on the landing page
+
+  AdminEmails:
+    Type: String
+    Default: ''
+    Description: Comma-separated list of admin email addresses for quota management panel
+
+  AdminGroupName:
+    Type: String
+    Default: ''
+    Description: IdP group name that grants admin access to quota management panel
+
+  QuotaPoliciesTableName:
+    Type: String
+    Default: ''
+    Description: Name of the QuotaPolicies DynamoDB table (from quota monitoring stack)
+
+  QuotaPoliciesTableArn:
+    Type: String
+    Default: ''
+    Description: ARN of the QuotaPolicies DynamoDB table
+
+  UserQuotaMetricsTableName:
+    Type: String
+    Default: ''
+    Description: Name of the UserQuotaMetrics DynamoDB table (from quota monitoring stack)
+
+  UserQuotaMetricsTableArn:
+    Type: String
+    Default: ''
+    Description: ARN of the UserQuotaMetrics DynamoDB table
+
 Conditions:
   IsOkta: !Equals [!Ref IdPProvider, 'okta']
   IsAzure: !Equals [!Ref IdPProvider, 'azure']
   IsAuth0: !Equals [!Ref IdPProvider, 'auth0']
   IsCognito: !Equals [!Ref IdPProvider, 'cognito']
   HasRoute53Zone: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasAdminPanel: !Equals [!Ref EnableAdminPanel, 'true']
 
 Resources:
   # S3 Bucket for package distribution
@@ -237,6 +275,7 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET_NAME: !Ref DistributionBucket
+          ENABLE_ADMIN_PANEL: !If [HasAdminPanel, 'true', 'false']
       Code:
         ZipFile: |
           # ABOUTME: Lambda function for authenticated distribution landing page
@@ -689,6 +728,7 @@ Resources:
                               <li>After installation, you can use the <code>claude</code> command from your terminal</li>
                           </ul>
                       </div>
+                      {'<div class="footer"><a href="/admin" style="color:#667eea;text-decoration:none;font-weight:500">Admin Panel</a></div>' if os.environ.get("ENABLE_ADMIN_PANEL") == "true" else ''}
                   </div>
               </body>
               </html>
@@ -998,6 +1038,279 @@ Resources:
       CustomDomain: !Ref CustomDomainName
       Version: !Ref DeploymentTimestamp  # Changes on every deployment to force Lambda re-execution
 
+  # ============================================
+  # Admin Panel Resources (conditional)
+  # ============================================
+
+  # Admin Lambda Execution Role
+  AdminLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: HasAdminPanel
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: AdminQuotaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !Ref QuotaPoliciesTableArn
+                  - !Sub '${QuotaPoliciesTableArn}/index/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref UserQuotaMetricsTableArn
+      Tags:
+        - Key: Application
+          Value: ClaudeCodeWithBedrock
+        - Key: Purpose
+          Value: AdminPanelLambda
+
+  # Admin Lambda CloudWatch Log Group
+  AdminPanelLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasAdminPanel
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IdentityPoolName}-admin-panel'
+      RetentionInDays: 30
+
+  # Admin Panel Lambda Function
+  AdminPanelFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasAdminPanel
+    DependsOn: AdminPanelLogGroup
+    Properties:
+      FunctionName: !Sub '${IdentityPoolName}-admin-panel'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AdminLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          QUOTA_POLICIES_TABLE: !Ref QuotaPoliciesTableName
+          USER_QUOTA_METRICS_TABLE: !Ref UserQuotaMetricsTableName
+          ADMIN_EMAILS: !Ref AdminEmails
+          ADMIN_GROUP_NAME: !Ref AdminGroupName
+      Code: ./lambda-functions/landing_page_admin/
+      Tags:
+        - Key: Application
+          Value: ClaudeCodeWithBedrock
+        - Key: Purpose
+          Value: AdminQuotaPanel
+
+  # Admin Lambda Invoke Permission for ALB
+  AdminLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasAdminPanel
+    Properties:
+      FunctionName: !Ref AdminPanelFunction
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+      SourceArn: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/*'
+
+  # Admin Lambda Target Group
+  AdminLambdaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasAdminPanel
+    DependsOn: AdminLambdaInvokePermission
+    Properties:
+      Name: !Sub '${IdentityPoolName}-admin-tg'
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt AdminPanelFunction.Arn
+      HealthCheckEnabled: false
+      Tags:
+        - Key: Application
+          Value: ClaudeCodeWithBedrock
+
+  # ALB Listener Rule for /admin* paths
+  AdminPathListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasAdminPanel
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/admin'
+              - '/admin/*'
+      Actions:
+        - Type: authenticate-oidc
+          Order: 1
+          AuthenticateOidcConfig:
+            Issuer: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/v2.0'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}'
+                  - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+            AuthorizationEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/authorize'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/authorize'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/authorize'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize'
+            TokenEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/token'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/token'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/oauth/token'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+            UserInfoEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/userinfo'
+              - !If
+                - IsAzure
+                - 'https://graph.microsoft.com/oidc/userinfo'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/userinfo'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo'
+            ClientId: !If
+              - IsOkta
+              - !Ref OktaClientId
+              - !If
+                - IsAzure
+                - !Ref AzureClientId
+                - !If
+                  - IsAuth0
+                  - !Ref Auth0ClientId
+                  - !Ref CognitoClientId
+            ClientSecret: !If
+              - IsOkta
+              - !Sub '{{resolve:secretsmanager:${OktaClientSecretArn}:SecretString}}'
+              - !If
+                - IsAzure
+                - !Sub '{{resolve:secretsmanager:${AzureClientSecretArn}:SecretString}}'
+                - !If
+                  - IsAuth0
+                  - !Sub '{{resolve:secretsmanager:${Auth0ClientSecretArn}:SecretString}}'
+                  - !Sub '{{resolve:secretsmanager:${CognitoClientSecretArn}:SecretString}}'
+            SessionTimeout: 43200
+            Scope: 'openid email profile'
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref AdminLambdaTargetGroup
+
+  # ALB Listener Rule for /api/* paths
+  ApiPathListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasAdminPanel
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/api/*'
+      Actions:
+        - Type: authenticate-oidc
+          Order: 1
+          AuthenticateOidcConfig:
+            Issuer: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/v2.0'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}'
+                  - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+            AuthorizationEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/authorize'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/authorize'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/authorize'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize'
+            TokenEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/token'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/token'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/oauth/token'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+            UserInfoEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/userinfo'
+              - !If
+                - IsAzure
+                - 'https://graph.microsoft.com/oidc/userinfo'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/userinfo'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo'
+            ClientId: !If
+              - IsOkta
+              - !Ref OktaClientId
+              - !If
+                - IsAzure
+                - !Ref AzureClientId
+                - !If
+                  - IsAuth0
+                  - !Ref Auth0ClientId
+                  - !Ref CognitoClientId
+            ClientSecret: !If
+              - IsOkta
+              - !Sub '{{resolve:secretsmanager:${OktaClientSecretArn}:SecretString}}'
+              - !If
+                - IsAzure
+                - !Sub '{{resolve:secretsmanager:${AzureClientSecretArn}:SecretString}}'
+                - !If
+                  - IsAuth0
+                  - !Sub '{{resolve:secretsmanager:${Auth0ClientSecretArn}:SecretString}}'
+                  - !Sub '{{resolve:secretsmanager:${CognitoClientSecretArn}:SecretString}}'
+            SessionTimeout: 43200
+            Scope: 'openid email profile'
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref AdminLambdaTargetGroup
+
 Outputs:
   DistributionURL:
     Description: Landing page URL for downloads (HTTPS with custom domain required)
@@ -1036,3 +1349,10 @@ Outputs:
     Value: !GetAtt DistributionBucket.Arn
     Export:
       Name: !Sub '${AWS::StackName}-DistributionBucketArn'
+
+  AdminPanelURL:
+    Condition: HasAdminPanel
+    Description: Admin quota management panel URL
+    Value: !Sub 'https://${CustomDomainName}/admin'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminPanelURL'

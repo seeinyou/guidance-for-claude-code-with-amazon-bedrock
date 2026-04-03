@@ -803,10 +803,34 @@ class MultiProviderAuth:
         server_thread.daemon = True
         server_thread.start()
 
-        # Open browser
-        self._debug_print(f"Opening browser for {self.provider_config['name']} authentication...")
-        self._debug_print(f"If browser doesn't open, visit: {auth_url}")
-        webbrowser.open(auth_url)
+        # Open browser - detect headless environment first
+        is_headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY") and sys.platform != "darwin"
+        browser_opened = False
+
+        if not is_headless:
+            self._debug_print(f"Opening browser for {self.provider_config['name']} authentication...")
+            try:
+                browser_opened = webbrowser.open(auth_url)
+            except Exception:
+                pass
+
+        if not browser_opened:
+            msg = (
+                "\n" + "=" * 60 + "\n"
+                "Open this URL in a browser to authenticate:\n\n"
+                f"  {auth_url}\n\n"
+                "Waiting for callback on localhost:8400...\n"
+                "Tip: Use port forwarding: ssh -L 8400:localhost:8400 <host>\n"
+                + "=" * 60 + "\n"
+            )
+            # Write to both stderr and /dev/tty to ensure visibility
+            print(msg, file=sys.stderr, flush=True)
+            try:
+                with open("/dev/tty", "w") as tty:
+                    tty.write(msg)
+                    tty.flush()
+            except Exception:
+                pass
 
         # Wait for callback
         server_thread.join(timeout=300)  # 5 minute timeout
