@@ -420,8 +420,15 @@ class QuotaPolicyManager:
                     group_policies.append(group_policy)
 
             if group_policies:
-                # Most restrictive = lowest monthly_token_limit
-                return min(group_policies, key=lambda p: p.monthly_token_limit)
+                # Most restrictive = lowest limits across token AND cost dimensions
+                def _policy_restrictiveness(p):
+                    return (
+                        p.monthly_token_limit or float("inf"),
+                        float(p.monthly_cost_limit) if p.monthly_cost_limit is not None else float("inf"),
+                        p.daily_token_limit or float("inf"),
+                        float(p.daily_cost_limit) if p.daily_cost_limit is not None else float("inf"),
+                    )
+                return min(group_policies, key=_policy_restrictiveness)
 
         # 3. Fall back to default policy
         default_policy = self.get_policy(PolicyType.DEFAULT, "default")

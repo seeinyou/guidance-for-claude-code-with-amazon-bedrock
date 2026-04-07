@@ -796,10 +796,17 @@ class MultiProviderAuth:
 
         # Setup callback server
         auth_result = {"code": None, "error": None}
-        server = HTTPServer(("127.0.0.1", self.redirect_port), self._create_callback_handler(state, auth_result))
+        bind_host = os.getenv("REDIRECT_BIND", "127.0.0.1")
+        server = HTTPServer((bind_host, self.redirect_port), self._create_callback_handler(state, auth_result, auth_url))
 
-        # Start server in background
-        server_thread = threading.Thread(target=server.handle_request)
+        # Start server in background — handle multiple requests (login redirect + callback)
+        def _serve_until_done():
+            server.timeout = 5  # per-request timeout
+            deadline = time.time() + 300  # 5 minute overall timeout
+            while not auth_result["code"] and not auth_result["error"] and time.time() < deadline:
+                server.handle_request()
+
+        server_thread = threading.Thread(target=_serve_until_done)
         server_thread.daemon = True
         server_thread.start()
 
@@ -818,22 +825,21 @@ class MultiProviderAuth:
             msg = (
                 "\n" + "=" * 60 + "\n"
                 "Open this URL in a browser to authenticate:\n\n"
-                f"  {auth_url}\n\n"
-                "Waiting for callback on localhost:8400...\n"
-                "Tip: Use port forwarding: ssh -L 8400:localhost:8400 <host>\n"
+                f"  http://localhost:{self.redirect_port}\n\n"
+                "Waiting for callback...\n"
+                "Tip: ssh -L 8400:localhost:8400 <host>\n"
                 + "=" * 60 + "\n"
             )
-            # Write to both stderr and /dev/tty to ensure visibility
             print(msg, file=sys.stderr, flush=True)
-            try:
-                with open("/dev/tty", "w") as tty:
-                    tty.write(msg)
-                    tty.flush()
-            except Exception:
-                pass
 
         # Wait for callback
         server_thread.join(timeout=300)  # 5 minute timeout
+
+        if auth_result["error"] == "stale_callback":
+            # Stale callback from previous session — retry once
+            self._debug_print("Stale callback received, retrying authentication...")
+            print("Stale session detected, retrying...\n", file=sys.stderr, flush=True)
+            return self.authenticate_oidc()
 
         if auth_result["error"]:
             raise Exception(f"Authentication error: {auth_result['error']}")
@@ -893,13 +899,22 @@ class MultiProviderAuth:
 
         return tokens["id_token"], id_token_claims
 
-    def _create_callback_handler(self, expected_state, result_container):
+    def _create_callback_handler(self, expected_state, result_container, auth_url=None):
         """Create HTTP handler for OAuth callback"""
         parent = self
 
         class CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self):
+                path = urlparse(self.path).path
                 parent._debug_print(f"Received callback request: {self.path}")
+
+                # Serve login redirect on root path
+                if path in ("/", "/login") and auth_url:
+                    self.send_response(302)
+                    self.send_header("Location", auth_url)
+                    self.end_headers()
+                    return
+
                 query = parse_qs(urlparse(self.path).query)
 
                 if query.get("error"):
@@ -909,8 +924,10 @@ class MultiProviderAuth:
                     result_container["code"] = query["code"][0]
                     self._send_response(200, "Authentication successful! You can close this window.")
                 else:
-                    result_container["error"] = "Invalid state or missing code"
-                    self._send_response(400, "Invalid response")
+                    # State mismatch — stale callback from a previous session.
+                    parent._debug_print(f"Stale callback with mismatched state (expected={expected_state[:8]}...)")
+                    result_container["error"] = "stale_callback"
+                    self._send_response(400, "Stale callback — please try again.")
 
             def _send_response(self, code, message):
                 self.send_response(code)
@@ -1198,15 +1215,97 @@ class MultiProviderAuth:
                 ) from e
             raise Exception(f"Failed to get AWS credentials: {str(e)}") from None
 
+    def _is_port_held_by_ccwb(self) -> bool:
+        """Check if the redirect port is held by another credential-provider process.
+
+        Uses /proc on Linux (no external tools needed), falls back to lsof on macOS.
+        """
+        try:
+            import subprocess
+            port = self.redirect_port
+
+            # Try /proc/net/tcp first (Linux, including Alpine/Docker — no lsof needed)
+            proc_net = None
+            for path in ["/proc/net/tcp", "/proc/net/tcp6"]:
+                try:
+                    with open(path) as f:
+                        proc_net = f.readlines()
+                    break
+                except FileNotFoundError:
+                    continue
+
+            if proc_net is not None:
+                # /proc/net/tcp format: local_address (hex ip:port), state 0A = LISTEN
+                hex_port = f":{port:04X}"
+                listening_inodes = set()
+                for line in proc_net[1:]:  # skip header
+                    fields = line.split()
+                    if len(fields) >= 10 and fields[1].upper().endswith(hex_port) and fields[3] == "0A":
+                        listening_inodes.add(fields[9])  # inode
+
+                if not listening_inodes:
+                    return False
+
+                # Find which PID owns these inodes
+                import os as _os
+                for pid_dir in _os.listdir("/proc"):
+                    if not pid_dir.isdigit():
+                        continue
+                    try:
+                        fd_dir = f"/proc/{pid_dir}/fd"
+                        for fd in _os.listdir(fd_dir):
+                            link = _os.readlink(f"{fd_dir}/{fd}")
+                            for inode in listening_inodes:
+                                if f"socket:[{inode}]" in link:
+                                    # Check command line
+                                    with open(f"/proc/{pid_dir}/cmdline") as f:
+                                        cmdline = f.read()
+                                    if "credential_provider" in cmdline or "ccwb" in cmdline:
+                                        return True
+                    except (PermissionError, FileNotFoundError, ProcessLookupError):
+                        continue
+                return False
+
+            # Fallback: lsof (macOS, or Linux with lsof installed)
+            result = subprocess.run(
+                ["lsof", "-i", f"TCP:{port}", "-sTCP:LISTEN", "-t"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return False
+            for pid_str in result.stdout.strip().split("\n"):
+                pid = int(pid_str)
+                cmd_result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, timeout=3,
+                )
+                cmd = cmd_result.stdout.strip()
+                if "credential_provider" in cmd or "ccwb" in cmd:
+                    return True
+            return False
+        except Exception:
+            # If we can't determine, assume it's ours (safer — avoids false negatives)
+            return True
+
     def _wait_for_auth_completion(self, timeout=60):
-        """Wait for another process to complete authentication using port-based detection"""
+        """Wait for another process to complete authentication using port-based detection."""
         start_time = time.time()
 
+        # Check if port is actually held by another ccwb process
+        if not self._is_port_held_by_ccwb():
+            print(
+                f"\nError: Port {self.redirect_port} is in use by another application.\n"
+                f"Free the port or set REDIRECT_PORT to a different value.\n",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+        bind_host = os.getenv("REDIRECT_BIND", "127.0.0.1")
         while time.time() - start_time < timeout:
             # Check if port is still in use (another auth in progress)
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
+                test_socket.bind((bind_host, self.redirect_port))
                 test_socket.close()
                 # Port is free, auth must have completed or failed
                 # Check for cached credentials
@@ -1234,10 +1333,17 @@ class MultiProviderAuth:
     def authenticate_for_monitoring(self):
         """Authenticate specifically for monitoring token (no AWS credential output)"""
         try:
+            # Return cached monitoring token if still valid (avoids port 8400 conflict)
+            cached_token = self.get_monitoring_token()
+            if cached_token:
+                self._debug_print("Using cached monitoring token")
+                return cached_token
+
             # Try to acquire port lock by testing if we can bind to it
+            bind_host = os.getenv("REDIRECT_BIND", "127.0.0.1")
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
+                test_socket.bind((bind_host, self.redirect_port))
                 test_socket.close()
                 # We got the port, we can proceed with authentication
                 self._debug_print("Port available, proceeding with monitoring authentication")
@@ -1503,27 +1609,40 @@ class MultiProviderAuth:
         """
         reason = quota_result.get("reason", "unknown")
         message = quota_result.get("message", "Access blocked due to quota limits")
-        usage = quota_result.get("usage", {})
-        policy = quota_result.get("policy", {})
+        usage = quota_result.get("usage") or {}
+        policy = quota_result.get("policy") or {}
 
-        print("\n" + "=" * 60, file=sys.stderr)
-        print("ACCESS BLOCKED - QUOTA EXCEEDED", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
-
-        print(f"\n{message}\n", file=sys.stderr)
+        lines = [
+            "",
+            "=" * 60,
+            "ACCESS BLOCKED - QUOTA EXCEEDED",
+            "=" * 60,
+            "",
+            message,
+            "",
+        ]
 
         if usage:
-            print("Current Usage:", file=sys.stderr)
+            lines.append("Current Usage:")
             if "monthly_tokens" in usage and "monthly_limit" in usage:
-                print(f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({usage.get('monthly_percent', 0):.1f}%)", file=sys.stderr)
+                lines.append(f"  Monthly Tokens: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} ({usage.get('monthly_percent', 0):.1f}%)")
             if "daily_tokens" in usage and "daily_limit" in usage:
-                print(f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({usage.get('daily_percent', 0):.1f}%)", file=sys.stderr)
+                lines.append(f"  Daily Tokens:   {usage['daily_tokens']:,} / {usage['daily_limit']:,} ({usage.get('daily_percent', 0):.1f}%)")
+            if "estimated_cost" in usage and "monthly_cost_limit" in usage:
+                lines.append(f"  Monthly Cost:   ${usage['estimated_cost']:,.2f} / ${usage['monthly_cost_limit']:,.2f} ({usage.get('monthly_cost_percent', 0):.1f}%)")
+            if "daily_cost" in usage and "daily_cost_limit" in usage:
+                lines.append(f"  Daily Cost:     ${usage['daily_cost']:,.2f} / ${usage['daily_cost_limit']:,.2f} ({usage.get('daily_cost_percent', 0):.1f}%)")
 
         if policy:
-            print(f"\nPolicy: {policy.get('type', 'unknown')}:{policy.get('identifier', 'unknown')}", file=sys.stderr)
+            lines.append(f"\nPolicy: {policy.get('type', 'unknown')}:{policy.get('identifier', 'unknown')}")
 
-        print("\nTo request an unblock, contact your administrator.", file=sys.stderr)
-        print("=" * 60 + "\n", file=sys.stderr)
+        if "cost" in reason:
+            lines.append("\nBlocked by: COST LIMIT")
+        elif "token" in reason:
+            lines.append("\nBlocked by: TOKEN LIMIT")
+
+        lines.extend(["", "To request an unblock, contact your administrator.", "=" * 60, ""])
+        print("\n".join(lines), file=sys.stderr, flush=True)
 
         # Show browser notification
         self._show_quota_browser_notification(quota_result, is_blocked=True)
@@ -1538,18 +1657,30 @@ class MultiProviderAuth:
             is_blocked: Whether access is blocked (vs warning)
         """
         try:
-            usage = quota_result.get("usage", {})
+            usage = quota_result.get("usage") or {}
             message = quota_result.get("message", "")
 
-            # Calculate percentages
+            reason = quota_result.get("reason", "")
+
+            # Calculate percentages — tokens
             monthly_percent = usage.get("monthly_percent", 0)
             daily_percent = usage.get("daily_percent", 0)
 
-            # Format numbers for display
+            # Calculate percentages — cost
+            monthly_cost_percent = usage.get("monthly_cost_percent", 0)
+            daily_cost_percent = usage.get("daily_cost_percent", 0)
+
+            # Format numbers for display — tokens
             monthly_tokens = usage.get("monthly_tokens", 0)
             monthly_limit = usage.get("monthly_limit", 0)
             daily_tokens = usage.get("daily_tokens", 0)
             daily_limit = usage.get("daily_limit", 0)
+
+            # Format numbers for display — cost
+            estimated_cost = usage.get("estimated_cost", 0)
+            monthly_cost_limit = usage.get("monthly_cost_limit", 0)
+            daily_cost = usage.get("daily_cost", 0)
+            daily_cost_limit = usage.get("daily_cost_limit", 0)
 
             def format_tokens(n):
                 if n >= 1_000_000_000:
@@ -1560,14 +1691,21 @@ class MultiProviderAuth:
                     return f"{n/1_000:.1f}K"
                 return str(int(n))
 
+            def format_cost(n):
+                return f"${n:,.2f}"
+
+            # Determine which limit type was hit
+            is_cost_issue = "cost" in reason
+            is_token_issue = "token" in reason
+
             # Determine status styling
             if is_blocked:
-                status_emoji = "🚫"
+                status_emoji = "&#x1F6AB;"
                 status_text = "Access Blocked"
                 status_color = "#dc3545"
                 header_bg = "#f8d7da"
             else:
-                status_emoji = "⚠️"
+                status_emoji = "&#x26A0;&#xFE0F;"
                 status_text = "Quota Warning"
                 status_color = "#ffc107"
                 header_bg = "#fff3cd"
@@ -1584,10 +1722,110 @@ class MultiProviderAuth:
 
             monthly_bar_color = bar_color(monthly_percent)
             daily_bar_color = bar_color(daily_percent) if daily_limit else "#6c757d"
+            monthly_cost_bar_color = bar_color(monthly_cost_percent) if monthly_cost_limit else "#6c757d"
+            daily_cost_bar_color = bar_color(daily_cost_percent) if daily_cost_limit else "#6c757d"
+
+            # Pre-format percentages to avoid f-string nesting issues
+            monthly_pct_str = f"{monthly_percent:.1f}"
+            monthly_pct_int = f"{monthly_percent:.0f}"
+            monthly_pct_width = f"{min(monthly_percent, 100)}"
+            daily_pct_str = f"{daily_percent:.1f}"
+            daily_pct_int = f"{daily_percent:.0f}"
+            daily_pct_width = f"{min(daily_percent, 100)}"
+            mcost_pct_str = f"{monthly_cost_percent:.1f}"
+            mcost_pct_int = f"{monthly_cost_percent:.0f}"
+            mcost_pct_width = f"{min(monthly_cost_percent, 100)}"
+            dcost_pct_str = f"{daily_cost_percent:.1f}"
+            dcost_pct_int = f"{daily_cost_percent:.0f}"
+            dcost_pct_width = f"{min(daily_cost_percent, 100)}"
+
+            # Pre-format token/cost display values
+            monthly_tokens_fmt = format_tokens(monthly_tokens)
+            monthly_limit_fmt = format_tokens(monthly_limit)
+            daily_tokens_fmt = format_tokens(daily_tokens)
+            daily_limit_fmt = format_tokens(daily_limit) if daily_limit else ""
+            estimated_cost_fmt = format_cost(estimated_cost)
+            monthly_cost_limit_fmt = format_cost(monthly_cost_limit) if monthly_cost_limit else ""
+            daily_cost_fmt = format_cost(daily_cost)
+            daily_cost_limit_fmt = format_cost(daily_cost_limit) if daily_cost_limit else ""
+
+            # Build usage sections as separate strings to avoid nested f-string issues
+            token_monthly_html = ""
+            if monthly_limit:
+                token_monthly_html = f"""
+            <div class="section-title">Token Usage</div>
+            <div class="usage-section">
+                <div class="usage-label">
+                    <span>Monthly Tokens</span>
+                    <span class="usage-value">{monthly_tokens_fmt} / {monthly_limit_fmt} ({monthly_pct_str}%)</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {monthly_pct_width}%; background: {monthly_bar_color};">
+                        {monthly_pct_int}%
+                    </div>
+                </div>
+            </div>"""
+
+            token_daily_html = ""
+            if daily_limit:
+                token_daily_html = f"""
+            <div class="usage-section">
+                <div class="usage-label">
+                    <span>Daily Tokens</span>
+                    <span class="usage-value">{daily_tokens_fmt} / {daily_limit_fmt} ({daily_pct_str}%)</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {daily_pct_width}%; background: {daily_bar_color};">
+                        {daily_pct_int}%
+                    </div>
+                </div>
+            </div>"""
+
+            cost_monthly_html = ""
+            if monthly_cost_limit:
+                cost_monthly_html = f"""
+            <div class="section-title">Cost Usage</div>
+            <div class="usage-section">
+                <div class="usage-label">
+                    <span>Monthly Cost</span>
+                    <span class="usage-value">{estimated_cost_fmt} / {monthly_cost_limit_fmt} ({mcost_pct_str}%)</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {mcost_pct_width}%; background: {monthly_cost_bar_color};">
+                        {mcost_pct_int}%
+                    </div>
+                </div>
+            </div>"""
+
+            cost_daily_html = ""
+            if daily_cost_limit:
+                cost_daily_html = f"""
+            <div class="usage-section">
+                <div class="usage-label">
+                    <span>Daily Cost</span>
+                    <span class="usage-value">{daily_cost_fmt} / {daily_cost_limit_fmt} ({dcost_pct_str}%)</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {dcost_pct_width}%; background: {daily_cost_bar_color};">
+                        {dcost_pct_int}%
+                    </div>
+                </div>
+            </div>"""
+
+            blocked_by_html = ""
+            if is_cost_issue:
+                blocked_by_html = "<div class='blocked-by'>COST LIMIT</div>"
+            elif is_token_issue:
+                blocked_by_html = "<div class='blocked-by'>TOKEN LIMIT</div>"
+
+            message_html = html_module.escape(message) if message else ("Your access has been blocked due to quota limits." if is_blocked else "You're approaching your quota limit.")
+            if is_blocked:
+                message_html += " Contact your administrator for assistance."
 
             html = f"""<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <title>Quota Status - Claude Code</title>
     <style>
         body {{
@@ -1669,41 +1907,41 @@ class MultiProviderAuth:
             font-size: 13px;
             color: #666;
         }}
+        .section-title {{
+            font-size: 13px;
+            font-weight: 600;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid #eee;
+        }}
+        .blocked-by {{
+            display: inline-block;
+            background: {status_color};
+            color: white;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 4px 12px;
+            border-radius: 12px;
+            margin-top: 10px;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>{status_emoji} {status_text}</h1>
+            {blocked_by_html}
         </div>
         <div class="content">
-            <div class="usage-section">
-                <div class="usage-label">
-                    <span>Monthly Usage</span>
-                    <span class="usage-value">{format_tokens(monthly_tokens)} / {format_tokens(monthly_limit)} ({monthly_percent:.1f}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {min(monthly_percent, 100)}%; background: {monthly_bar_color};">
-                        {monthly_percent:.0f}%
-                    </div>
-                </div>
-            </div>
-            {"" if not daily_limit else f'''
-            <div class="usage-section">
-                <div class="usage-label">
-                    <span>Daily Usage</span>
-                    <span class="usage-value">{format_tokens(daily_tokens)} / {format_tokens(daily_limit)} ({daily_percent:.1f}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {min(daily_percent, 100)}%; background: {daily_bar_color};">
-                        {daily_percent:.0f}%
-                    </div>
-                </div>
-            </div>
-            '''}
+            {token_monthly_html}
+            {token_daily_html}
+            {cost_monthly_html}
+            {cost_daily_html}
             <div class="message">
-                {html_module.escape(message) if message else ("Your access has been blocked due to quota limits." if is_blocked else "You're approaching your quota limit.")}
-                {" Contact your administrator for assistance." if is_blocked else ""}
+                {message_html}
             </div>
         </div>
         <div class="footer">
@@ -1755,7 +1993,7 @@ class MultiProviderAuth:
         Args:
             quota_result: Result from quota check API
         """
-        usage = quota_result.get("usage", {})
+        usage = quota_result.get("usage") or {}
         monthly_percent = usage.get("monthly_percent", 0)
         daily_percent = usage.get("daily_percent", 0)
 
@@ -1763,18 +2001,28 @@ class MultiProviderAuth:
         if monthly_percent < 80 and daily_percent < 80:
             return
 
-        # Show terminal warning
-        print("\n" + "=" * 60, file=sys.stderr)
-        print("QUOTA WARNING", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
+        # Show terminal warning (single print to avoid interleaving with Claude Code UI)
+        lines = [
+            "",
+            "=" * 60,
+            "QUOTA WARNING",
+            "=" * 60,
+        ]
 
         if usage:
             if "monthly_tokens" in usage and "monthly_limit" in usage:
-                print(f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({monthly_percent:.1f}%)", file=sys.stderr)
+                lines.append(f"  Monthly Tokens: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} ({monthly_percent:.1f}%)")
             if "daily_tokens" in usage and "daily_limit" in usage:
-                print(f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({daily_percent:.1f}%)", file=sys.stderr)
+                lines.append(f"  Daily Tokens:   {usage['daily_tokens']:,} / {usage['daily_limit']:,} ({daily_percent:.1f}%)")
+            if "estimated_cost" in usage and "monthly_cost_limit" in usage:
+                monthly_cost_pct = usage.get("monthly_cost_percent", 0)
+                lines.append(f"  Monthly Cost:   ${usage['estimated_cost']:,.2f} / ${usage['monthly_cost_limit']:,.2f} ({monthly_cost_pct:.1f}%)")
+            if "daily_cost" in usage and "daily_cost_limit" in usage:
+                daily_cost_pct = usage.get("daily_cost_percent", 0)
+                lines.append(f"  Daily Cost:     ${usage['daily_cost']:,.2f} / ${usage['daily_cost_limit']:,.2f} ({daily_cost_pct:.1f}%)")
 
-        print("=" * 60 + "\n", file=sys.stderr)
+        lines.extend(["=" * 60, ""])
+        print("\n".join(lines), file=sys.stderr, flush=True)
 
         # Show browser notification
         self._show_quota_browser_notification(quota_result, is_blocked=False)
@@ -1808,17 +2056,32 @@ class MultiProviderAuth:
                 print(json.dumps(cached))  # noqa: S105
                 return 0
 
+            # Pre-check quota before browser auth if we have a cached monitoring token.
+            # This avoids forcing re-authentication when the user is already blocked.
+            if self._should_check_quota():
+                cached_id_token = self.get_monitoring_token()
+                cached_token_claims = self._get_cached_token_claims()
+                if cached_id_token and cached_token_claims:
+                    self._debug_print("Pre-checking quota with cached monitoring token...")
+                    quota_result = self._check_quota(cached_token_claims, cached_id_token)
+                    self._save_quota_check_timestamp()
+                    if not quota_result.get("allowed", True):
+                        return self._handle_quota_blocked(quota_result)
+                    self._debug_print("Quota pre-check passed, proceeding with authentication")
+
             # Try to acquire port lock by testing if we can bind to it
+            # Use the same bind address as the actual callback server
+            bind_host = os.getenv("REDIRECT_BIND", "127.0.0.1")
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                test_socket.bind(("127.0.0.1", self.redirect_port))
+                test_socket.bind((bind_host, self.redirect_port))
                 test_socket.close()
                 # We got the port, we can proceed with authentication
                 self._debug_print("Port available, proceeding with authentication")
             except OSError as e:
                 if e.errno == errno.EADDRINUSE:
                     # Port in use, another auth is in progress
-                    self._debug_print("Another authentication is in progress, waiting...")
+                    self._debug_print(f"Port {self.redirect_port} in use on {bind_host}, checking...")
                     test_socket.close()
 
                     # Wait for the other process to complete
@@ -1844,6 +2107,10 @@ class MultiProviderAuth:
             # Authenticate with OIDC provider
             self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
             id_token, token_claims = self.authenticate_oidc()
+
+            # Save monitoring token early (before quota check) so subsequent
+            # calls can check quota without re-authenticating via browser
+            self.save_monitoring_token(id_token, token_claims)
 
             # Check quota before issuing credentials (if configured)
             if self._should_check_quota():

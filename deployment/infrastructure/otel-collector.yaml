@@ -62,7 +62,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: /aws/claude-code/metrics
-      RetentionInDays: 30
+      RetentionInDays: 60
       Tags:
         - Key: Purpose
           Value: Claude Code Usage Metrics

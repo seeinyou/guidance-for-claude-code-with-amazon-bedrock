@@ -12,7 +12,7 @@ _query_cache = {}
 _last_query_time = 0
 _query_counter = 0
 
-def validate_time_range(start_time, end_time, max_days=7):
+def validate_time_range(start_time, end_time, max_days=60):
     """
     Validate the time range is within acceptable limits.
     

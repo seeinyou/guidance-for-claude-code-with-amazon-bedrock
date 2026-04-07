@@ -4,8 +4,11 @@
 import json
 import boto3
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+
+# Effective timezone for daily/monthly quota boundaries (UTC+8)
+EFFECTIVE_TZ = timezone(timedelta(hours=8))
 from boto3.dynamodb.conditions import Key, Attr
 
 # Initialize clients
@@ -36,8 +39,8 @@ def lambda_handler(event, context):
     print(f"Starting quota monitoring check at {datetime.now(timezone.utc).isoformat()}")
     print(f"Fine-grained quotas: {'enabled' if ENABLE_FINEGRAINED_QUOTAS else 'disabled'}")
 
-    # Get current calendar month boundaries
-    now = datetime.now(timezone.utc)
+    # Get current calendar month boundaries (UTC+8)
+    now = datetime.now(EFFECTIVE_TZ)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_name = now.strftime("%B %Y")
     current_date = now.strftime("%Y-%m-%d")
@@ -181,8 +184,8 @@ def get_monthly_usage(month_name):
     """
     user_usage = {}
 
-    # Extract YYYY-MM format from month_name
-    now = datetime.now(timezone.utc)
+    # Extract YYYY-MM format (UTC+8 boundaries)
+    now = datetime.now(EFFECTIVE_TZ)
     month_prefix = now.strftime("%Y-%m")
 
     try:
@@ -499,7 +502,7 @@ def get_sent_alerts(month_name):
     sent_alerts = set()
 
     try:
-        month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        month_prefix = datetime.now(EFFECTIVE_TZ).strftime("%Y-%m")
 
         response = quota_table.query(
             KeyConditionExpression=Key("pk").eq("ALERTS")
@@ -554,11 +557,12 @@ def record_sent_alert(month_name, email, alert_type, alert_level, alert_data):
     Record that an alert was sent to prevent duplicates.
     """
     try:
-        month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        effective_now = datetime.now(EFFECTIVE_TZ)
+        month_prefix = effective_now.strftime("%Y-%m")
 
         # Build SK based on alert type
         if alert_type == "daily":
-            date = alert_data.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            date = alert_data.get("date", effective_now.strftime("%Y-%m-%d"))
             sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}#{date}"
         else:
             sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}"
@@ -715,7 +719,7 @@ Enforcement: {enforcement}
 -------------------------------------
 ACTION REQUIRED
 -------------------------------------
-{"ACCESS IS BLOCKED until daily quota resets at UTC midnight or admin unblocks." if enforcement == "block" and alert['alert_level'] == 'exceeded' else "User may soon exceed daily quota limit."}
+{"ACCESS IS BLOCKED until daily quota resets at midnight (UTC+8) or admin unblocks." if enforcement == "block" and alert['alert_level'] == 'exceeded' else "User may soon exceed daily quota limit."}
 
 To temporarily unblock this user:
   ccwb quota unblock {user_email} --duration 24h
@@ -724,7 +728,7 @@ To increase their daily quota:
   ccwb quota set-user {user_email} --daily-limit 20M
 
 =====================================
-Daily quotas reset at UTC midnight.
+Daily quotas reset at midnight (UTC+8).
 """
 
 
@@ -763,13 +767,13 @@ To increase their cost quota:
   ccwb quota set-user {user_email} --{'daily' if is_daily else 'monthly'}-cost-limit {'20' if is_daily else '200'}
 
 =====================================
-{"Daily cost quotas reset at UTC midnight." if is_daily else "This alert is sent once per threshold level per month."}
+{"Daily cost quotas reset at midnight (UTC+8)." if is_daily else "This alert is sent once per threshold level per month."}
 """
 
 
 def get_org_usage():
-    """Get org aggregate usage for current month."""
-    now = datetime.now(timezone.utc)
+    """Get org aggregate usage for current month (UTC+8 boundaries)."""
+    now = datetime.now(EFFECTIVE_TZ)
     sk = f"MONTH#{now.strftime('%Y-%m')}"
     try:
         response = quota_table.get_item(Key={"pk": "ORG#global", "sk": sk})

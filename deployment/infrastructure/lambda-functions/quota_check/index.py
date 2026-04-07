@@ -5,9 +5,12 @@
 import json
 import boto3
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from boto3.dynamodb.conditions import Key, Attr
+
+# Effective timezone for daily/monthly quota boundaries (UTC+8)
+EFFECTIVE_TZ = timezone(timedelta(hours=8))
 
 # Initialize clients
 dynamodb = boto3.resource("dynamodb")
@@ -46,12 +49,34 @@ def lambda_handler(event, context):
     """
     try:
         # Extract validated claims from API Gateway JWT Authorizer
-        # The JWT Authorizer validates the token before Lambda is invoked
+        # The JWT Authorizer validates the token and passes claims to Lambda via requestContext.
         authorizer_context = event.get("requestContext", {}).get("authorizer", {})
         jwt_claims = authorizer_context.get("jwt", {}).get("claims", {})
 
         # Email from validated JWT claims (secure - no parameter tampering possible)
         email = jwt_claims.get("email")
+
+        # Fallback: if API Gateway didn't pass claims (e.g. payload format mismatch),
+        # decode the JWT from the Authorization header directly. The token has already
+        # been validated by the API Gateway JWT Authorizer, so signature verification
+        # is not required here — we only need the claims.
+        if not email:
+            auth_header = event.get("headers", {}).get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                try:
+                    import base64
+                    token = auth_header[7:]
+                    payload_b64 = token.split(".")[1]
+                    padding = 4 - len(payload_b64) % 4
+                    if padding != 4:
+                        payload_b64 += "=" * padding
+                    fallback_claims = json.loads(base64.b64decode(payload_b64))
+                    email = fallback_claims.get("email")
+                    if email:
+                        print(f"Extracted email from Authorization header fallback: {email}")
+                        jwt_claims = fallback_claims
+                except Exception as fb_err:
+                    print(f"Fallback JWT decode failed: {fb_err}")
 
         # Extract groups from various possible JWT claims
         groups = extract_groups_from_claims(jwt_claims)
@@ -175,7 +200,7 @@ def lambda_handler(event, context):
                 "usage": usage_summary,
                 "policy": policy_ref,
                 "unblock_status": {"is_unblocked": False},
-                "message": f"Daily quota exceeded: {int(daily_tokens):,} / {int(daily_limit):,} tokens ({daily_tokens/daily_limit*100:.1f}%). Quota resets at UTC midnight."
+                "message": f"Daily quota exceeded: {int(daily_tokens):,} / {int(daily_limit):,} tokens ({daily_tokens/daily_limit*100:.1f}%). Quota resets at midnight (UTC+8)."
             })
 
         # Check daily cost limit
@@ -187,7 +212,7 @@ def lambda_handler(event, context):
                 "usage": usage_summary,
                 "policy": policy_ref,
                 "unblock_status": {"is_unblocked": False},
-                "message": f"Daily cost quota exceeded: ${daily_cost:,.2f} / ${daily_cost_limit:,.2f} ({daily_cost/daily_cost_limit*100:.1f}%). Quota resets at UTC midnight."
+                "message": f"Daily cost quota exceeded: ${daily_cost:,.2f} / ${daily_cost_limit:,.2f} ({daily_cost/daily_cost_limit*100:.1f}%). Quota resets at midnight (UTC+8)."
             })
 
         # All checks passed - access allowed
@@ -301,8 +326,16 @@ def resolve_quota_for_user(email: str, groups: list) -> dict | None:
                 group_policies.append(group_policy)
 
         if group_policies:
-            # Most restrictive = lowest monthly_token_limit
-            return min(group_policies, key=lambda p: p.get("monthly_token_limit", float("inf")))
+            # Most restrictive = lowest limits across token AND cost dimensions
+            # Compare by: monthly_token_limit, monthly_cost_limit, daily_token_limit, daily_cost_limit
+            def _policy_restrictiveness(p):
+                return (
+                    p.get("monthly_token_limit") or float("inf"),
+                    p.get("monthly_cost_limit") or float("inf"),
+                    p.get("daily_token_limit") or float("inf"),
+                    p.get("daily_cost_limit") or float("inf"),
+                )
+            return min(group_policies, key=_policy_restrictiveness)
 
     # 3. Fall back to default policy
     default_policy = get_policy("default", "default")
@@ -374,8 +407,8 @@ def get_unblock_status(email: str) -> dict:
 
 
 def get_user_usage(email: str) -> dict:
-    """Get current usage for a user in the current month."""
-    now = datetime.now(timezone.utc)
+    """Get current usage for a user in the current month (UTC+8 boundaries)."""
+    now = datetime.now(EFFECTIVE_TZ)
     month_prefix = now.strftime("%Y-%m")
     current_date = now.strftime("%Y-%m-%d")
 
@@ -497,8 +530,8 @@ def get_org_policy() -> dict | None:
 
 
 def get_org_usage() -> dict:
-    """Get org aggregate usage for current month."""
-    now = datetime.now(timezone.utc)
+    """Get org aggregate usage for current month (UTC+8 boundaries)."""
+    now = datetime.now(EFFECTIVE_TZ)
     sk = f"MONTH#{now.strftime('%Y-%m')}"
     try:
         response = quota_table.get_item(Key={"pk": "ORG#global", "sk": sk})
@@ -535,7 +568,13 @@ def check_org_limits() -> dict | None:
             "allowed": False,
             "reason": "org_monthly_tokens_exceeded",
             "enforcement_mode": "block",
-            "usage": {"org_total_tokens": int(total_tokens), "org_monthly_limit": monthly_limit},
+            "usage": {
+                "monthly_tokens": int(total_tokens),
+                "monthly_limit": monthly_limit,
+                "monthly_percent": round(total_tokens / monthly_limit * 100, 1) if monthly_limit > 0 else 0,
+                "org_total_tokens": int(total_tokens),
+                "org_monthly_limit": monthly_limit,
+            },
             "policy": {"type": "org", "identifier": "global"},
             "unblock_status": None,
             "message": f"Organization-wide monthly token quota exceeded: {int(total_tokens):,} / {int(monthly_limit):,} tokens. All users are blocked. Contact your administrator."
@@ -546,7 +585,16 @@ def check_org_limits() -> dict | None:
             "allowed": False,
             "reason": "org_monthly_cost_exceeded",
             "enforcement_mode": "block",
-            "usage": {"org_estimated_cost": round(estimated_cost, 2), "org_monthly_cost_limit": monthly_cost_limit},
+            "usage": {
+                "monthly_tokens": int(total_tokens),
+                "monthly_limit": monthly_limit if monthly_limit > 0 else 0,
+                "monthly_percent": round(total_tokens / monthly_limit * 100, 1) if monthly_limit > 0 else 0,
+                "estimated_cost": round(estimated_cost, 2),
+                "monthly_cost_limit": monthly_cost_limit,
+                "monthly_cost_percent": round(estimated_cost / monthly_cost_limit * 100, 1),
+                "org_estimated_cost": round(estimated_cost, 2),
+                "org_monthly_cost_limit": monthly_cost_limit,
+            },
             "policy": {"type": "org", "identifier": "global"},
             "unblock_status": None,
             "message": f"Organization-wide monthly cost quota exceeded: ${estimated_cost:,.2f} / ${monthly_cost_limit:,.2f}. All users are blocked. Contact your administrator."

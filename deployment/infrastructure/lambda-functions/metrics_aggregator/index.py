@@ -9,6 +9,9 @@ import time
 from collections import defaultdict
 from decimal import Decimal
 
+# Effective timezone for daily/monthly quota boundaries (UTC+8)
+EFFECTIVE_TZ = timezone(timedelta(hours=8))
+
 # Initialize clients
 logs_client = boto3.client("logs")
 cloudwatch_client = boto3.client("cloudwatch")
@@ -22,7 +25,7 @@ QUOTA_TABLE = os.environ.get("QUOTA_TABLE")  # Optional - only set if quota moni
 POLICIES_TABLE = os.environ.get("POLICIES_TABLE")  # Optional - for fine-grained quotas
 PRICING_TABLE = os.environ.get("PRICING_TABLE")  # Optional - for cost-based quotas
 ENABLE_FINEGRAINED_QUOTAS = os.environ.get("ENABLE_FINEGRAINED_QUOTAS", "false").lower() == "true"
-AGGREGATION_WINDOW = 5  # minutes
+AGGREGATION_WINDOW = int(os.environ.get("AGGREGATION_WINDOW", "15"))  # minutes
 
 # DynamoDB tables
 table = dynamodb.Table(METRICS_TABLE)
@@ -918,10 +921,12 @@ def update_quota_table(timestamp, user_details):
         return
 
     try:
-        current_month = timestamp.strftime("%Y-%m")
-        current_date = timestamp.strftime("%Y-%m-%d")
+        # Use UTC+8 for daily/monthly quota boundaries
+        effective_now = timestamp.astimezone(EFFECTIVE_TZ)
+        current_month = effective_now.strftime("%Y-%m")
+        current_date = effective_now.strftime("%Y-%m-%d")
         ttl = int(
-            (timestamp.replace(day=28) + timedelta(days=32)).replace(day=1).timestamp()
+            (effective_now.replace(day=28) + timedelta(days=32)).replace(day=1).timestamp()
         )  # End of next month
 
         for user in user_details:
