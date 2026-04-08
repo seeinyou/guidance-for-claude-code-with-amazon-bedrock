@@ -526,27 +526,182 @@ class DeployCommand(Command):
                     deployment_timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
                     params.append(f"DeploymentTimestamp={deployment_timestamp}")
 
-                    result = deploy_with_cf(
-                        template,
-                        stack_name,
-                        params,
-                        ["CAPABILITY_NAMED_IAM"],
-                        task_description="Deploying landing page distribution stack...",
-                    )
+                    # Add admin panel parameters if enabled
+                    admin_enabled = getattr(profile, "admin_panel_enabled", False)
+                    if admin_enabled and getattr(profile, "quota_monitoring_enabled", False):
+                        # Get quota stack outputs for table names/ARNs
+                        quota_stack_name = profile.stack_names.get(
+                            "quota", f"{profile.identity_pool_name}-quota"
+                        )
+                        quota_outputs = get_stack_outputs(quota_stack_name, profile.aws_region)
 
-                    # Display outputs for landing page
-                    if result == 0:
-                        outputs = get_stack_outputs(stack_name, profile.aws_region)
-                        console.print("\n[bold green]✓ Landing page deployed successfully![/bold green]")
-                        console.print(f"\n[bold]Distribution URL:[/bold] {outputs.get('DistributionURL', 'N/A')}")
-                        console.print("\n[bold yellow]⚠️  Configure your IdP web application:[/bold yellow]")
-                        console.print(f"   [cyan]Redirect URI:[/cyan] {outputs.get('IdPRedirectURI', 'N/A')}")
-                        console.print(
-                            "\n   Add this redirect URI to your IdP web application settings "
-                            "before users can authenticate."
+                        if not quota_outputs or not quota_outputs.get("PoliciesTableArn"):
+                            console.print(
+                                "[red]Error: Quota stack outputs not found. Deploy quota stack first.[/red]"
+                            )
+                            console.print("Run: [cyan]ccwb deploy quota[/cyan]")
+                            return 1
+
+                        admin_params = [
+                            "EnableAdminPanel=true",
+                            f"AdminEmails={getattr(profile, 'admin_emails', '')}",
+                            f"AdminGroupName={getattr(profile, 'admin_group_name', '')}",
+                            f"QuotaPoliciesTableName={quota_outputs['PoliciesTableName']}",
+                            f"QuotaPoliciesTableArn={quota_outputs['PoliciesTableArn']}",
+                            f"UserQuotaMetricsTableName={quota_outputs['QuotaTableName']}",
+                            f"UserQuotaMetricsTableArn={quota_outputs['QuotaTableArn']}",
+                        ]
+
+                        # Add pricing table if available
+                        if quota_outputs.get("PricingTableName"):
+                            admin_params.extend([
+                                f"BedrockPricingTableName={quota_outputs['PricingTableName']}",
+                                f"BedrockPricingTableArn={quota_outputs['PricingTableArn']}",
+                            ])
+
+                        params.extend(admin_params)
+
+                    # When admin panel is enabled, use aws cloudformation package
+                    # to upload file-based Lambda code to S3
+                    deploy_template = template
+                    if admin_enabled and getattr(profile, "quota_monitoring_enabled", False):
+                        s3_stack_name = profile.stack_names.get(
+                            "s3", f"{profile.identity_pool_name}-s3bucket"
+                        )
+                        s3_outputs = get_stack_outputs(s3_stack_name, profile.aws_region)
+
+                        if not s3_outputs or not s3_outputs.get("CfnArtifactsBucket"):
+                            console.print(
+                                "[red]Error: S3 bucket for packaging not found.[/red]"
+                            )
+                            console.print(
+                                "[yellow]The s3bucket stack must be deployed first.[/yellow]"
+                            )
+                            console.print("Run: [cyan]ccwb deploy[/cyan]")
+                            return 1
+
+                        s3_bucket = s3_outputs["CfnArtifactsBucket"]
+                        task = progress.add_task(
+                            "Packaging admin panel Lambda functions...", total=None
                         )
 
-                    return result
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                mode="w", suffix=".yaml", delete=False
+                            ) as f:
+                                packaged_template_path = f.name
+
+                            cmd = [
+                                "aws",
+                                "cloudformation",
+                                "package",
+                                "--template-file",
+                                str(template),
+                                "--s3-bucket",
+                                s3_bucket,
+                                "--s3-prefix",
+                                "claude-code/landing-page-admin",
+                                "--output-template-file",
+                                packaged_template_path,
+                                "--region",
+                                profile.aws_region,
+                            ]
+
+                            result_pkg = subprocess.run(
+                                cmd, capture_output=True, text=True
+                            )
+
+                            if result_pkg.returncode != 0:
+                                console.print(
+                                    f"[red]Failed to package template: {result_pkg.stderr}[/red]"
+                                )
+                                return 1
+
+                            progress.update(
+                                task,
+                                description="Admin panel Lambda packaged successfully",
+                                completed=True,
+                            )
+                            deploy_template = packaged_template_path
+                        except Exception as e:
+                            console.print(
+                                f"[red]Failed to package template: {e}[/red]"
+                            )
+                            return 1
+
+                    try:
+                        if admin_enabled and getattr(profile, "quota_monitoring_enabled", False):
+                            # Use AWS CLI deploy for admin panel (template > 51KB TemplateBody limit)
+                            task = progress.add_task(
+                                "Deploying landing page distribution stack...", total=None
+                            )
+
+                            deploy_cmd = [
+                                "aws", "cloudformation", "deploy",
+                                "--template-file", str(deploy_template),
+                                "--stack-name", stack_name,
+                                "--capabilities", "CAPABILITY_NAMED_IAM",
+                                "--region", profile.aws_region,
+                                "--s3-bucket", s3_bucket,
+                                "--s3-prefix", "claude-code/landing-page-templates",
+                                "--no-fail-on-empty-changeset",
+                                "--parameter-overrides",
+                            ] + params
+
+                            result_deploy = subprocess.run(
+                                deploy_cmd, capture_output=True, text=True
+                            )
+
+                            progress.update(task, completed=True)
+
+                            if result_deploy.returncode != 0:
+                                console.print(
+                                    f"[red]CloudFormation deploy failed:\n{result_deploy.stderr}[/red]"
+                                )
+                                result = 1
+                            else:
+                                result = 0
+                        else:
+                            result = deploy_with_cf(
+                                deploy_template,
+                                stack_name,
+                                params,
+                                ["CAPABILITY_NAMED_IAM"],
+                                task_description="Deploying landing page distribution stack...",
+                            )
+
+                        # Display outputs for landing page
+                        if result == 0:
+                            outputs = get_stack_outputs(stack_name, profile.aws_region)
+                            console.print(
+                                "\n[bold green]✓ Landing page deployed successfully![/bold green]"
+                            )
+                            console.print(
+                                f"\n[bold]Distribution URL:[/bold] {outputs.get('DistributionURL', 'N/A')}"
+                            )
+                            console.print(
+                                "\n[bold yellow]⚠️  Configure your IdP web application:[/bold yellow]"
+                            )
+                            console.print(
+                                f"   [cyan]Redirect URI:[/cyan] {outputs.get('IdPRedirectURI', 'N/A')}"
+                            )
+                            console.print(
+                                "\n   Add this redirect URI to your IdP web application settings "
+                                "before users can authenticate."
+                            )
+                            if admin_enabled and outputs.get("AdminPanelURL"):
+                                console.print(
+                                    f"\n[bold]Admin Panel:[/bold] {outputs.get('AdminPanelURL')}"
+                                )
+
+                        return result
+                    finally:
+                        # Clean up packaged template if we created one
+                        if deploy_template != template:
+                            try:
+                                os.unlink(str(deploy_template))
+                            except Exception:
+                                pass
 
                 else:  # presigned-s3 or legacy
                     template = project_root / "deployment" / "infrastructure" / "presigned-s3-distribution.yaml"
@@ -772,13 +927,17 @@ class DeployCommand(Command):
                 )
 
                 # Get OIDC configuration for JWT authentication
-                oidc_issuer_url = profile.provider_domain
-                # Ensure issuer URL has https:// prefix
-                if oidc_issuer_url and not oidc_issuer_url.startswith(("http://", "https://")):
-                    oidc_issuer_url = f"https://{oidc_issuer_url}"
-                # Auth0 tokens include trailing slash in iss claim, so authorizer must match
-                if profile.provider_type == "auth0" and oidc_issuer_url and not oidc_issuer_url.endswith("/"):
-                    oidc_issuer_url = f"{oidc_issuer_url}/"
+                # Cognito OIDC issuer is cognito-idp endpoint, NOT the hosted UI domain
+                if profile.provider_type == "cognito" and profile.cognito_user_pool_id:
+                    oidc_issuer_url = f"https://cognito-idp.{profile.aws_region}.amazonaws.com/{profile.cognito_user_pool_id}"
+                else:
+                    oidc_issuer_url = profile.provider_domain
+                    # Ensure issuer URL has https:// prefix
+                    if oidc_issuer_url and not oidc_issuer_url.startswith(("http://", "https://")):
+                        oidc_issuer_url = f"https://{oidc_issuer_url}"
+                    # Auth0 tokens include trailing slash in iss claim, so authorizer must match
+                    if profile.provider_type == "auth0" and oidc_issuer_url and not oidc_issuer_url.endswith("/"):
+                        oidc_issuer_url = f"{oidc_issuer_url}/"
                 oidc_client_id = profile.client_id
 
                 params = [
@@ -971,6 +1130,8 @@ class DeployCommand(Command):
                 return
 
             quota_table_name = quota_outputs["QuotaTableName"]
+            policies_table_name = quota_outputs.get("PoliciesTableName", "QuotaPolicies")
+            pricing_table_name = quota_outputs.get("PricingTableName", "BedrockPricing")
 
             # Get the metrics aggregator function name
             metrics_aggregator_name = "ClaudeCode-MetricsAggregator"
@@ -981,16 +1142,20 @@ class DeployCommand(Command):
             lambda_client = boto3.client("lambda", region_name=profile.aws_region)
 
             try:
+                env_vars = {
+                    "METRICS_LOG_GROUP": profile.metrics_log_group,
+                    "METRICS_REGION": profile.aws_region,
+                    "METRICS_TABLE": "ClaudeCodeMetrics",
+                    "QUOTA_TABLE": quota_table_name,
+                    "POLICIES_TABLE": policies_table_name,
+                    "PRICING_TABLE": pricing_table_name,
+                }
+                if getattr(profile, "enable_finegrained_quotas", False):
+                    env_vars["ENABLE_FINEGRAINED_QUOTAS"] = "true"
+
                 lambda_client.update_function_configuration(
                     FunctionName=metrics_aggregator_name,
-                    Environment={
-                        "Variables": {
-                            "METRICS_LOG_GROUP": profile.metrics_log_group,
-                            "METRICS_REGION": profile.aws_region,
-                            "METRICS_TABLE": "ClaudeCodeMetrics",
-                            "QUOTA_TABLE": quota_table_name,
-                        }
-                    },
+                    Environment={"Variables": env_vars},
                 )
                 console.print("[green]✓ Updated metrics aggregator to enable quota tracking[/green]")
             except Exception as e:

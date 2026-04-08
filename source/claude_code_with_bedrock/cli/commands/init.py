@@ -750,6 +750,42 @@ class InitCommand(Command):
                     console.print(f"  • Burst buffer: {burst_percent}%")
                     console.print(f"  • Re-check interval: {check_interval} minutes")
 
+                    # Admin panel for landing page (only if landing-page distribution + quota enabled)
+                    dist_type = config.get("distribution", {}).get("type")
+                    if dist_type == "landing-page":
+                        console.print("\n[bold]Admin Quota Panel[/bold]")
+                        console.print(
+                            "Add a web-based admin panel to the landing page for managing quotas "
+                            "(create/edit/delete policies, view usage, unblock users)."
+                        )
+                        enable_admin = questionary.confirm(
+                            "Enable admin panel on landing page?",
+                            default=config.get("admin_panel", {}).get("enabled", False),
+                        ).ask()
+
+                        if "admin_panel" not in config:
+                            config["admin_panel"] = {}
+                        config["admin_panel"]["enabled"] = enable_admin
+
+                        if enable_admin:
+                            admin_emails = questionary.text(
+                                "Admin email addresses (comma-separated):",
+                                default=config.get("admin_panel", {}).get("admin_emails", ""),
+                            ).ask()
+                            config["admin_panel"]["admin_emails"] = admin_emails.strip()
+
+                            admin_group = questionary.text(
+                                "Admin IdP group name (optional, press Enter to skip):",
+                                default=config.get("admin_panel", {}).get("admin_group_name", ""),
+                            ).ask()
+                            config["admin_panel"]["admin_group_name"] = admin_group.strip()
+
+                            console.print("\n[green]✓[/green] Admin panel configured:")
+                            if admin_emails.strip():
+                                console.print(f"  • Admin emails: {admin_emails.strip()}")
+                            if admin_group.strip():
+                                console.print(f"  • Admin group: {admin_group.strip()}")
+
             # Save monitoring progress
             progress.save_step("monitoring_complete", config)
 
@@ -1237,6 +1273,16 @@ class InitCommand(Command):
                     quota_status += f"\n  Daily: {daily:,} ({daily_mode})"
                 quota_status += f"\n  Re-check: {check_interval} min"
                 table.add_row("Quota Monitoring", quota_status)
+
+                # Admin panel status
+                admin_config = config.get("admin_panel", {})
+                if admin_config.get("enabled"):
+                    admin_info = "✓ Enabled"
+                    if admin_config.get("admin_emails"):
+                        admin_info += f"\n  Emails: {admin_config['admin_emails']}"
+                    if admin_config.get("admin_group_name"):
+                        admin_info += f"\n  Group: {admin_config['admin_group_name']}"
+                    table.add_row("Admin Panel", admin_info)
             else:
                 table.add_row("Quota Monitoring", "✗ Disabled")
             table.add_row(
@@ -1490,6 +1536,9 @@ class InitCommand(Command):
             daily_enforcement_mode=config_data.get("quota", {}).get("daily_enforcement_mode", "alert"),
             monthly_enforcement_mode=config_data.get("quota", {}).get("monthly_enforcement_mode", "block"),
             quota_check_interval=config_data.get("quota", {}).get("check_interval", 30),
+            admin_panel_enabled=config_data.get("admin_panel", {}).get("enabled", False),
+            admin_emails=config_data.get("admin_panel", {}).get("admin_emails", ""),
+            admin_group_name=config_data.get("admin_panel", {}).get("admin_group_name", ""),
         )
 
         config.add_profile(profile)
@@ -1795,6 +1844,14 @@ class InitCommand(Command):
                     "monthly_limit": getattr(profile, "monthly_token_limit", 300000000),
                     "warning_threshold_80": getattr(profile, "warning_threshold_80", 240000000),
                     "warning_threshold_90": getattr(profile, "warning_threshold_90", 270000000),
+                }
+
+            # Add admin panel configuration if present
+            if hasattr(profile, "admin_panel_enabled"):
+                existing_config["admin_panel"] = {
+                    "enabled": getattr(profile, "admin_panel_enabled", False),
+                    "admin_emails": getattr(profile, "admin_emails", ""),
+                    "admin_group_name": getattr(profile, "admin_group_name", ""),
                 }
 
             # Add analytics configuration if present

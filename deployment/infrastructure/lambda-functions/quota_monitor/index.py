@@ -4,8 +4,11 @@
 import json
 import boto3
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+
+# Effective timezone for daily/monthly quota boundaries (UTC+8)
+EFFECTIVE_TZ = timezone(timedelta(hours=8))
 from boto3.dynamodb.conditions import Key, Attr
 
 # Initialize clients
@@ -36,8 +39,8 @@ def lambda_handler(event, context):
     print(f"Starting quota monitoring check at {datetime.now(timezone.utc).isoformat()}")
     print(f"Fine-grained quotas: {'enabled' if ENABLE_FINEGRAINED_QUOTAS else 'disabled'}")
 
-    # Get current calendar month boundaries
-    now = datetime.now(timezone.utc)
+    # Get current calendar month boundaries (UTC+8)
+    now = datetime.now(EFFECTIVE_TZ)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_name = now.strftime("%B %Y")
     current_date = now.strftime("%Y-%m-%d")
@@ -63,6 +66,8 @@ def lambda_handler(event, context):
         if ENABLE_FINEGRAINED_QUOTAS and policies_table:
             policies_cache = load_all_policies()
             print(f"Loaded {len(policies_cache)} policies")
+        else:
+            policies_cache = {}
 
         # Check alerts that have already been sent this month
         sent_alerts = get_sent_alerts(month_name)
@@ -83,6 +88,12 @@ def lambda_handler(event, context):
 
             total_tokens = float(usage.get("total_tokens", 0))
             daily_tokens = float(usage.get("daily_tokens", 0))
+            estimated_cost = float(usage.get("estimated_cost", 0))
+            daily_cost_val = float(usage.get("daily_cost", 0))
+
+            # Reset daily cost if date has changed
+            if usage.get("daily_cost_date") != current_date:
+                daily_cost_val = 0.0
 
             # Check all limit types and generate alerts
             alerts = check_limits_and_generate_alerts(
@@ -95,6 +106,8 @@ def lambda_handler(event, context):
                 days_remaining=days_remaining,
                 days_in_month=days_in_month,
                 sent_alerts=sent_alerts,
+                estimated_cost=estimated_cost,
+                daily_cost=daily_cost_val,
             )
 
             # Update statistics
@@ -116,6 +129,22 @@ def lambda_handler(event, context):
                     alerts_to_send.append(alert)
                     # Record alert to prevent duplicates
                     record_sent_alert(month_name, email, alert["alert_type"], alert["alert_level"], alert)
+
+        # Check org-wide limits
+        org_policy = policies_cache.get("org:global") if policies_cache else None
+        if org_policy:
+            org_usage = get_org_usage()
+            org_alerts = check_org_limits_and_generate_alerts(
+                org_usage=org_usage,
+                policy=org_policy,
+                month_name=month_name,
+                sent_alerts=sent_alerts,
+            )
+            for alert in org_alerts:
+                alert_key = f"ORG#global#{alert['alert_type']}#{alert['alert_level']}"
+                if alert_key not in sent_alerts:
+                    alerts_to_send.append(alert)
+                    record_sent_alert(month_name, "ORG#global", alert["alert_type"], alert["alert_level"], alert)
 
         # Send alerts via SNS
         if alerts_to_send:
@@ -155,38 +184,43 @@ def get_monthly_usage(month_name):
     """
     user_usage = {}
 
-    # Extract YYYY-MM format from month_name
-    now = datetime.now(timezone.utc)
+    # Extract YYYY-MM format (UTC+8 boundaries)
+    now = datetime.now(EFFECTIVE_TZ)
     month_prefix = now.strftime("%Y-%m")
 
     try:
         # Scan for all users in this month with enhanced fields
         response = quota_table.scan(
             FilterExpression=Attr("sk").eq(f"MONTH#{month_prefix}"),
-            ProjectionExpression="email, total_tokens, daily_tokens, daily_date, input_tokens, output_tokens, cache_tokens, estimated_cost, #groups",
+            ProjectionExpression="email, total_tokens, daily_tokens, daily_date, input_tokens, output_tokens, cache_tokens, estimated_cost, daily_cost, daily_cost_date, #groups",
             ExpressionAttributeNames={"#groups": "groups"},
         )
+
+        def _parse_usage_item(item):
+            return {
+                "total_tokens": float(item.get("total_tokens", 0)),
+                "daily_tokens": float(item.get("daily_tokens", 0)),
+                "daily_date": item.get("daily_date"),
+                "input_tokens": float(item.get("input_tokens", 0)),
+                "output_tokens": float(item.get("output_tokens", 0)),
+                "cache_tokens": float(item.get("cache_tokens", 0)),
+                "estimated_cost": float(item.get("estimated_cost", 0)),
+                "daily_cost": float(item.get("daily_cost", 0)),
+                "daily_cost_date": item.get("daily_cost_date"),
+                "groups": item.get("groups", []),
+            }
 
         # Process results
         for item in response.get("Items", []):
             email = item.get("email")
             if email:
-                user_usage[email] = {
-                    "total_tokens": float(item.get("total_tokens", 0)),
-                    "daily_tokens": float(item.get("daily_tokens", 0)),
-                    "daily_date": item.get("daily_date"),
-                    "input_tokens": float(item.get("input_tokens", 0)),
-                    "output_tokens": float(item.get("output_tokens", 0)),
-                    "cache_tokens": float(item.get("cache_tokens", 0)),
-                    "estimated_cost": float(item.get("estimated_cost", 0)),
-                    "groups": item.get("groups", []),
-                }
+                user_usage[email] = _parse_usage_item(item)
 
         # Handle pagination
         while "LastEvaluatedKey" in response:
             response = quota_table.scan(
                 FilterExpression=Attr("sk").eq(f"MONTH#{month_prefix}"),
-                ProjectionExpression="email, total_tokens, daily_tokens, daily_date, input_tokens, output_tokens, cache_tokens, estimated_cost, #groups",
+                ProjectionExpression="email, total_tokens, daily_tokens, daily_date, input_tokens, output_tokens, cache_tokens, estimated_cost, daily_cost, daily_cost_date, #groups",
                 ExpressionAttributeNames={"#groups": "groups"},
                 ExclusiveStartKey=response["LastEvaluatedKey"],
             )
@@ -194,16 +228,7 @@ def get_monthly_usage(month_name):
             for item in response.get("Items", []):
                 email = item.get("email")
                 if email:
-                    user_usage[email] = {
-                        "total_tokens": float(item.get("total_tokens", 0)),
-                        "daily_tokens": float(item.get("daily_tokens", 0)),
-                        "daily_date": item.get("daily_date"),
-                        "input_tokens": float(item.get("input_tokens", 0)),
-                        "output_tokens": float(item.get("output_tokens", 0)),
-                        "cache_tokens": float(item.get("cache_tokens", 0)),
-                        "estimated_cost": float(item.get("estimated_cost", 0)),
-                        "groups": item.get("groups", []),
-                    }
+                    user_usage[email] = _parse_usage_item(item)
 
         print(f"Found {len(user_usage)} users with usage in {month_prefix}")
 
@@ -212,6 +237,24 @@ def get_monthly_usage(month_name):
         raise
 
     return user_usage
+
+
+def _parse_policy_item(item, policy_type, identifier):
+    """Parse a DynamoDB policy item into a policy dict."""
+    return {
+        "policy_type": policy_type,
+        "identifier": identifier,
+        "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
+        "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
+        "monthly_cost_limit": float(item["monthly_cost_limit"]) if item.get("monthly_cost_limit") else None,
+        "daily_cost_limit": float(item["daily_cost_limit"]) if item.get("daily_cost_limit") else None,
+        "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
+        "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
+        "cost_warning_threshold_80": float(item["cost_warning_threshold_80"]) if item.get("cost_warning_threshold_80") else None,
+        "cost_warning_threshold_90": float(item["cost_warning_threshold_90"]) if item.get("cost_warning_threshold_90") else None,
+        "enforcement_mode": item.get("enforcement_mode", "alert"),
+        "enabled": item.get("enabled", True),
+    }
 
 
 def load_all_policies():
@@ -235,16 +278,7 @@ def load_all_policies():
 
             if policy_type and identifier:
                 key = f"{policy_type}:{identifier}"
-                policies[key] = {
-                    "policy_type": policy_type,
-                    "identifier": identifier,
-                    "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
-                    "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
-                    "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
-                    "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
-                    "enforcement_mode": item.get("enforcement_mode", "alert"),
-                    "enabled": item.get("enabled", True),
-                }
+                policies[key] = _parse_policy_item(item, policy_type, identifier)
 
         # Handle pagination
         while "LastEvaluatedKey" in response:
@@ -259,16 +293,7 @@ def load_all_policies():
 
                 if policy_type and identifier:
                     key = f"{policy_type}:{identifier}"
-                    policies[key] = {
-                        "policy_type": policy_type,
-                        "identifier": identifier,
-                        "monthly_token_limit": int(item.get("monthly_token_limit", 0)),
-                        "daily_token_limit": int(item.get("daily_token_limit", 0)) if item.get("daily_token_limit") else None,
-                        "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
-                        "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
-                        "enforcement_mode": item.get("enforcement_mode", "alert"),
-                        "enabled": item.get("enabled", True),
-                    }
+                    policies[key] = _parse_policy_item(item, policy_type, identifier)
 
     except Exception as e:
         print(f"Error loading policies: {str(e)}")
@@ -335,10 +360,11 @@ def resolve_user_quota(email, groups, policies_cache):
 
 def check_limits_and_generate_alerts(
     email, total_tokens, daily_tokens, policy,
-    month_name, current_date, days_remaining, days_in_month, sent_alerts
+    month_name, current_date, days_remaining, days_in_month, sent_alerts,
+    estimated_cost=0, daily_cost=0,
 ):
     """
-    Check all limit types and generate appropriate alerts.
+    Check all limit types (tokens and cost) and generate appropriate alerts.
     Returns list of alert dicts.
     """
     alerts = []
@@ -377,7 +403,38 @@ def check_limits_and_generate_alerts(
                 "enforcement_mode": enforcement_mode,
             })
 
-    # 2. Check daily token limit (if configured)
+    # 2. Check monthly cost limit (if configured)
+    monthly_cost_limit = policy.get("monthly_cost_limit")
+    if monthly_cost_limit and monthly_cost_limit > 0:
+        cost_pct = (estimated_cost / monthly_cost_limit) * 100
+        cost_threshold_80 = policy.get("cost_warning_threshold_80", monthly_cost_limit * 0.8)
+        cost_threshold_90 = policy.get("cost_warning_threshold_90", monthly_cost_limit * 0.9)
+
+        cost_alert_level = None
+        if estimated_cost > monthly_cost_limit:
+            cost_alert_level = "exceeded"
+        elif estimated_cost > cost_threshold_90:
+            cost_alert_level = "critical"
+        elif estimated_cost > cost_threshold_80:
+            cost_alert_level = "warning"
+
+        if cost_alert_level:
+            alert_key = f"{email}#monthly_cost#{cost_alert_level}"
+            if alert_key not in sent_alerts:
+                alerts.append({
+                    "user": email,
+                    "alert_type": "monthly_cost",
+                    "alert_level": cost_alert_level,
+                    "current_usage": round(estimated_cost, 2),
+                    "limit": monthly_cost_limit,
+                    "percentage": round(cost_pct, 1),
+                    "month": month_name,
+                    "days_remaining": days_remaining,
+                    "policy_info": policy_info,
+                    "enforcement_mode": enforcement_mode,
+                })
+
+    # 3. Check daily token limit (if configured)
     daily_limit = policy.get("daily_token_limit")
     if daily_limit:
         daily_pct = (daily_tokens / daily_limit) * 100 if daily_limit > 0 else 0
@@ -406,6 +463,34 @@ def check_limits_and_generate_alerts(
                     "enforcement_mode": enforcement_mode,
                 })
 
+    # 4. Check daily cost limit (if configured)
+    daily_cost_limit = policy.get("daily_cost_limit")
+    if daily_cost_limit and daily_cost_limit > 0:
+        daily_cost_pct = (daily_cost / daily_cost_limit) * 100
+
+        daily_cost_alert_level = None
+        if daily_cost > daily_cost_limit:
+            daily_cost_alert_level = "exceeded"
+        elif daily_cost > (daily_cost_limit * 0.9):
+            daily_cost_alert_level = "critical"
+        elif daily_cost > (daily_cost_limit * 0.8):
+            daily_cost_alert_level = "warning"
+
+        if daily_cost_alert_level:
+            alert_key = f"{email}#daily_cost#{current_date}#{daily_cost_alert_level}"
+            if alert_key not in sent_alerts:
+                alerts.append({
+                    "user": email,
+                    "alert_type": "daily_cost",
+                    "alert_level": daily_cost_alert_level,
+                    "current_usage": round(daily_cost, 2),
+                    "limit": daily_cost_limit,
+                    "percentage": round(daily_cost_pct, 1),
+                    "date": current_date,
+                    "policy_info": policy_info,
+                    "enforcement_mode": enforcement_mode,
+                })
+
     return alerts
 
 
@@ -417,7 +502,7 @@ def get_sent_alerts(month_name):
     sent_alerts = set()
 
     try:
-        month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        month_prefix = datetime.now(EFFECTIVE_TZ).strftime("%Y-%m")
 
         response = quota_table.query(
             KeyConditionExpression=Key("pk").eq("ALERTS")
@@ -472,11 +557,12 @@ def record_sent_alert(month_name, email, alert_type, alert_level, alert_data):
     Record that an alert was sent to prevent duplicates.
     """
     try:
-        month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        effective_now = datetime.now(EFFECTIVE_TZ)
+        month_prefix = effective_now.strftime("%Y-%m")
 
         # Build SK based on alert type
         if alert_type == "daily":
-            date = alert_data.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            date = alert_data.get("date", effective_now.strftime("%Y-%m-%d"))
             sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}#{date}"
         else:
             sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}"
@@ -525,6 +611,10 @@ def send_alerts(alerts):
             type_label = {
                 "monthly": "Monthly Token Quota",
                 "daily": "Daily Token Quota",
+                "monthly_cost": "Monthly Cost Quota",
+                "daily_cost": "Daily Cost Quota",
+                "org_monthly_tokens": "Org-Wide Monthly Token Quota",
+                "org_monthly_cost": "Org-Wide Monthly Cost Quota",
             }.get(alert_type, "Quota")
 
             subject = f"Claude Code {level_prefix} - {type_label} - {alert['percentage']:.0f}%"
@@ -534,6 +624,12 @@ def send_alerts(alerts):
                 message = format_monthly_alert(alert)
             elif alert_type == "daily":
                 message = format_daily_alert(alert)
+            elif alert_type == "monthly_cost":
+                message = format_cost_alert(alert, "Monthly")
+            elif alert_type == "daily_cost":
+                message = format_cost_alert(alert, "Daily")
+            elif alert_type in ("org_monthly_tokens", "org_monthly_cost"):
+                message = format_org_alert(alert)
             else:
                 message = format_monthly_alert(alert)
 
@@ -623,7 +719,7 @@ Enforcement: {enforcement}
 -------------------------------------
 ACTION REQUIRED
 -------------------------------------
-{"ACCESS IS BLOCKED until daily quota resets at UTC midnight or admin unblocks." if enforcement == "block" and alert['alert_level'] == 'exceeded' else "User may soon exceed daily quota limit."}
+{"ACCESS IS BLOCKED until daily quota resets at midnight (UTC+8) or admin unblocks." if enforcement == "block" and alert['alert_level'] == 'exceeded' else "User may soon exceed daily quota limit."}
 
 To temporarily unblock this user:
   ccwb quota unblock {user_email} --duration 24h
@@ -632,5 +728,160 @@ To increase their daily quota:
   ccwb quota set-user {user_email} --daily-limit 20M
 
 =====================================
-Daily quotas reset at UTC midnight.
+Daily quotas reset at midnight (UTC+8).
+"""
+
+
+def format_cost_alert(alert, period="Monthly"):
+    """Format cost quota alert message."""
+    enforcement = alert.get('enforcement_mode', 'alert')
+    user_email = alert['user']
+    is_daily = period == "Daily"
+
+    return f"""
+=====================================
+CLAUDE CODE COST QUOTA ALERT
+=====================================
+
+USER: {user_email}
+ALERT: {period} Cost Quota - {alert['alert_level'].upper()}
+{"DATE: " + alert.get('date', 'N/A') if is_daily else "MONTH: " + alert.get('month', 'N/A')}
+
+-------------------------------------
+CURRENT COST USAGE
+-------------------------------------
+{period} Cost: ${alert['current_usage']:,.2f} / ${alert['limit']:,.2f} ({alert['percentage']:.1f}%)
+
+Policy: {alert.get('policy_info', 'default')}
+Enforcement: {enforcement}
+
+-------------------------------------
+ACTION REQUIRED
+-------------------------------------
+{"ACCESS IS BLOCKED until cost quota resets or admin unblocks." if enforcement == "block" and alert['alert_level'] == 'exceeded' else f"User may soon exceed {period.lower()} cost limit."}
+
+To temporarily unblock this user:
+  ccwb quota unblock {user_email} --duration 24h
+
+To increase their cost quota:
+  ccwb quota set-user {user_email} --{'daily' if is_daily else 'monthly'}-cost-limit {'20' if is_daily else '200'}
+
+=====================================
+{"Daily cost quotas reset at midnight (UTC+8)." if is_daily else "This alert is sent once per threshold level per month."}
+"""
+
+
+def get_org_usage():
+    """Get org aggregate usage for current month (UTC+8 boundaries)."""
+    now = datetime.now(EFFECTIVE_TZ)
+    sk = f"MONTH#{now.strftime('%Y-%m')}"
+    try:
+        response = quota_table.get_item(Key={"pk": "ORG#global", "sk": sk})
+        item = response.get("Item")
+        if not item:
+            return {"total_tokens": 0, "estimated_cost": 0.0, "user_count": 0}
+        return {
+            "total_tokens": float(item.get("total_tokens", 0)),
+            "estimated_cost": float(item.get("estimated_cost", 0)),
+            "user_count": int(item.get("user_count", 0)),
+        }
+    except Exception as e:
+        print(f"Error getting org usage: {e}")
+        return {"total_tokens": 0, "estimated_cost": 0.0, "user_count": 0}
+
+
+def check_org_limits_and_generate_alerts(org_usage, policy, month_name, sent_alerts):
+    """Check org-wide limits and generate alerts at 80%/90%/exceeded thresholds."""
+    alerts = []
+
+    if not policy or not policy.get("enabled", True):
+        return alerts
+
+    total_tokens = org_usage.get("total_tokens", 0)
+    estimated_cost = org_usage.get("estimated_cost", 0)
+    user_count = org_usage.get("user_count", 0)
+    monthly_limit = policy.get("monthly_token_limit", 0)
+    monthly_cost_limit = policy.get("monthly_cost_limit")
+    enforcement = policy.get("enforcement_mode", "alert")
+
+    # Token threshold checks
+    if monthly_limit > 0:
+        pct = (total_tokens / monthly_limit) * 100
+        for level, threshold in [("exceeded", 100), ("critical", 90), ("warning", 80)]:
+            if pct >= threshold:
+                alert_key = f"ORG#global#org_monthly_tokens#{level}"
+                if alert_key not in sent_alerts:
+                    alerts.append({
+                        "user": "ORG#global",
+                        "alert_type": "org_monthly_tokens",
+                        "alert_level": level,
+                        "percentage": pct,
+                        "current_usage": total_tokens,
+                        "limit": monthly_limit,
+                        "month": month_name,
+                        "enforcement_mode": enforcement,
+                        "user_count": user_count,
+                    })
+                break
+
+    # Cost threshold checks
+    if monthly_cost_limit and monthly_cost_limit > 0:
+        cost_pct = (estimated_cost / monthly_cost_limit) * 100
+        for level, threshold in [("exceeded", 100), ("critical", 90), ("warning", 80)]:
+            if cost_pct >= threshold:
+                alert_key = f"ORG#global#org_monthly_cost#{level}"
+                if alert_key not in sent_alerts:
+                    alerts.append({
+                        "user": "ORG#global",
+                        "alert_type": "org_monthly_cost",
+                        "alert_level": level,
+                        "percentage": cost_pct,
+                        "current_usage": estimated_cost,
+                        "limit": monthly_cost_limit,
+                        "month": month_name,
+                        "enforcement_mode": enforcement,
+                        "user_count": user_count,
+                    })
+                break
+
+    return alerts
+
+
+def format_org_alert(alert):
+    """Format organization-wide quota alert message."""
+    enforcement = alert.get('enforcement_mode', 'alert')
+    is_cost = alert.get("alert_type") == "org_monthly_cost"
+    user_count = alert.get("user_count", 0)
+
+    if is_cost:
+        usage_line = f"Org Monthly Cost: ${alert['current_usage']:,.2f} / ${alert['limit']:,.2f} ({alert['percentage']:.1f}%)"
+    else:
+        usage_line = f"Org Monthly Tokens: {int(alert['current_usage']):,} / {int(alert['limit']):,} ({alert['percentage']:.1f}%)"
+
+    return f"""
+=====================================
+ORGANIZATION-WIDE QUOTA ALERT
+=====================================
+
+SCOPE: All users ({user_count} active)
+ALERT: {'Cost' if is_cost else 'Token'} Quota - {alert['alert_level'].upper()}
+MONTH: {alert.get('month', 'N/A')}
+
+-------------------------------------
+CURRENT ORG USAGE
+-------------------------------------
+{usage_line}
+
+Enforcement: {enforcement}
+
+-------------------------------------
+ACTION REQUIRED
+-------------------------------------
+{"ALL USERS ARE BLOCKED. Organization-wide quota exceeded." if enforcement == "block" and alert['alert_level'] == 'exceeded' else "Organization may soon exceed its quota limit. Consider increasing the org limit or reviewing user usage."}
+
+To update the organization limit:
+  ccwb quota set-org --monthly-{'cost-limit 10000' if is_cost else 'limit 2B'}
+
+=====================================
+This alert is sent once per threshold level per month.
 """

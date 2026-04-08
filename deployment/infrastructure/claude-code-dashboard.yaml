@@ -220,6 +220,7 @@ Resources:
           METRICS_LOG_GROUP: !Ref MetricsLogGroup
           METRICS_REGION: !Ref MetricsRegion
           METRICS_TABLE: !Ref MetricsTable
+          AGGREGATION_WINDOW: "15"
       Code: ./lambda-functions/metrics_aggregator/
 
   MetricsAggregatorScheduleRule:
@@ -250,7 +251,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -268,7 +269,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -285,7 +286,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -304,7 +305,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -321,7 +322,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -339,7 +340,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -358,7 +359,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -375,7 +376,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -392,7 +393,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -409,7 +410,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -426,7 +427,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -443,7 +444,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer
@@ -460,7 +461,7 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CustomWidgetRole.Arn
-      Timeout: 60
+      Timeout: 120
       Layers:
         - !Ref QueryUtilsLayer
         - !Ref MetricsUtilsLayer

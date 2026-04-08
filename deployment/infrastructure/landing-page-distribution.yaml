@@ -109,12 +109,60 @@ Parameters:
     Default: 'initial'
     Description: Timestamp to force custom resource re-execution on every deployment (auto-populated by deploy command)
 
+  # Admin panel parameters
+  EnableAdminPanel:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable admin quota management panel on the landing page
+
+  AdminEmails:
+    Type: String
+    Default: ''
+    Description: Comma-separated list of admin email addresses for quota management panel
+
+  AdminGroupName:
+    Type: String
+    Default: ''
+    Description: IdP group name that grants admin access to quota management panel
+
+  QuotaPoliciesTableName:
+    Type: String
+    Default: ''
+    Description: Name of the QuotaPolicies DynamoDB table (from quota monitoring stack)
+
+  QuotaPoliciesTableArn:
+    Type: String
+    Default: ''
+    Description: ARN of the QuotaPolicies DynamoDB table
+
+  UserQuotaMetricsTableName:
+    Type: String
+    Default: ''
+    Description: Name of the UserQuotaMetrics DynamoDB table (from quota monitoring stack)
+
+  UserQuotaMetricsTableArn:
+    Type: String
+    Default: ''
+    Description: ARN of the UserQuotaMetrics DynamoDB table
+
+  BedrockPricingTableName:
+    Type: String
+    Default: ''
+    Description: Name of the BedrockPricing DynamoDB table (from quota monitoring stack)
+
+  BedrockPricingTableArn:
+    Type: String
+    Default: ''
+    Description: ARN of the BedrockPricing DynamoDB table
+
 Conditions:
   IsOkta: !Equals [!Ref IdPProvider, 'okta']
   IsAzure: !Equals [!Ref IdPProvider, 'azure']
   IsAuth0: !Equals [!Ref IdPProvider, 'auth0']
   IsCognito: !Equals [!Ref IdPProvider, 'cognito']
   HasRoute53Zone: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasAdminPanel: !Equals [!Ref EnableAdminPanel, 'true']
 
 Resources:
   # S3 Bucket for package distribution
@@ -206,12 +254,23 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                  - s3:GetObjectMetadata
                   - s3:ListBucket
                   - s3:HeadObject
                 Resource:
                   - !GetAtt DistributionBucket.Arn
                   - !Sub '${DistributionBucket.Arn}/*'
+        - !If
+          - HasAdminPanel
+          - PolicyName: AdminCheckAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:Scan
+                  Resource: !Ref QuotaPoliciesTableArn
+          - !Ref AWS::NoValue
       Tags:
         - Key: Application
           Value: ClaudeCodeWithBedrock
@@ -237,6 +296,14 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET_NAME: !Ref DistributionBucket
+          ENABLE_ADMIN_PANEL: !If [HasAdminPanel, 'true', 'false']
+          ADMIN_EMAILS: !If [HasAdminPanel, !Ref AdminEmails, '']
+          ADMIN_GROUP_NAME: !If [HasAdminPanel, !Ref AdminGroupName, '']
+          QUOTA_POLICIES_TABLE: !If [HasAdminPanel, !Ref QuotaPoliciesTableName, '']
+          CCWB_PROFILE_NAME: !Ref IdentityPoolName
+          COGNITO_DOMAIN: !Sub '${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+          COGNITO_CLIENT_ID: !Ref CognitoClientId
+          CUSTOM_DOMAIN: !Ref CustomDomainName
       Code:
         ZipFile: |
           # ABOUTME: Lambda function for authenticated distribution landing page
@@ -259,6 +326,33 @@ Resources:
               try:
                   # Check if this is a documentation request
                   path = event.get('path', '/')
+                  if path == '/logout':
+                      # Clear all ALB OIDC session cookies (ALB may use -0 through -4)
+                      # Then redirect to Cognito logout endpoint to terminate IdP session
+                      expired = 'Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; HttpOnly; Secure'
+                      cognito_domain = os.environ.get('COGNITO_DOMAIN', '')
+                      cognito_client_id = os.environ.get('COGNITO_CLIENT_ID', '')
+                      custom_domain = os.environ.get('CUSTOM_DOMAIN', '')
+                      if cognito_domain and cognito_client_id and custom_domain:
+                          logout_uri = f'https://{custom_domain}/'
+                          cognito_logout_url = f'https://{cognito_domain}/logout?client_id={cognito_client_id}&logout_uri={logout_uri}'
+                          redirect_location = cognito_logout_url
+                      else:
+                          redirect_location = '/'
+                      return {
+                          'statusCode': 302,
+                          'multiValueHeaders': {
+                              'Location': [redirect_location],
+                              'Set-Cookie': [
+                                  f'AWSELBAuthSessionCookie-0=; {expired}',
+                                  f'AWSELBAuthSessionCookie-1=; {expired}',
+                                  f'AWSELBAuthSessionCookie-2=; {expired}',
+                                  f'AWSELBAuthSessionCookie-3=; {expired}',
+                                  f'AWSELBAuthSessionCookie-4=; {expired}',
+                              ]
+                          },
+                          'body': ''
+                      }
                   if path.startswith('/docs'):
                       return serve_documentation(path)
 
@@ -286,12 +380,16 @@ Resources:
                   timestamp = metadata_source.get('timestamp', 'Unknown')
                   release_datetime = metadata_source.get('release_datetime', 'Unknown')
 
+                  # Check if user is an admin — DynamoDB is source of truth, seed list is fallback
+                  is_admin = check_is_admin(user_email)
+
                   # Generate HTML page with OS detection
-                  html = generate_landing_page(user_email, download_urls, profile, timestamp, release_datetime, packages, detected_os)
+                  aws_profile = os.environ.get('CCWB_PROFILE_NAME', 'claude-bedrock-ccwb')
+                  html = generate_landing_page(user_email, download_urls, profile, timestamp, release_datetime, packages, detected_os, is_admin, aws_profile)
 
                   return {
                       'statusCode': 200,
-                      'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                      'multiValueHeaders': {'Content-Type': ['text/html; charset=utf-8']},
                       'body': html
                   }
 
@@ -306,15 +404,26 @@ Resources:
                   # Return generic error to user (no sensitive details)
                   return {
                       'statusCode': 500,
-                      'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                      'multiValueHeaders': {'Content-Type': ['text/html; charset=utf-8']},
                       'body': f'<html><body><h1>Error</h1><p>An error occurred while generating the landing page.</p><p>Error ID: {error_id}</p><p>Please contact your IT administrator with this error ID.</p></body></html>'
                   }
+
+          def get_header(event, name):
+              """Get a header value from either headers or multiValueHeaders (ALB multi-value mode)."""
+              # multiValueHeaders takes precedence when lambda.multi_value_headers.enabled=true
+              mvh = event.get('multiValueHeaders', {})
+              if mvh:
+                  val = mvh.get(name) or mvh.get(name.lower())
+                  if val:
+                      return val[0]
+              h = event.get('headers', {})
+              return (h.get(name) or h.get(name.lower()) or '')
 
           def extract_user_email(event):
               """Extract user email from ALB OIDC headers - ALB has already validated authentication"""
               # Priority 1: Extract email from ALB-verified JWT payload
               # ALB has validated the JWT signature, so we can safely decode the payload
-              oidc_data = event.get('headers', {}).get('x-amzn-oidc-data', '')
+              oidc_data = get_header(event, 'x-amzn-oidc-data')
               if oidc_data:
                   try:
                       parts = oidc_data.split('.')
@@ -331,16 +440,33 @@ Resources:
                       pass
 
               # Priority 2: Fallback to x-amzn-oidc-identity header (may be Cognito sub UUID)
-              user_identity = event.get('headers', {}).get('x-amzn-oidc-identity', '')
+              user_identity = get_header(event, 'x-amzn-oidc-identity')
               if user_identity:
                   return user_identity
 
               # Default fallback for non-authenticated requests
               return 'authenticated-user@example.com'
 
+          def check_is_admin(user_email):
+              """Check admin status: DynamoDB is source of truth, seed list is fallback."""
+              email = user_email.lower()
+              table_name = os.environ.get('QUOTA_POLICIES_TABLE', '')
+              if table_name:
+                  try:
+                      ddb = boto3.resource('dynamodb')
+                      table = ddb.Table(table_name)
+                      resp = table.get_item(Key={'pk': f'ADMIN#{email}', 'sk': 'ADMIN'})
+                      if resp.get('Item'):
+                          return True
+                  except Exception as e:
+                      print(f"DynamoDB admin check failed, falling back to env var: {e}")
+              # Fallback: seed list from env var
+              seed_admins = [e.strip().lower() for e in os.environ.get('ADMIN_EMAILS', '').split(',') if e.strip()]
+              return email in seed_admins
+
           def detect_os(event):
               """Detect user's operating system from User-Agent header"""
-              user_agent = event.get('headers', {}).get('user-agent', '').lower()
+              user_agent = get_header(event, 'user-agent').lower()
 
               # Check for macOS
               if 'mac' in user_agent or 'darwin' in user_agent:
@@ -432,7 +558,7 @@ Resources:
 
                   return {
                       'statusCode': 200,
-                      'headers': {'Content-Type': content_type},
+                      'multiValueHeaders': {'Content-Type': [content_type]},
                       'body': base64.b64encode(content).decode('utf-8') if is_binary else content.decode('utf-8'),
                       'isBase64Encoded': is_binary
                   }
@@ -440,7 +566,7 @@ Resources:
                   print(f"Documentation not found: {doc_path}")
                   return {
                       'statusCode': 404,
-                      'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                      'multiValueHeaders': {'Content-Type': ['text/html; charset=utf-8']},
                       'body': '<html><body><h1>404 - Documentation Not Found</h1><p>The requested documentation page does not exist.</p></body></html>'
                   }
               except Exception as e:
@@ -452,7 +578,7 @@ Resources:
                   # Return generic error to user
                   return {
                       'statusCode': 500,
-                      'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                      'multiValueHeaders': {'Content-Type': ['text/html; charset=utf-8']},
                       'body': f'<html><body><h1>Error</h1><p>Error loading documentation.</p><p>Error ID: {error_id}</p></body></html>'
                   }
 
@@ -467,7 +593,7 @@ Resources:
               else:
                   return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
-          def generate_landing_page(user_email, download_urls, profile, timestamp, release_datetime, packages, detected_os=None):
+          def generate_landing_page(user_email, download_urls, profile, timestamp, release_datetime, packages, detected_os=None, is_admin=False, aws_profile=''):
               """Generate HTML landing page with OS detection"""
 
               # Format release datetime
@@ -493,206 +619,305 @@ Resources:
 
               # Generate platform cards
               platform_cards = []
-              platforms = [
-                  ('windows', '🪟 Windows', 'Download Windows-specific package'),
-                  ('linux', '🐧 Linux', 'Download Linux-specific package'),
-                  ('mac', '🍎 macOS', 'Download macOS-specific package'),
-                  ('all-platforms', '📦 All Platforms', 'Download all packages in one bundle'),
-              ]
 
-              for platform_key, platform_title, platform_desc in platforms:
+              platform_meta = {
+                  'windows': {
+                      'label': 'Windows',
+                      'desc': 'For Windows 10 / 11 (x64)',
+                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.6L10.5 4.5V11.5H3V5.6ZM11.5 4.35L21 3V11.5H11.5V4.35ZM3 12.5H10.5V19.5L3 18.4V12.5ZM11.5 12.5H21V21L11.5 19.65V12.5Z"/></svg>',
+                  },
+                  'linux': {
+                      'label': 'Linux',
+                      'desc': 'For Ubuntu 20.04+ / RHEL 8+ (x64)',
+                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.686 2 6 5.02 6 8.5c0 1.8.6 3.4 1.6 4.6-.4.7-.6 1.4-.6 2.1 0 1.4.7 2.7 1.8 3.5-.3.4-.5.9-.5 1.4 0 1.3 1 2.4 2.4 2.4h2.6c1.4 0 2.4-1.1 2.4-2.4 0-.5-.2-1-.5-1.4 1.1-.8 1.8-2.1 1.8-3.5 0-.7-.2-1.4-.6-2.1C17.4 11.9 18 10.3 18 8.5 18 5.02 15.314 2 12 2z"/></svg>',
+                  },
+                  'mac': {
+                      'label': 'macOS',
+                      'desc': 'For macOS 12+ (Apple Silicon & Intel)',
+                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>',
+                  },
+                  'all-platforms': {
+                      'label': 'All Platforms',
+                      'desc': 'Complete bundle — Windows, Linux, macOS',
+                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
+                  },
+              }
+
+              platform_cards = []
+              for platform_key in ['windows', 'linux', 'mac', 'all-platforms']:
                   if platform_key in download_urls:
+                      meta = platform_meta.get(platform_key, {})
                       size_str = format_size(packages.get(platform_key, {}).get('size', 0))
-                      # Check if this platform matches the detected OS
                       is_recommended = detected_os == platform_key
-                      recommended_badge = '<span class="recommended-badge">✨ Recommended for your system</span>' if is_recommended else ''
-                      card_class = 'platform-card recommended' if is_recommended else 'platform-card'
-                      platform_cards.append(f'''
-                      <div class="{card_class}">
-                          <h3>{platform_title} {recommended_badge}</h3>
-                          <p>{platform_desc}</p>
-                          <p class="file-size">{size_str}</p>
-                          <a href="{download_urls[platform_key]}" class="download-btn">Download</a>
-                      </div>
-                      ''')
+                      rec_badge = '<span class="rec-badge"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Recommended</span>' if is_recommended else ''
+                      card_class = 'pkg-card recommended' if is_recommended else 'pkg-card'
+                      icon_html = meta.get('icon', '')
+                      label     = meta.get('label', platform_key)
+                      desc      = meta.get('desc', '')
+                      dl_url    = download_urls[platform_key]
+                      dl_icon   = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
+                      sz_icon   = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
+                      platform_cards.append(
+                          f'<div class="{card_class}">'
+                          f'<div class="pkg-card-header">'
+                          f'<div class="pkg-icon">{icon_html}</div>'
+                          f'<div class="pkg-info">'
+                          f'<div class="pkg-name">{label} {rec_badge}</div>'
+                          f'<div class="pkg-desc">{desc}</div>'
+                          f'</div></div>'
+                          f'<div class="pkg-meta">{sz_icon} {size_str}</div>'
+                          f'<a href="{dl_url}" class="download-btn">{dl_icon} Download</a>'
+                          f'</div>'
+                      )
 
               if not platform_cards:
-                  platform_cards.append('''
-                  <div class="platform-card">
-                      <h3>⚠️ No Packages Available</h3>
-                      <p>No packages have been published yet. Contact your IT administrator.</p>
-                  </div>
-                  ''')
+                  platform_cards.append('<div class="no-pkg"><strong>No packages available.</strong> No packages have been published yet. Please contact your IT administrator.</div>')
 
-              return f'''
-              <!DOCTYPE html>
+              return f'''<!DOCTYPE html>
               <html lang="en">
               <head>
-                  <meta charset="UTF-8">
-                  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                  <title>Claude Code Distribution</title>
-                  <style>
-                      * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                      body {{
-                          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-                          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                          min-height: 100vh;
-                          padding: 20px;
-                      }}
-                      .container {{
-                          max-width: 900px;
-                          margin: 0 auto;
-                          background: white;
-                          border-radius: 16px;
-                          box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                          padding: 40px;
-                      }}
-                      h1 {{
-                          color: #333;
-                          font-size: 32px;
-                          margin-bottom: 10px;
-                          display: flex;
-                          align-items: center;
-                          gap: 12px;
-                      }}
-                      .welcome {{
-                          color: #666;
-                          font-size: 16px;
-                          margin-bottom: 30px;
-                          padding: 12px 20px;
-                          background: #f8f9fa;
-                          border-radius: 8px;
-                          border-left: 4px solid #667eea;
-                      }}
-                      .release-date {{
-                          color: #888;
-                          font-size: 14px;
-                          margin-bottom: 30px;
-                          display: flex;
-                          align-items: center;
-                          gap: 8px;
-                      }}
-                      .platform-card {{
-                          border: 2px solid #e9ecef;
-                          padding: 24px;
-                          margin: 20px 0;
-                          border-radius: 12px;
-                          transition: all 0.3s ease;
-                          background: white;
-                      }}
-                      .platform-card:hover {{
-                          border-color: #667eea;
-                          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
-                          transform: translateY(-2px);
-                      }}
-                      .platform-card.recommended {{
-                          border: 2px solid #667eea;
-                          background: linear-gradient(135deg, #f8f9ff 0%, #fff 100%);
-                          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
-                      }}
-                      .recommended-badge {{
-                          display: inline-block;
-                          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                          color: white;
-                          padding: 4px 12px;
-                          border-radius: 12px;
-                          font-size: 14px;
-                          font-weight: 600;
-                          margin-left: 8px;
-                      }}
-                      .platform-card h3 {{
-                          color: #333;
-                          margin-bottom: 8px;
-                          font-size: 20px;
-                      }}
-                      .platform-card p {{
-                          color: #666;
-                          margin-bottom: 16px;
-                      }}
-                      .file-size {{
-                          color: #888;
-                          font-size: 14px;
-                          font-weight: 600;
-                      }}
-                      .download-btn {{
-                          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                          color: white;
-                          padding: 12px 32px;
-                          text-decoration: none;
-                          border-radius: 8px;
-                          display: inline-block;
-                          font-weight: 600;
-                          transition: all 0.3s ease;
-                          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-                      }}
-                      .download-btn:hover {{
-                          transform: translateY(-2px);
-                          box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
-                      }}
-                      .instructions {{
-                          margin-top: 40px;
-                          padding: 24px;
-                          background: #f8f9fa;
-                          border-radius: 12px;
-                          border: 1px solid #e9ecef;
-                      }}
-                      .instructions h4 {{
-                          color: #333;
-                          margin-bottom: 16px;
-                          font-size: 18px;
-                      }}
-                      .instructions ul {{
-                          margin-left: 24px;
-                          color: #666;
-                          line-height: 1.8;
-                      }}
-                      .instructions code {{
-                          background: #e9ecef;
-                          padding: 2px 8px;
-                          border-radius: 4px;
-                          font-family: 'Courier New', monospace;
-                          color: #d63384;
-                      }}
-                      .footer {{
-                          margin-top: 24px;
-                          padding-top: 24px;
-                          border-top: 1px solid #e9ecef;
-                          color: #888;
-                          font-size: 14px;
-                          text-align: center;
-                      }}
-                  </style>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Claude Code — Software Distribution</title>
+              <style>
+              *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+              :root {{
+                --brand:       #1A3F82;
+                --brand-dark:  #122D61;
+                --brand-light: #2B5BA8;
+                --accent:      #0078D4;
+                --accent-hover:#0063B1;
+                --ok:          #107C10;
+                --ok-bg:       #E8F5E8;
+                --warn-bg:     #FFF4CE;
+                --warn:        #7A4A00;
+                --surface:     #F5F7FA;
+                --border:      #DDE1E9;
+                --text-primary:#1A1D23;
+                --text-secondary:#5A6270;
+                --text-muted:  #8B93A1;
+                --white:       #FFFFFF;
+                --shadow-sm:   0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+                --shadow-md:   0 4px 12px rgba(0,0,0,.10), 0 2px 6px rgba(0,0,0,.06);
+                --radius:      6px;
+              }}
+
+              html, body {{
+                height: 100%;
+                background: var(--surface);
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+                font-size: 14px;
+                color: var(--text-primary);
+                line-height: 1.5;
+              }}
+
+              .topbar {{
+                background: var(--brand);
+                height: 52px;
+                display: flex;
+                align-items: center;
+                padding: 0 32px;
+                gap: 12px;
+                position: sticky;
+                top: 0;
+                z-index: 100;
+                box-shadow: 0 2px 8px rgba(0,0,0,.25);
+              }}
+              .topbar-logo {{ display: flex; align-items: center; gap: 10px; text-decoration: none; }}
+              .topbar-product {{ color: #fff; font-size: 15px; font-weight: 600; letter-spacing: .01em; }}
+              .topbar-sep {{ width: 1px; height: 18px; background: rgba(255,255,255,.25); margin: 0 4px; }}
+              .topbar-sub {{ color: rgba(255,255,255,.7); font-size: 13px; }}
+              .topbar-spacer {{ flex: 1; }}
+              .topbar-user {{ display: flex; align-items: center; gap: 8px; color: rgba(255,255,255,.9); font-size: 13px; }}
+              .topbar-user svg {{ opacity: .7; }}
+              .role-chip {{
+                display: inline-flex; align-items: center;
+                padding: 2px 8px; border-radius: 3px;
+                font-size: 11px; font-weight: 600;
+                letter-spacing: .03em; text-transform: uppercase;
+              }}
+              .role-chip.standard {{ background: rgba(255,255,255,.15); color: rgba(255,255,255,.85); }}
+              .role-chip.admin    {{ background: #F0A500; color: #1A1D23; text-decoration: none; }}
+              .role-chip.admin:hover {{ background: #D4920A; }}
+
+              .page {{ max-width: 960px; margin: 0 auto; padding: 32px 24px 64px; }}
+
+              .page-header {{
+                margin-bottom: 28px; padding-bottom: 20px;
+                border-bottom: 1px solid var(--border);
+              }}
+              .page-header h1 {{ font-size: 22px; font-weight: 700; letter-spacing: -.01em; }}
+              .page-header p {{ margin-top: 4px; color: var(--text-secondary); font-size: 13px; }}
+
+              .meta-row {{ display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 28px; }}
+              .meta-item {{ display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-secondary); }}
+              .meta-item strong {{ color: var(--text-primary); font-weight: 600; }}
+              .meta-dot {{ width: 4px; height: 4px; border-radius: 50%; background: var(--border); }}
+
+              .section-heading {{
+                font-size: 13px; font-weight: 700; color: var(--text-secondary);
+                text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px;
+              }}
+
+              .download-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                gap: 12px; margin-bottom: 32px;
+              }}
+              .pkg-card {{
+                background: var(--white); border: 1px solid var(--border);
+                border-radius: var(--radius); padding: 20px;
+                display: flex; flex-direction: column; gap: 12px;
+                box-shadow: var(--shadow-sm);
+                transition: border-color .15s, box-shadow .15s;
+              }}
+              .pkg-card:hover {{ border-color: var(--accent); box-shadow: var(--shadow-md); }}
+              .pkg-card.recommended {{ border-color: var(--accent); border-width: 2px; }}
+              .pkg-card-header {{ display: flex; align-items: flex-start; gap: 12px; }}
+              .pkg-icon {{
+                width: 36px; height: 36px; border-radius: 8px;
+                display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0; background: #EEF3FC; color: var(--brand-light);
+              }}
+              .pkg-info {{ flex: 1; min-width: 0; }}
+              .pkg-name {{ font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }}
+              .pkg-desc {{ font-size: 12.5px; color: var(--text-secondary); margin-top: 2px; }}
+              .pkg-meta {{ display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-muted); }}
+              .rec-badge {{
+                display: inline-flex; align-items: center; gap: 4px;
+                padding: 2px 7px; background: var(--ok-bg); color: var(--ok);
+                border-radius: 3px; font-size: 11px; font-weight: 600;
+              }}
+              .download-btn {{
+                display: inline-flex; align-items: center; justify-content: center;
+                gap: 6px; padding: 8px 18px;
+                background: var(--accent); color: var(--white);
+                text-decoration: none; border-radius: var(--radius);
+                font-size: 13px; font-weight: 600;
+                transition: background .15s, box-shadow .15s;
+                box-shadow: 0 1px 3px rgba(0,120,212,.3);
+                align-self: flex-start;
+              }}
+              .download-btn:hover {{ background: var(--accent-hover); box-shadow: 0 2px 8px rgba(0,120,212,.4); }}
+              .no-pkg {{
+                grid-column: 1/-1; padding: 32px;
+                background: var(--warn-bg); border: 1px solid #F0C060;
+                border-radius: var(--radius); color: var(--warn); font-size: 13px;
+              }}
+
+              .instructions-card {{
+                background: var(--white); border: 1px solid var(--border);
+                border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow-sm);
+              }}
+              .instructions-card h3 {{ font-size: 14px; font-weight: 700; margin-bottom: 16px; }}
+              .step-list {{ list-style: none; display: flex; flex-direction: column; gap: 10px; }}
+              .step-list li {{ display: flex; gap: 12px; font-size: 13px; color: var(--text-secondary); line-height: 1.5; }}
+              .step-num {{
+                flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%;
+                background: var(--brand); color: var(--white);
+                font-size: 11px; font-weight: 700;
+                display: flex; align-items: center; justify-content: center; margin-top: 1px;
+              }}
+              .step-list code {{
+                display: inline-block; padding: 1px 6px;
+                background: #F0F2F5; border: 1px solid var(--border);
+                border-radius: 3px; font-family: 'SFMono-Regular', Consolas, monospace;
+                font-size: 12px; color: var(--brand);
+              }}
+
+              .page-footer {{
+                margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border);
+                display: flex; justify-content: space-between; align-items: center;
+                flex-wrap: wrap; gap: 12px;
+              }}
+              .page-footer-left {{ color: var(--text-muted); font-size: 12px; }}
+              .page-footer-right a {{ color: var(--accent); text-decoration: none; font-size: 12px; font-weight: 500; }}
+              .page-footer-right a:hover {{ text-decoration: underline; }}
+              </style>
               </head>
               <body>
-                  <div class="container">
-                      <h1>📦 Claude Code Distribution</h1>
-                      <div class="welcome">
-                          <strong>Welcome, {user_email}</strong>
-                      </div>
-                      <div class="release-date">
-                          📦 <strong>Profile:</strong> {profile}
-                      </div>
-                      <div class="release-date">
-                          📅 <strong>Release Date:</strong> {formatted_datetime}
-                      </div>
-                      <div class="release-date">
-                          🕐 <strong>Build Timestamp:</strong> {formatted_timestamp}
-                      </div>
 
-                      {''.join(platform_cards)}
+              <nav class="topbar">
+              <a class="topbar-logo" href="/">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                  <rect width="24" height="24" rx="4" fill="rgba(255,255,255,0.15)"/>
+                  <path d="M7 8h10M7 12h7M7 16h5" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+                <span class="topbar-product">Claude Code Portal</span>
+              </a>
+              <div class="topbar-sep"></div>
+              <span class="topbar-sub">Software Distribution</span>
+              <div class="topbar-spacer"></div>
+              <div class="topbar-user">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                  <circle cx="12" cy="7" r="4"/>
+                </svg>
+                <span>{user_email}</span>
+                {'<a id="user-role-badge" class="role-chip admin" href="/admin">Admin &#8599;</a>' if is_admin else ''}
+                <a href="/logout" onclick="return confirm('Sign out of this portal?')" style="margin-left:8px;color:rgba(255,255,255,.6);font-size:12px;text-decoration:none;border:1px solid rgba(255,255,255,.25);padding:2px 8px;border-radius:3px" onmouseover="this.style.color='rgba(255,255,255,.9)'" onmouseout="this.style.color='rgba(255,255,255,.6)'">Sign Out</a>
+              </div>
+              </nav>
 
-                      <div class="instructions">
-                          <h4>📋 Installation Instructions</h4>
-                          <ul>
-                              <li><strong>Windows:</strong> Extract the ZIP file and run <code>install.bat</code></li>
-                              <li><strong>Linux/Mac:</strong> Extract the ZIP file and run <code>./install.sh</code></li>
-                              <li>After installation, you can use the <code>claude</code> command from your terminal</li>
-                          </ul>
-                      </div>
-                  </div>
+              <main class="page">
+              <div class="page-header">
+                <h1>Claude Code — Software Distribution</h1>
+                <p>Select the appropriate package for your operating system and follow the installation steps below.</p>
+              </div>
+
+              <div class="meta-row">
+                <div class="meta-item">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+                  <span>Profile: <strong>{profile}</strong></span>
+                </div>
+                <div class="meta-dot"></div>
+                <div class="meta-item">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                  <span>Released: <strong>{formatted_datetime}</strong></span>
+                </div>
+                <div class="meta-dot"></div>
+                <div class="meta-item">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                  <span>Build: <strong>{formatted_timestamp}</strong></span>
+                </div>
+              </div>
+
+              <div class="section-heading">Available Packages</div>
+              <div class="download-grid">
+                {"".join(platform_cards)}
+              </div>
+
+              <div class="instructions-card">
+                <h3>Installation Guide</h3>
+                <ol class="step-list">
+                  <li><span class="step-num">1</span><span>Download the package for your operating system using the button above.</span></li>
+                  <li><span class="step-num">2</span><span><strong>Windows:</strong> Extract the ZIP archive and run <code>install.bat</code> as Administrator.</span></li>
+                  <li><span class="step-num">3</span><span><strong>Linux / macOS:</strong> Extract the archive and run <code>./install.sh</code> in your terminal.</span></li>
+                  <li><span class="step-num">4</span><span>After installation, verify the setup by running <code>claude --version</code> in a new terminal session.</span></li>
+                </ol>
+              </div>
+
+              <div class="instructions-card" style="margin-top:12px">
+                <h3>Session &amp; Login Troubleshooting</h3>
+                <ol class="step-list">
+                  <li><span class="step-num">1</span><span><strong>Clear login cache (Linux / macOS):</strong> Run <code>~/claude-code-with-bedrock/credential-process --profile {aws_profile} --clear-cache</code> then restart Claude Code to re-authenticate.</span></li>
+                  <li><span class="step-num">2</span><span><strong>Clear login cache (Windows):</strong> Run <code>%USERPROFILE%\claude-code-with-bedrock\credential-process.exe --profile {aws_profile} --clear-cache</code> then restart Claude Code.</span></li>
+                  <li><span class="step-num">3</span><span><strong>Portal session:</strong> Use the <strong>Sign Out</strong> button above to clear your browser session for this portal.</span></li>
+                </ol>
+              </div>
+
+              <footer class="page-footer">
+                <span class="page-footer-left">Claude Code Portal &middot; Internal Distribution System</span>
+                <div class="page-footer-right" style="display:flex;gap:16px;align-items:center">
+                  {'<a href="/admin">Admin Panel</a>' if is_admin else ''}
+                  <a href="/logout" onclick="return confirm('Sign out of this portal?')" style="color:var(--text-secondary)">Sign Out</a>
+                </div>
+              </footer>
+              </main>
+
               </body>
-              </html>
-              '''
+              </html>'''
       Tags:
         - Key: Application
           Value: ClaudeCodeWithBedrock
@@ -745,6 +970,9 @@ Resources:
     Properties:
       Name: !Sub '${IdentityPoolName}-landing-page-tg'
       TargetType: lambda
+      TargetGroupAttributes:
+        - Key: lambda.multi_value_headers.enabled
+          Value: 'true'
       Targets:
         - Id: !GetAtt LandingPageFunction.Arn
       HealthCheckEnabled: false
@@ -933,7 +1161,7 @@ Resources:
 
                   # Build callback URLs
                   callback_url = f"https://{custom_domain}/oauth2/idpresponse"
-                  logout_url = f"https://{custom_domain}"
+                  logout_url = f"https://{custom_domain}/"
 
                   logger.info(f"Updating Cognito client {client_id} in pool {user_pool_id}")
                   logger.info(f"Callback URL: {callback_url}")
@@ -998,6 +1226,295 @@ Resources:
       CustomDomain: !Ref CustomDomainName
       Version: !Ref DeploymentTimestamp  # Changes on every deployment to force Lambda re-execution
 
+  # ============================================
+  # Admin Panel Resources (conditional)
+  # ============================================
+
+  # Admin Lambda Execution Role
+  AdminLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: HasAdminPanel
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: AdminQuotaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !Ref QuotaPoliciesTableArn
+                  - !Sub '${QuotaPoliciesTableArn}/index/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref UserQuotaMetricsTableArn
+              - !If
+                - HasAdminPanel
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:DeleteItem
+                    - dynamodb:Scan
+                  Resource:
+                    - !Ref BedrockPricingTableArn
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Application
+          Value: ClaudeCodeWithBedrock
+        - Key: Purpose
+          Value: AdminPanelLambda
+
+  # Admin Lambda CloudWatch Log Group
+  AdminPanelLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasAdminPanel
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IdentityPoolName}-admin-panel'
+      RetentionInDays: 30
+
+  # Admin Panel Lambda Function
+  AdminPanelFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasAdminPanel
+    DependsOn: AdminPanelLogGroup
+    Properties:
+      FunctionName: !Sub '${IdentityPoolName}-admin-panel'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AdminLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          QUOTA_POLICIES_TABLE: !Ref QuotaPoliciesTableName
+          USER_QUOTA_METRICS_TABLE: !Ref UserQuotaMetricsTableName
+          ADMIN_EMAILS: !Ref AdminEmails
+          ADMIN_GROUP_NAME: !Ref AdminGroupName
+          PRICING_TABLE: !Ref BedrockPricingTableName
+      Code: ./lambda-functions/landing_page_admin/
+      Tags:
+        - Key: Application
+          Value: ClaudeCodeWithBedrock
+        - Key: Purpose
+          Value: AdminQuotaPanel
+
+  # Admin Lambda Invoke Permission for ALB
+  AdminLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasAdminPanel
+    Properties:
+      FunctionName: !Ref AdminPanelFunction
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+      SourceArn: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/*'
+
+  # Admin Lambda Target Group
+  AdminLambdaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasAdminPanel
+    DependsOn: AdminLambdaInvokePermission
+    Properties:
+      Name: !Sub '${IdentityPoolName}-admin-tg'
+      TargetType: lambda
+      TargetGroupAttributes:
+        - Key: lambda.multi_value_headers.enabled
+          Value: 'true'
+      Targets:
+        - Id: !GetAtt AdminPanelFunction.Arn
+      HealthCheckEnabled: false
+      Tags:
+        - Key: Application
+          Value: ClaudeCodeWithBedrock
+
+  # ALB Listener Rule for /admin* paths
+  AdminPathListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasAdminPanel
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/admin'
+              - '/admin/*'
+      Actions:
+        - Type: authenticate-oidc
+          Order: 1
+          AuthenticateOidcConfig:
+            Issuer: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/v2.0'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}'
+                  - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+            AuthorizationEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/authorize'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/authorize'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/authorize'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize'
+            TokenEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/token'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/token'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/oauth/token'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+            UserInfoEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/userinfo'
+              - !If
+                - IsAzure
+                - 'https://graph.microsoft.com/oidc/userinfo'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/userinfo'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo'
+            ClientId: !If
+              - IsOkta
+              - !Ref OktaClientId
+              - !If
+                - IsAzure
+                - !Ref AzureClientId
+                - !If
+                  - IsAuth0
+                  - !Ref Auth0ClientId
+                  - !Ref CognitoClientId
+            ClientSecret: !If
+              - IsOkta
+              - !Sub '{{resolve:secretsmanager:${OktaClientSecretArn}:SecretString}}'
+              - !If
+                - IsAzure
+                - !Sub '{{resolve:secretsmanager:${AzureClientSecretArn}:SecretString}}'
+                - !If
+                  - IsAuth0
+                  - !Sub '{{resolve:secretsmanager:${Auth0ClientSecretArn}:SecretString}}'
+                  - !Sub '{{resolve:secretsmanager:${CognitoClientSecretArn}:SecretString}}'
+            SessionTimeout: 43200
+            Scope: 'openid email profile'
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref AdminLambdaTargetGroup
+
+  # ALB Listener Rule for /api/* paths
+  ApiPathListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasAdminPanel
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/api/*'
+      Actions:
+        - Type: authenticate-oidc
+          Order: 1
+          AuthenticateOidcConfig:
+            Issuer: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/v2.0'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}'
+                  - !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+            AuthorizationEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/authorize'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/authorize'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/authorize'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize'
+            TokenEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/token'
+              - !If
+                - IsAzure
+                - !Sub 'https://login.microsoftonline.com/${AzureTenantId}/oauth2/v2.0/token'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/oauth/token'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+            UserInfoEndpoint: !If
+              - IsOkta
+              - !Sub 'https://${OktaDomain}/oauth2/v1/userinfo'
+              - !If
+                - IsAzure
+                - 'https://graph.microsoft.com/oidc/userinfo'
+                - !If
+                  - IsAuth0
+                  - !Sub 'https://${Auth0Domain}/userinfo'
+                  - !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo'
+            ClientId: !If
+              - IsOkta
+              - !Ref OktaClientId
+              - !If
+                - IsAzure
+                - !Ref AzureClientId
+                - !If
+                  - IsAuth0
+                  - !Ref Auth0ClientId
+                  - !Ref CognitoClientId
+            ClientSecret: !If
+              - IsOkta
+              - !Sub '{{resolve:secretsmanager:${OktaClientSecretArn}:SecretString}}'
+              - !If
+                - IsAzure
+                - !Sub '{{resolve:secretsmanager:${AzureClientSecretArn}:SecretString}}'
+                - !If
+                  - IsAuth0
+                  - !Sub '{{resolve:secretsmanager:${Auth0ClientSecretArn}:SecretString}}'
+                  - !Sub '{{resolve:secretsmanager:${CognitoClientSecretArn}:SecretString}}'
+            SessionTimeout: 43200
+            Scope: 'openid email profile'
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref AdminLambdaTargetGroup
+
 Outputs:
   DistributionURL:
     Description: Landing page URL for downloads (HTTPS with custom domain required)
@@ -1036,3 +1553,10 @@ Outputs:
     Value: !GetAtt DistributionBucket.Arn
     Export:
       Name: !Sub '${AWS::StackName}-DistributionBucketArn'
+
+  AdminPanelURL:
+    Condition: HasAdminPanel
+    Description: Admin quota management panel URL
+    Value: !Sub 'https://${CustomDomainName}/admin'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminPanelURL'
