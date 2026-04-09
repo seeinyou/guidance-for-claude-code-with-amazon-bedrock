@@ -20,6 +20,7 @@ class Profile:
     credential_storage: str  # Storage method: "keyring" (OS keyring) or "session" (~/.aws/credentials)
     aws_region: str
     identity_pool_name: str
+    client_secret: str | None = None  # OIDC client secret (for confidential clients)
     schema_version: str = "2.0"  # Configuration schema version
     stack_names: dict[str, str] = field(default_factory=dict)
     monitoring_enabled: bool = True
@@ -159,6 +160,11 @@ class Profile:
                 regions = data["allowed_bedrock_regions"]
                 if any(r.startswith("us-") for r in regions):
                     data["cross_region_profile"] = "us"
+
+        # Strip unknown fields to allow forward/backward compatibility
+        import dataclasses
+        known_fields = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in known_fields}
 
         return cls(**data)
 

@@ -183,6 +183,7 @@ class ContextShowCommand(Command):
             console.print(f"  Provider Type:    {profile.provider_type or 'auto-detect'}")
             console.print(f"  Provider Domain:  {profile.provider_domain}")
             console.print(f"  Client ID:        {profile.client_id}")
+            console.print(f"  Client Secret:    {'configured' if profile.client_secret else 'not set (public client)'}")
             console.print(f"  Credential Store: {profile.credential_storage}")
             if profile.cognito_user_pool_id:
                 console.print(f"  User Pool ID:     {profile.cognito_user_pool_id}")
@@ -420,6 +421,7 @@ class ConfigExportCommand(Command):
         # Fields to remove (secrets/credentials)
         sensitive_fields = [
             "client_id",  # OIDC client ID
+            "client_secret",  # OIDC client secret
             "cognito_user_pool_id",  # Cognito User Pool ID
             "distribution_idp_client_id",  # Distribution client ID
             "distribution_idp_client_secret_arn",  # Secret ARN

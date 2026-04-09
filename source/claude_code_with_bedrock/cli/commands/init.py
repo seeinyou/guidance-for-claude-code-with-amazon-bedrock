@@ -397,6 +397,12 @@ class InitCommand(Command):
             if not client_id:
                 return None
 
+            # Optional OIDC client secret (for confidential clients)
+            client_secret = questionary.password(
+                "Enter your OIDC Client Secret (leave empty for public clients):",
+                default="",
+            ).ask()
+
             # Credential Storage Method
             console.print("\n[bold]Credential Storage Method[/bold]")
             console.print("Choose how to store AWS credentials locally:")
@@ -420,6 +426,8 @@ class InitCommand(Command):
                 config["okta"] = {}
             config["okta"]["domain"] = provider_domain
             config["okta"]["client_id"] = client_id
+            if client_secret:
+                config["okta"]["client_secret"] = client_secret
             config["credential_storage"] = credential_storage
             config["provider_type"] = provider_type
             if cognito_user_pool_id:
@@ -1250,6 +1258,10 @@ class InitCommand(Command):
             ),
         )
         table.add_row(
+            "OIDC Client Secret",
+            "configured" if config["okta"].get("client_secret") else "not set (public client)",
+        )
+        table.add_row(
             "Credential Storage",
             (
                 "Keyring (OS secure storage)"
@@ -1495,6 +1507,7 @@ class InitCommand(Command):
             name=profile_name,
             provider_domain=config_data["okta"]["domain"],
             client_id=config_data["okta"]["client_id"],
+            client_secret=config_data["okta"].get("client_secret"),
             credential_storage=config_data.get("credential_storage", "session"),
             aws_region=config_data["aws"]["region"],
             identity_pool_name=config_data["aws"]["identity_pool_name"],
@@ -1776,7 +1789,11 @@ class InitCommand(Command):
 
             existing_config = {
                 "_stacks_found": stacks_found,
-                "okta": {"domain": profile.provider_domain, "client_id": profile.client_id},
+                "okta": {
+                    "domain": profile.provider_domain,
+                    "client_id": profile.client_id,
+                    **({"client_secret": profile.client_secret} if profile.client_secret else {}),
+                },
                 "credential_storage": getattr(profile, "credential_storage", "session"),
                 "aws": {
                     "region": region,

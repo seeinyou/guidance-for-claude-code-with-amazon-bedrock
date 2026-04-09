@@ -856,6 +856,10 @@ class MultiProviderAuth:
             "code_verifier": code_verifier,
         }
 
+        # Include client_secret if configured (for confidential OIDC clients)
+        if self.config.get("client_secret"):
+            token_data["client_secret"] = self.config["client_secret"]
+
         # Build token endpoint URL
         token_url = f"{base_url}{self.provider_config['token_endpoint']}"
 
