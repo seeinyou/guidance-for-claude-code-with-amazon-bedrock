@@ -2041,27 +2041,37 @@ echo Copying configuration...
 copy /Y "config.json" "%USERPROFILE%\\claude-code-with-bedrock\\" >nul
 
 REM Copy Claude Code settings if they exist
-if not exist "claude-settings" goto :skip_settings
-echo Copying Claude Code telemetry settings...
-if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
+if exist "claude-settings" (
+    echo Copying Claude Code telemetry settings...
+    if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
 
-if not exist "claude-settings\\settings.json" goto :skip_settings
+    REM Copy settings and replace placeholders
+    if exist "claude-settings\\settings.json" (
+        set SKIP_SETTINGS=false
+        if exist "%USERPROFILE%\\.claude\\settings.json" (
+            echo Existing Claude Code settings found
+            set /p OVERWRITE="Overwrite with new settings? (y/n): "
+            if /i not "%OVERWRITE%"=="y" (
+                echo Skipping Claude Code settings...
+                set SKIP_SETTINGS=true
+            )
+        )
 
-set OVERWRITE=y
-if exist "%USERPROFILE%\\.claude\\settings.json" (
-    echo Existing Claude Code settings found
-    set /p OVERWRITE="Overwrite with new settings? (y/n): "
+        if not "%SKIP_SETTINGS%"=="true" (
+            REM Use PowerShell to replace placeholders
+            powershell -Command ^
+            "$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
+            -replace '\\\\\\\\', '/'; ^
+            $credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
+            -replace '\\\\\\\\', '/'; ^
+            (Get-Content 'claude-settings\\\\settings.json') ^
+            -replace '__OTEL_HELPER_PATH__', $otelPath ^
+            -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | ^
+            Set-Content '%USERPROFILE%\\\\.claude\\\\settings.json'"
+            echo OK Claude Code settings configured
+        )
+    )
 )
-if /i not "%OVERWRITE%"=="y" (
-    echo Skipping Claude Code settings...
-    goto :skip_settings
-)
-
-REM Use PowerShell to replace placeholders (use semicolons not pipes to avoid cmd.exe pipe parsing)
-powershell -Command "$dest = $env:USERPROFILE + '\\.claude\\settings.json'; $otelPath = ($env:USERPROFILE + '\\claude-code-with-bedrock\\otel-helper.exe') -replace '\\\\', '\\\\'; $credPath = ($env:USERPROFILE + '\\claude-code-with-bedrock\\credential-process.exe') -replace '\\\\', '\\\\'; $content = (Get-Content 'claude-settings\\settings.json' -Raw) -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath; Set-Content -Path $dest -Value $content"
-echo OK Claude Code settings configured
-
-:skip_settings
 
 REM Configure AWS profiles
 echo.
