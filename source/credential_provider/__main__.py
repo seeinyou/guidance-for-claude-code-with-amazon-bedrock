@@ -811,7 +811,7 @@ class MultiProviderAuth:
         server_thread.start()
 
         # Open browser - detect headless environment first
-        is_headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY") and sys.platform != "darwin"
+        is_headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY") and sys.platform not in ("darwin", "win32")
         browser_opened = False
 
         if not is_headless:
