@@ -420,6 +420,7 @@ class ConfigExportCommand(Command):
         # Fields to remove (secrets/credentials)
         sensitive_fields = [
             "client_id",  # OIDC client ID
+            "client_secret",  # OIDC client secret
             "cognito_user_pool_id",  # Cognito User Pool ID
             "distribution_idp_client_id",  # Distribution client ID
             "distribution_idp_client_secret_arn",  # Secret ARN

@@ -1679,16 +1679,20 @@ RUN pyinstaller \
             federation_type: "cognito" or "direct"
             profile_name: Name to use as key in config.json (defaults to "ClaudeCode" for backward compatibility)
         """
-        config = {
-            profile_name: {
-                "provider_domain": profile.provider_domain,
-                "client_id": profile.client_id,
-                "aws_region": profile.aws_region,
-                "provider_type": profile.provider_type or self._detect_provider_type(profile.provider_domain),
-                "credential_storage": profile.credential_storage,
-                "cross_region_profile": profile.cross_region_profile or "us",
-            }
+        profile_data = {
+            "provider_domain": profile.provider_domain,
+            "client_id": profile.client_id,
+            "aws_region": profile.aws_region,
+            "provider_type": profile.provider_type or self._detect_provider_type(profile.provider_domain),
+            "credential_storage": profile.credential_storage,
+            "cross_region_profile": profile.cross_region_profile or "us",
         }
+
+        # Include client_secret if configured (for confidential OIDC clients)
+        if profile.client_secret:
+            profile_data["client_secret"] = profile.client_secret
+
+        config = {profile_name: profile_data}
 
         # Add the appropriate federation field based on type
         if federation_type == "direct":
