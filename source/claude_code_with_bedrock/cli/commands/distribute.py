@@ -70,6 +70,31 @@ class DistributeCommand(Command):
         option("latest", description="Auto-select latest build without wizard", flag=True),
     ]
 
+    def _refine_windows_installer(self, package_path: Path, console: Console):
+        """Refine Windows install.bat for cmd.exe and PowerShell compatibility."""
+        install_bat = package_path / "install.bat"
+        if not install_bat.exists():
+            return
+
+        from importlib.util import module_from_spec, spec_from_file_location
+
+        spec = spec_from_file_location(
+            "refine_win_install",
+            Path(__file__).parent / "refine-win-install.py",
+        )
+        refiner = module_from_spec(spec)
+        spec.loader.exec_module(refiner)
+
+        content = install_bat.read_text()
+        crlf = "\r\n" in content
+        if crlf:
+            content = content.replace("\r\n", "\n")
+        content = refiner.refine_installer(content)
+        if crlf:
+            content = content.replace("\n", "\r\n")
+        install_bat.write_text(content)
+        console.print("  [green]✓ Windows installer refined[/green]")
+
     def _check_old_flat_structure(self, dist_dir: Path) -> bool:
         """Check if old flat directory structure exists."""
         if not dist_dir.exists():
@@ -288,6 +313,9 @@ class DistributeCommand(Command):
         # Use selected build path for distribution
         package_path = selected_build_path
         console.print(f"\n[green]Using build: {package_path.parent.name}/{package_path.name}[/green]")
+
+        # Refine Windows installer for cmd.exe/PowerShell compatibility
+        self._refine_windows_installer(package_path, console)
 
         # Load configuration
         config = Config.load()

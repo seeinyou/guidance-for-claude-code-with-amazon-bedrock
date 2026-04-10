@@ -2078,13 +2078,11 @@ echo.
 echo Configuring AWS profiles...
 
 REM Read profiles from config.json using PowerShell
-for /f %%p in ('powershell -Command ^
-"& {{$c=Get-Content config.json|ConvertFrom-Json;$c.PSObject.Properties.Name}}"') do (
+for /f %%p in ('powershell -Command "(ConvertFrom-Json -InputObject (Get-Content config.json -Raw)).PSObject.Properties.Name"') do (
     echo Configuring AWS profile: %%p
 
     REM Get profile-specific region
-    for /f %%r in ('powershell -Command ^
-    "& {{$c=Get-Content config.json|ConvertFrom-Json;$c.'%%p'.aws_region}}"') do set PROFILE_REGION=%%r
+    for /f %%r in ('powershell -Command "(ConvertFrom-Json -InputObject (Get-Content config.json -Raw)).'%%p'.aws_region"') do set PROFILE_REGION=%%r
 
 
     REM Set credential process with --profile flag (cross-platform, no wrapper needed)
@@ -2108,8 +2106,7 @@ echo Installation complete!
 echo ======================================
 echo.
 echo Available profiles:
-for /f %%p in ('powershell -Command ^
-"$config = Get-Content config.json | ConvertFrom-Json; $config.PSObject.Properties.Name"') do (
+for /f %%p in ('powershell -Command "(ConvertFrom-Json -InputObject (Get-Content config.json -Raw)).PSObject.Properties.Name"') do (
     echo   - %%p
 )
 echo.
@@ -2118,8 +2115,7 @@ echo   set AWS_PROFILE=^<profile-name^>
 echo   aws sts get-caller-identity
 echo.
 echo Example:
-for /f %%p in ('powershell -Command ^
-"$config = Get-Content config.json | ConvertFrom-Json; $config.PSObject.Properties.Name | Select-Object -First 1"') do (
+for /f %%p in ('powershell -Command "(ConvertFrom-Json -InputObject (Get-Content config.json -Raw)).PSObject.Properties.Name | Select-Object -First 1"') do (
     echo   set AWS_PROFILE=%%p
     echo   aws sts get-caller-identity
 )
