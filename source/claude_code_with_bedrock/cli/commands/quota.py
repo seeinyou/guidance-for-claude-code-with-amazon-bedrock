@@ -1454,7 +1454,30 @@ class QuotaImportCommand(Command):
 
 
 # Default pricing for Claude models on Bedrock (per 1M tokens in USD)
+# Source: https://docs.anthropic.com/en/docs/about-claude/pricing
+# Note: 4.6 models use shorter IDs without :0 suffix (e.g. anthropic.claude-opus-4-6-v1)
+# Note: cache_write uses 5-minute cache (1.25x input). 1-hour cache is 2x input.
 DEFAULT_BEDROCK_PRICING = {
+    # Claude 4.6 (no :0 suffix)
+    "anthropic.claude-opus-4-6-v1": {
+        "input_per_1m": "5.00", "output_per_1m": "25.00",
+        "cache_read_per_1m": "0.50", "cache_write_per_1m": "6.25",
+    },
+    "anthropic.claude-sonnet-4-6": {
+        "input_per_1m": "3.00", "output_per_1m": "15.00",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+    },
+    # Claude 4.5
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": {
+        "input_per_1m": "3.00", "output_per_1m": "15.00",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+    },
+    # Claude 4.1
+    "anthropic.claude-opus-4-1-20250805-v1:0": {
+        "input_per_1m": "15.00", "output_per_1m": "75.00",
+        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
+    },
+    # Claude 4
     "anthropic.claude-sonnet-4-20250514-v1:0": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
         "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
@@ -1463,13 +1486,15 @@ DEFAULT_BEDROCK_PRICING = {
         "input_per_1m": "15.00", "output_per_1m": "75.00",
         "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
     },
-    "anthropic.claude-opus-4-6-v1:0": {
-        "input_per_1m": "15.00", "output_per_1m": "75.00",
-        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
-    },
+    # Claude Haiku 4.5
     "anthropic.claude-haiku-4-5-20251001-v1:0": {
-        "input_per_1m": "0.80", "output_per_1m": "4.00",
-        "cache_read_per_1m": "0.08", "cache_write_per_1m": "1.00",
+        "input_per_1m": "1.00", "output_per_1m": "5.00",
+        "cache_read_per_1m": "0.10", "cache_write_per_1m": "1.25",
+    },
+    # Claude 3.x
+    "anthropic.claude-3-7-sonnet-20250219-v1:0": {
+        "input_per_1m": "3.00", "output_per_1m": "15.00",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
     },
     "anthropic.claude-3-5-sonnet-20241022-v2:0": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
