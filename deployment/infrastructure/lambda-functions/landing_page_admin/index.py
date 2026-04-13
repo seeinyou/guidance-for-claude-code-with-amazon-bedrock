@@ -1719,7 +1719,7 @@ def generate_admin_page(admin_email):
     <div id="alert" class="alert"></div>
 
     <div class="tabs">
-      <button class="tab active" onclick="switchTab('usage')">Usage</button>
+      <button class="tab active" onclick="switchTab('usage')">Users</button>
       <button class="tab" onclick="switchTab('policies')">Quota Policies</button>
       <button class="tab" onclick="switchTab('unblock')">Unblock User</button>
       <button class="tab" onclick="switchTab('admins')">Admins</button>
@@ -1778,10 +1778,10 @@ def generate_admin_page(admin_email):
             <th style="min-width:220px">Email</th>
             <th style="min-width:110px">Joined</th>
             <th style="min-width:70px">Role</th>
-            <th>Total Tokens</th>
-            <th>Daily Tokens</th>
-            <th>Monthly Cost</th>
-            <th>Daily Cost</th>
+            <th style="display:none">Total Tokens</th>
+            <th style="display:none">Daily Tokens</th>
+            <th style="display:none">Monthly Cost</th>
+            <th style="display:none">Daily Cost</th>
             <th>Last Active</th>
             <th style="min-width:90px">Status</th>
           </tr></thead>
@@ -2357,7 +2357,7 @@ def generate_admin_page(admin_email):
     const pageRows = rows.slice(start, start + _usagePageSize);
 
     document.getElementById('usage-list-body').innerHTML = pageRows.map(u => `
-      <tr style="cursor:pointer" onclick="showUsageDetail('${{u.email}}')">
+      <tr style="cursor:default" onclick="/* showUsageDetail('${{u.email}}') */">
         <td class="usage-email-cell">${{u.email}}</td>
         <td class="usage-date-cell">${{u.first_seen
           ? new Date(u.first_seen).toLocaleDateString(undefined, {{year:'numeric',month:'short',day:'numeric'}})
@@ -2365,10 +2365,10 @@ def generate_admin_page(admin_email):
         <td>${{u.is_admin
           ? '<span class="badge badge-admin">Admin</span>'
           : '<span class="badge badge-standard">User</span>'}}</td>
-        <td>${{fmtTokens(u.total_tokens)}}</td>
-        <td>${{fmtTokens(u.daily_tokens)}}</td>
-        <td>${{u.estimated_cost ? '$' + parseFloat(u.estimated_cost).toFixed(2) : '$0.00'}}</td>
-        <td>${{u.daily_cost ? '$' + parseFloat(u.daily_cost).toFixed(2) : '$0.00'}}</td>
+        <td style="display:none">${{fmtTokens(u.total_tokens)}}</td>
+        <td style="display:none">${{fmtTokens(u.daily_tokens)}}</td>
+        <td style="display:none">${{u.estimated_cost ? '$' + parseFloat(u.estimated_cost).toFixed(2) : '$0.00'}}</td>
+        <td style="display:none">${{u.daily_cost ? '$' + parseFloat(u.daily_cost).toFixed(2) : '$0.00'}}</td>
         <td style="color:var(--text-secondary);font-size:12px">${{u.last_updated ? new Date(u.last_updated).toLocaleString() : '<span style="color:var(--text-muted)">—</span>'}}</td>
         <td>${{u.is_blocked
           ? `<span class="badge" style="background:#dc3545;color:#fff;margin-right:6px">Blocked</span><button class="btn btn-primary" style="padding:2px 10px;font-size:12px;min-width:auto" onclick="event.stopPropagation();goToUnblock('${{u.email}}')">Unblock</button>`
