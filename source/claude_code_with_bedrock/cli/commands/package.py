@@ -328,6 +328,20 @@ class PackageCommand(Command):
                     except Exception as e:
                         console.print(f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]")
 
+        # Compute SHA256 hash of built otel-helper binaries for integrity verification
+        otel_helper_hash = None
+        if built_otel_helpers:
+            # Use the first built helper's hash (all should be platform-specific,
+            # the hash for the user's platform will be set during installation)
+            for platform_name, otel_helper_path in built_otel_helpers:
+                import hashlib
+                sha256 = hashlib.sha256()
+                with open(otel_helper_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        sha256.update(chunk)
+                otel_helper_hash = sha256.hexdigest()
+                console.print(f"  [dim]SHA256 ({platform_name}): {otel_helper_hash}[/dim]")
+
         # Check if any binaries were built
         if not built_executables:
             console.print("\n[red]Error: No binaries were successfully built.[/red]")
@@ -338,7 +352,7 @@ class PackageCommand(Command):
         console.print("\n[cyan]Creating configuration...[/cyan]")
         # Pass the appropriate identifier based on federation type
         federation_identifier = federated_role_arn if federation_type == "direct" else identity_pool_id
-        self._create_config(output_dir, profile, federation_identifier, federation_type, profile_name)
+        self._create_config(output_dir, profile, federation_identifier, federation_type, profile_name, otel_helper_hash=otel_helper_hash)
 
         # Create installer
         console.print("[cyan]Creating installer script...[/cyan]")
@@ -1669,6 +1683,7 @@ RUN pyinstaller \
         federation_identifier: str,
         federation_type: str = "cognito",
         profile_name: str = "ClaudeCode",
+        otel_helper_hash: str | None = None,
     ) -> Path:
         """Create the configuration file.
 
@@ -1710,6 +1725,16 @@ RUN pyinstaller \
         # Add selected_model if available
         if hasattr(profile, "selected_model") and profile.selected_model:
             config[profile_name]["selected_model"] = profile.selected_model
+
+        # Add TVM endpoint if quota monitoring is enabled
+        if hasattr(profile, 'tvm_endpoint') and profile.tvm_endpoint:
+            config[profile_name]["tvm_endpoint"] = profile.tvm_endpoint
+        if hasattr(profile, 'tvm_request_timeout') and profile.tvm_request_timeout:
+            config[profile_name]["tvm_request_timeout"] = profile.tvm_request_timeout
+
+        # Add otel-helper hash for integrity verification
+        if otel_helper_hash:
+            config[profile_name]["otel_helper_hash"] = otel_helper_hash
 
         config_path = output_dir / "config.json"
         with open(config_path, "w") as f:

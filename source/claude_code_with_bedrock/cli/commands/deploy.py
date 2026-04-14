@@ -951,6 +951,7 @@ class DeployCommand(Command):
                     f"MonthlyEnforcementMode={monthly_enforcement}",
                     f"OidcIssuerUrl={oidc_issuer_url}",
                     f"OidcClientId={oidc_client_id}",
+                    f"AlertEmail={getattr(profile, 'admin_emails', '').split(',')[0].strip()}",
                 ]
 
                 # Package the template using AWS CLI
@@ -989,8 +990,11 @@ class DeployCommand(Command):
                     )
 
                     # Deploy the packaged template
+                    # CAPABILITY_NAMED_IAM required for BedrockUserRole (explicit RoleName)
                     result = deploy_with_cf(
-                        packaged_template_path, stack_name, params, task_description="Deploying quota monitoring..."
+                        packaged_template_path, stack_name, params,
+                        capabilities=["CAPABILITY_NAMED_IAM"],
+                        task_description="Deploying quota monitoring..."
                     )
 
                     # Update metrics aggregator Lambda environment if successful
@@ -1111,7 +1115,7 @@ class DeployCommand(Command):
 
                     # Save quota outputs to profile for test command and credential provider
                     if quota_endpoint and quota_endpoint != "N/A":
-                        profile.quota_api_endpoint = quota_endpoint
+                        profile.tvm_endpoint = quota_endpoint
                     if quota_outputs.get("PoliciesTableName"):
                         profile.quota_policies_table = quota_outputs["PoliciesTableName"]
                     if quota_outputs.get("QuotaTableName"):

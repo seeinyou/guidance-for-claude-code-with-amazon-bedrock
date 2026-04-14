@@ -62,9 +62,8 @@ class Profile:
     enable_finegrained_quotas: bool = False  # Enable fine-grained quota policies (user/group/default)
     quota_policies_table: str | None = None  # DynamoDB table name for quota policies
     user_quota_metrics_table: str | None = None  # DynamoDB table name for user quota metrics
-    quota_api_endpoint: str | None = None  # API Gateway endpoint for real-time quota checks
-    quota_fail_mode: str = "open"  # "open" (allow on error) or "closed" (deny on error)
-    quota_check_interval: int = 30  # Minutes between quota re-checks (0 = every request)
+    tvm_endpoint: str | None = None  # TVM Lambda endpoint for credential issuance via API Gateway
+    tvm_request_timeout: int = 5  # TVM request timeout in seconds
 
     # Admin panel configuration (for landing-page distribution with quota monitoring)
     admin_panel_enabled: bool = False  # Enable admin quota management UI on landing page
@@ -78,6 +77,8 @@ class Profile:
 
     # Claude Code settings configuration
     include_coauthored_by: bool = True  # Whether to include "co-authored-by Claude" in git commits
+
+    otel_helper_hash: str | None = None  # SHA256 hash of otel-helper binary for integrity verification
 
     # Legacy field support
     @property

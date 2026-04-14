@@ -19,6 +19,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -78,32 +79,73 @@ class MultiProviderAuth:
         # Debug mode - set before loading config since _load_config may use _debug_print
         self.debug = os.getenv("COGNITO_AUTH_DEBUG", "").lower() in ("1", "true", "yes")
 
-        # Load configuration from environment or config file
-        # Auto-detect profile from config.json if not specified
-        self.profile = profile or self._auto_detect_profile() or "ClaudeCode"
+        # File logging - always enabled, writes to ~/claude-code-with-bedrock/logs/
+        self._log_file = None
+        self._init_file_logging()
 
-        self.config = self._load_config()
+        try:
+            # Load configuration from environment or config file
+            # Auto-detect profile from config.json if not specified
+            self.profile = profile or self._auto_detect_profile() or "ClaudeCode"
+            self._log(f"profile={self.profile}")
 
-        # Determine provider type from domain
-        self.provider_type = self._determine_provider_type()
+            self.config = self._load_config()
 
-        # Fail clearly if provider type is unknown
-        if self.provider_type not in PROVIDER_CONFIGS:
-            raise ValueError(
-                f"Unknown provider type '{self.provider_type}'. "
-                f"Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
-            )
-        self.provider_config = PROVIDER_CONFIGS[self.provider_type]
+            # Determine provider type from domain
+            self.provider_type = self._determine_provider_type()
 
-        # OAuth configuration
-        self.redirect_port = int(os.getenv("REDIRECT_PORT", "8400"))
-        self.redirect_uri = f"http://localhost:{self.redirect_port}/callback"
+            # Fail clearly if provider type is unknown
+            if self.provider_type not in PROVIDER_CONFIGS:
+                raise ValueError(
+                    f"Unknown provider type '{self.provider_type}'. "
+                    f"Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
+                )
+            self.provider_config = PROVIDER_CONFIGS[self.provider_type]
 
-        # Initialize credential storage
-        self._init_credential_storage()
+            # Default otel-helper integrity status (updated in run())
+            self.otel_helper_status = "not-configured"
+
+            # OAuth configuration
+            self.redirect_port = int(os.getenv("REDIRECT_PORT", "8400"))
+            self.redirect_uri = f"http://localhost:{self.redirect_port}/callback"
+
+            # Initialize credential storage
+            self._init_credential_storage()
+
+            self._log(f"init OK provider={self.provider_type} federation={self.config.get('federation_type')} storage={self.config.get('credential_storage')}")
+        except Exception as e:
+            self._log(f"INIT FAILED: {e}")
+            raise
+
+    def _init_file_logging(self):
+        """Initialize file-based logging to ~/claude-code-with-bedrock/logs/."""
+        try:
+            log_dir = Path.home() / "claude-code-with-bedrock" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "credential-process.log"
+            # Rotate: keep max 1MB, truncate if larger
+            if log_path.exists() and log_path.stat().st_size > 1_048_576:
+                # Keep last 500KB
+                content = log_path.read_bytes()
+                log_path.write_bytes(content[-524_288:])
+            self._log_file = open(log_path, "a")
+            self._log(f"--- session start (pid={os.getpid()}) ---")
+        except Exception:
+            self._log_file = None  # Non-fatal: logging is best-effort
+
+    def _log(self, message):
+        """Write a timestamped message to the log file (always, regardless of debug mode)."""
+        if self._log_file:
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._log_file.write(f"{ts}  {message}\n")
+                self._log_file.flush()
+            except Exception:
+                pass
 
     def _debug_print(self, message):
-        """Print debug message only if debug mode is enabled"""
+        """Print debug message to stderr if debug mode is enabled, and always log to file."""
+        self._log(message)
         if self.debug:
             print(f"Debug: {message}", file=sys.stderr)
 
@@ -515,7 +557,211 @@ class MultiProviderAuth:
             except Exception:
                 pass
 
+        # Clear refresh token from keyring
+        try:
+            if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-refresh-token"):
+                keyring.set_password("claude-code-with-bedrock", f"{self.profile}-refresh-token",
+                                    json.dumps({"refresh_token": "EXPIRED", "profile": self.profile}))
+                cleared_items.append("keyring refresh token")
+        except Exception as e:
+            self._debug_print(f"Could not clear keyring refresh token: {e}")
+
+        # Clear refresh token from session directory
+        if session_dir.exists():
+            refresh_file = session_dir / f"{self.profile}-refresh-token.json"
+            if refresh_file.exists():
+                refresh_file.unlink()
+                cleared_items.append("refresh token file")
+
         return cleared_items
+
+    def _check_otel_helper_integrity(self) -> str:
+        """Verify otel-helper binary's SHA256 hash against config.
+
+        Returns status: 'valid', 'missing', 'hash-mismatch', 'not-configured'.
+        Does NOT exit — status is reported to TVM Lambda for server-side enforcement.
+        """
+        expected_hash = self.config.get("otel_helper_hash")
+        if not expected_hash:
+            print("Warning: otel_helper_hash not configured — integrity check skipped", file=sys.stderr)
+            return "not-configured"
+
+        # Determine binary path based on platform
+        if platform.system() == "Windows":
+            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper.exe"
+        else:
+            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
+
+        if not helper_path.exists():
+            print(f"Warning: otel-helper binary not found at {helper_path}", file=sys.stderr)
+            return "missing"
+
+        # Compute SHA256
+        sha256 = hashlib.sha256()
+        with open(helper_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        actual_hash = sha256.hexdigest()
+
+        if actual_hash != expected_hash:
+            print(f"Warning: otel-helper hash mismatch (expected={expected_hash[:16]}..., actual={actual_hash[:16]}...)", file=sys.stderr)
+            return "hash-mismatch"
+
+        self._debug_print("otel-helper integrity check passed")
+        return "valid"
+
+    def _call_tvm(self, id_token: str, otel_helper_status: str) -> dict:
+        """Call TVM Lambda via API Gateway to obtain Bedrock credentials.
+
+        The TVM Lambda validates the JWT, checks quota, and issues
+        time-scoped STS credentials. This is the sole path to Bedrock credentials.
+
+        Args:
+            id_token: Valid Cognito id_token for Authorization header
+            otel_helper_status: One of 'valid', 'missing', 'hash-mismatch', 'not-configured'
+
+        Returns:
+            Credential dict with Version, AccessKeyId, SecretAccessKey, SessionToken, Expiration
+
+        Raises:
+            Exception: On TVM denial or unreachable
+        """
+        tvm_endpoint = self.config.get("tvm_endpoint")
+        if not tvm_endpoint:
+            raise Exception("tvm_endpoint not configured — cannot obtain Bedrock credentials")
+
+        timeout = self.config.get("tvm_request_timeout", 5)
+
+        try:
+            response = requests.post(
+                f"{tvm_endpoint}/tvm",
+                headers={
+                    "Authorization": f"Bearer {id_token}",
+                    "X-OTEL-Helper-Status": otel_helper_status,
+                },
+                timeout=timeout,
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                credentials = result.get("credentials")
+                if not credentials:
+                    raise Exception(f"TVM returned no credentials: {result.get('message', 'unknown error')}")
+                # Ensure Version field is present
+                credentials.setdefault("Version", 1)
+                return credentials
+            elif response.status_code == 401:
+                raise Exception("TVM authentication failed — id_token rejected by API Gateway")
+            elif response.status_code == 403:
+                result = response.json()
+                reason = result.get("reason", "unknown")
+                message = result.get("message", "Access denied")
+                raise Exception(f"TVM denied: {reason} — {message}")
+            else:
+                raise Exception(f"TVM returned HTTP {response.status_code}: {response.text[:200]}")
+        except requests.exceptions.Timeout:
+            raise Exception(f"TVM Lambda unreachable (timeout={timeout}s)")
+        except requests.exceptions.ConnectionError as e:
+            raise Exception(f"TVM Lambda unreachable: {e}")
+
+    def _try_refresh_token(self) -> str | None:
+        """Exchange refresh_token for new id_token via Cognito /oauth2/token.
+
+        Returns new id_token or None if refresh fails.
+        """
+        refresh_token = self._get_cached_refresh_token()
+        if not refresh_token:
+            self._debug_print("No cached refresh_token for silent refresh")
+            return None
+
+        provider_domain = self.config["provider_domain"]
+        base_url = f"https://{provider_domain}"
+        token_url = f"{base_url}{self.provider_config['token_endpoint']}"
+
+        try:
+            token_data = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": self.config["client_id"],
+            }
+            # Include client_secret if configured
+            if self.config.get("client_secret"):
+                token_data["client_secret"] = self.config["client_secret"]
+
+            response = requests.post(
+                token_url,
+                data=token_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10,
+            )
+
+            if response.ok:
+                tokens = response.json()
+                new_id_token = tokens.get("id_token")
+                if new_id_token:
+                    self._debug_print("Successfully refreshed id_token via refresh_token")
+                    return new_id_token
+                else:
+                    self._debug_print("Refresh response missing id_token")
+                    return None
+            else:
+                self._debug_print(f"Refresh token exchange failed: {response.status_code}")
+                self._clear_cached_refresh_token()
+                return None
+        except Exception as e:
+            self._debug_print(f"Refresh token exchange error: {e}")
+            return None
+
+    def _save_refresh_token(self, refresh_token: str):
+        """Save refresh_token to dedicated storage (similar to monitoring token)."""
+        try:
+            token_data = {"refresh_token": refresh_token, "profile": self.profile}
+            if self.credential_storage == "keyring":
+                keyring.set_password("claude-code-with-bedrock", f"{self.profile}-refresh-token", json.dumps(token_data))
+            else:
+                session_dir = Path.home() / ".claude-code-session"
+                session_dir.mkdir(parents=True, exist_ok=True)
+                token_file = session_dir / f"{self.profile}-refresh-token.json"
+                with open(token_file, "w") as f:
+                    json.dump(token_data, f)
+                token_file.chmod(0o600)
+            self._debug_print("Saved refresh token")
+        except Exception as e:
+            self._debug_print(f"Warning: Could not save refresh token: {e}")
+
+    def _get_cached_refresh_token(self) -> str | None:
+        """Retrieve cached refresh_token."""
+        try:
+            if self.credential_storage == "keyring":
+                token_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-refresh-token")
+                if token_json:
+                    data = json.loads(token_json)
+                    return data.get("refresh_token")
+            else:
+                session_dir = Path.home() / ".claude-code-session"
+                token_file = session_dir / f"{self.profile}-refresh-token.json"
+                if token_file.exists():
+                    with open(token_file) as f:
+                        data = json.load(f)
+                    return data.get("refresh_token")
+            return None
+        except Exception:
+            return None
+
+    def _clear_cached_refresh_token(self):
+        """Clear cached refresh_token."""
+        try:
+            if self.credential_storage == "keyring":
+                if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-refresh-token"):
+                    keyring.set_password("claude-code-with-bedrock", f"{self.profile}-refresh-token",
+                                        json.dumps({"refresh_token": "EXPIRED", "profile": self.profile}))
+            else:
+                session_dir = Path.home() / ".claude-code-session"
+                token_file = session_dir / f"{self.profile}-refresh-token.json"
+                if token_file.exists():
+                    token_file.unlink()
+        except Exception as e:
+            self._debug_print(f"Could not clear refresh token: {e}")
 
     def save_monitoring_token(self, id_token, token_claims):
         """Save ID token for monitoring authentication"""
@@ -900,6 +1146,10 @@ class MultiProviderAuth:
             for claim in important_claims:
                 if claim in id_token_claims:
                     self._debug_print(f"{claim}: {id_token_claims[claim]}")
+
+        # Save refresh_token if present (for silent refresh up to 12 hours)
+        if "refresh_token" in tokens:
+            self._save_refresh_token(tokens["refresh_token"])
 
         return tokens["id_token"], id_token_claims
 
@@ -1397,74 +1647,6 @@ class MultiProviderAuth:
             self._debug_print(f"Error during monitoring authentication: {e}")
             return None
 
-    # ===========================================
-    # Quota Check Methods (Phase 2)
-    # ===========================================
-
-    def _should_check_quota(self) -> bool:
-        """Check if quota checking is configured and enabled."""
-        quota_api_endpoint = self.config.get("quota_api_endpoint")
-        return bool(quota_api_endpoint)
-
-    def _should_recheck_quota(self) -> bool:
-        """Check if quota should be re-verified based on configured interval.
-
-        Returns True if:
-        - Quota checking is enabled AND
-        - Either interval is 0 (always check) OR
-        - Last quota check was more than interval minutes ago
-        """
-        if not self._should_check_quota():
-            return False
-
-        interval_minutes = self.config.get("quota_check_interval", 30)
-        if interval_minutes == 0:
-            return True  # Always check
-
-        last_check = self._get_last_quota_check_time()
-        if not last_check:
-            return True  # Never checked
-
-        elapsed = (datetime.now(timezone.utc) - last_check).total_seconds() / 60
-        self._debug_print(f"Quota check: {elapsed:.1f} min since last check, interval={interval_minutes} min")
-        return elapsed >= interval_minutes
-
-    def _get_last_quota_check_time(self) -> datetime | None:
-        """Get timestamp of last quota check from storage."""
-        try:
-            if self.credential_storage == "keyring":
-                timestamp_str = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-quota-check")
-                if timestamp_str:
-                    return datetime.fromisoformat(timestamp_str)
-            else:
-                session_dir = Path.home() / ".claude-code-session"
-                timestamp_file = session_dir / f"{self.profile}-quota-check.json"
-                if timestamp_file.exists():
-                    with open(timestamp_file) as f:
-                        data = json.load(f)
-                        return datetime.fromisoformat(data["last_check"])
-            return None
-        except Exception as e:
-            self._debug_print(f"Could not read quota check timestamp: {e}")
-            return None
-
-    def _save_quota_check_timestamp(self):
-        """Save current time as last quota check timestamp."""
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            if self.credential_storage == "keyring":
-                keyring.set_password("claude-code-with-bedrock", f"{self.profile}-quota-check", now)
-            else:
-                session_dir = Path.home() / ".claude-code-session"
-                session_dir.mkdir(parents=True, exist_ok=True)
-                timestamp_file = session_dir / f"{self.profile}-quota-check.json"
-                with open(timestamp_file, "w") as f:
-                    json.dump({"last_check": now}, f)
-                timestamp_file.chmod(0o600)
-            self._debug_print("Saved quota check timestamp")
-        except Exception as e:
-            self._debug_print(f"Could not save quota check timestamp: {e}")
-
     def _get_cached_token_claims(self) -> dict | None:
         """Get token claims from cached monitoring token for quota re-check."""
         try:
@@ -1518,700 +1700,124 @@ class MultiProviderAuth:
 
         return list(set(groups))  # Remove duplicates
 
-    def _check_quota(self, token_claims: dict, id_token: str) -> dict:
-        """Check user quota via the quota check API.
-
-        Args:
-            token_claims: JWT token claims containing user info (for logging/fallback)
-            id_token: Raw JWT token to send in Authorization header for API Gateway validation
-
-        Returns:
-            Quota check result dict with 'allowed' key
-        """
-        quota_api_endpoint = self.config.get("quota_api_endpoint")
-        fail_mode = self.config.get("quota_fail_mode", "open")
-        timeout = self.config.get("quota_check_timeout", 5)
-
-        email = token_claims.get("email")
-        if not email:
-            self._debug_print("No email in token claims, skipping quota check")
-            return {"allowed": True, "reason": "no_email"}
-
-        groups = self._extract_groups(token_claims)
-        self._debug_print(f"Checking quota for {email} (groups: {groups})")
-
-        try:
-            # Send JWT token in Authorization header for API Gateway JWT Authorizer validation
-            # The API extracts email/groups from validated JWT claims, not query params
-            response = requests.get(
-                f"{quota_api_endpoint}/check",
-                headers={"Authorization": f"Bearer {id_token}"},
-                timeout=timeout
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                self._debug_print(f"Quota check result: allowed={result.get('allowed')}, reason={result.get('reason')}")
-                return result
-            elif response.status_code == 401:
-                # JWT validation failed at API Gateway
-                self._debug_print("Quota check JWT validation failed (401)")
-                if fail_mode == "closed":
-                    return {
-                        "allowed": False,
-                        "reason": "jwt_invalid",
-                        "message": "Quota check authentication failed - invalid or expired token"
-                    }
-                return {"allowed": True, "reason": "jwt_invalid"}
-            else:
-                self._debug_print(f"Quota check returned status {response.status_code}")
-                # Fail according to configured mode
-                if fail_mode == "closed":
-                    return {
-                        "allowed": False,
-                        "reason": "api_error",
-                        "message": f"Quota check failed with status {response.status_code}"
-                    }
-                return {"allowed": True, "reason": "api_error"}
-
-        except requests.exceptions.Timeout:
-            self._debug_print("Quota check timed out")
-            if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "timeout",
-                    "message": "Quota check timed out. Please try again."
-                }
-            return {"allowed": True, "reason": "timeout"}
-
-        except requests.exceptions.RequestException as e:
-            self._debug_print(f"Quota check request failed: {e}")
-            if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "connection_error",
-                    "message": f"Could not connect to quota service: {e}"
-                }
-            return {"allowed": True, "reason": "connection_error"}
-
-        except Exception as e:
-            self._debug_print(f"Quota check error: {e}")
-            if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "error",
-                    "message": f"Quota check failed: {e}"
-                }
-            return {"allowed": True, "reason": "error"}
-
-    def _handle_quota_blocked(self, quota_result: dict) -> int:
-        """Handle blocked quota by displaying user-friendly message.
-
-        Args:
-            quota_result: Result from quota check API
-
-        Returns:
-            Exit code (always 1 for blocked)
-        """
-        reason = quota_result.get("reason", "unknown")
-        message = quota_result.get("message", "Access blocked due to quota limits")
-        usage = quota_result.get("usage") or {}
-        policy = quota_result.get("policy") or {}
-
-        lines = [
-            "",
-            "=" * 60,
-            "ACCESS BLOCKED - QUOTA EXCEEDED",
-            "=" * 60,
-            "",
-            message,
-            "",
-        ]
-
-        if usage:
-            lines.append("Current Usage:")
-            if "monthly_tokens" in usage and "monthly_limit" in usage:
-                lines.append(f"  Monthly Tokens: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} ({usage.get('monthly_percent', 0):.1f}%)")
-            if "daily_tokens" in usage and "daily_limit" in usage:
-                lines.append(f"  Daily Tokens:   {usage['daily_tokens']:,} / {usage['daily_limit']:,} ({usage.get('daily_percent', 0):.1f}%)")
-            if "estimated_cost" in usage and "monthly_cost_limit" in usage:
-                lines.append(f"  Monthly Cost:   ${usage['estimated_cost']:,.2f} / ${usage['monthly_cost_limit']:,.2f} ({usage.get('monthly_cost_percent', 0):.1f}%)")
-            if "daily_cost" in usage and "daily_cost_limit" in usage:
-                lines.append(f"  Daily Cost:     ${usage['daily_cost']:,.2f} / ${usage['daily_cost_limit']:,.2f} ({usage.get('daily_cost_percent', 0):.1f}%)")
-
-        if policy:
-            lines.append(f"\nPolicy: {policy.get('type', 'unknown')}:{policy.get('identifier', 'unknown')}")
-
-        if "cost" in reason:
-            lines.append("\nBlocked by: COST LIMIT")
-        elif "token" in reason:
-            lines.append("\nBlocked by: TOKEN LIMIT")
-
-        lines.extend(["", "To request an unblock, contact your administrator.", "=" * 60, ""])
-        print("\n".join(lines), file=sys.stderr, flush=True)
-
-        # Show browser notification
-        self._show_quota_browser_notification(quota_result, is_blocked=True)
-
-        return 1
-
-    def _show_quota_browser_notification(self, quota_result: dict, is_blocked: bool = False):
-        """Show quota status in browser with visual progress bars.
-
-        Args:
-            quota_result: Result from quota check API
-            is_blocked: Whether access is blocked (vs warning)
-        """
-        try:
-            usage = quota_result.get("usage") or {}
-            message = quota_result.get("message", "")
-
-            reason = quota_result.get("reason", "")
-
-            # Calculate percentages — tokens
-            monthly_percent = usage.get("monthly_percent", 0)
-            daily_percent = usage.get("daily_percent", 0)
-
-            # Calculate percentages — cost
-            monthly_cost_percent = usage.get("monthly_cost_percent", 0)
-            daily_cost_percent = usage.get("daily_cost_percent", 0)
-
-            # Format numbers for display — tokens
-            monthly_tokens = usage.get("monthly_tokens", 0)
-            monthly_limit = usage.get("monthly_limit", 0)
-            daily_tokens = usage.get("daily_tokens", 0)
-            daily_limit = usage.get("daily_limit", 0)
-
-            # Format numbers for display — cost
-            estimated_cost = usage.get("estimated_cost", 0)
-            monthly_cost_limit = usage.get("monthly_cost_limit", 0)
-            daily_cost = usage.get("daily_cost", 0)
-            daily_cost_limit = usage.get("daily_cost_limit", 0)
-
-            def format_tokens(n):
-                if n >= 1_000_000_000:
-                    return f"{n/1_000_000_000:.1f}B"
-                elif n >= 1_000_000:
-                    return f"{n/1_000_000:.1f}M"
-                elif n >= 1_000:
-                    return f"{n/1_000:.1f}K"
-                return str(int(n))
-
-            def format_cost(n):
-                return f"${n:,.2f}"
-
-            # Determine which limit type was hit
-            is_cost_issue = "cost" in reason
-            is_token_issue = "token" in reason
-
-            # Determine status styling
-            if is_blocked:
-                status_emoji = "&#x1F6AB;"
-                status_text = "Access Blocked"
-                status_color = "#dc3545"
-                header_bg = "#f8d7da"
-            else:
-                status_emoji = "&#x26A0;&#xFE0F;"
-                status_text = "Quota Warning"
-                status_color = "#ffc107"
-                header_bg = "#fff3cd"
-
-            # Progress bar color based on percentage
-            def bar_color(pct):
-                if pct >= 100:
-                    return "#dc3545"  # Red
-                elif pct >= 90:
-                    return "#fd7e14"  # Orange
-                elif pct >= 80:
-                    return "#ffc107"  # Yellow
-                return "#28a745"  # Green
-
-            monthly_bar_color = bar_color(monthly_percent)
-            daily_bar_color = bar_color(daily_percent) if daily_limit else "#6c757d"
-            monthly_cost_bar_color = bar_color(monthly_cost_percent) if monthly_cost_limit else "#6c757d"
-            daily_cost_bar_color = bar_color(daily_cost_percent) if daily_cost_limit else "#6c757d"
-
-            # Pre-format percentages to avoid f-string nesting issues
-            monthly_pct_str = f"{monthly_percent:.1f}"
-            monthly_pct_int = f"{monthly_percent:.0f}"
-            monthly_pct_width = f"{min(monthly_percent, 100)}"
-            daily_pct_str = f"{daily_percent:.1f}"
-            daily_pct_int = f"{daily_percent:.0f}"
-            daily_pct_width = f"{min(daily_percent, 100)}"
-            mcost_pct_str = f"{monthly_cost_percent:.1f}"
-            mcost_pct_int = f"{monthly_cost_percent:.0f}"
-            mcost_pct_width = f"{min(monthly_cost_percent, 100)}"
-            dcost_pct_str = f"{daily_cost_percent:.1f}"
-            dcost_pct_int = f"{daily_cost_percent:.0f}"
-            dcost_pct_width = f"{min(daily_cost_percent, 100)}"
-
-            # Pre-format token/cost display values
-            monthly_tokens_fmt = format_tokens(monthly_tokens)
-            monthly_limit_fmt = format_tokens(monthly_limit)
-            daily_tokens_fmt = format_tokens(daily_tokens)
-            daily_limit_fmt = format_tokens(daily_limit) if daily_limit else ""
-            estimated_cost_fmt = format_cost(estimated_cost)
-            monthly_cost_limit_fmt = format_cost(monthly_cost_limit) if monthly_cost_limit else ""
-            daily_cost_fmt = format_cost(daily_cost)
-            daily_cost_limit_fmt = format_cost(daily_cost_limit) if daily_cost_limit else ""
-
-            # Build usage sections as separate strings to avoid nested f-string issues
-            token_monthly_html = ""
-            if monthly_limit:
-                token_monthly_html = f"""
-            <div class="section-title">Token Usage</div>
-            <div class="usage-section">
-                <div class="usage-label">
-                    <span>Monthly Tokens</span>
-                    <span class="usage-value">{monthly_tokens_fmt} / {monthly_limit_fmt} ({monthly_pct_str}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {monthly_pct_width}%; background: {monthly_bar_color};">
-                        {monthly_pct_int}%
-                    </div>
-                </div>
-            </div>"""
-
-            token_daily_html = ""
-            if daily_limit:
-                token_daily_html = f"""
-            <div class="usage-section">
-                <div class="usage-label">
-                    <span>Daily Tokens</span>
-                    <span class="usage-value">{daily_tokens_fmt} / {daily_limit_fmt} ({daily_pct_str}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {daily_pct_width}%; background: {daily_bar_color};">
-                        {daily_pct_int}%
-                    </div>
-                </div>
-            </div>"""
-
-            cost_monthly_html = ""
-            if monthly_cost_limit:
-                cost_monthly_html = f"""
-            <div class="section-title">Cost Usage</div>
-            <div class="usage-section">
-                <div class="usage-label">
-                    <span>Monthly Cost</span>
-                    <span class="usage-value">{estimated_cost_fmt} / {monthly_cost_limit_fmt} ({mcost_pct_str}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {mcost_pct_width}%; background: {monthly_cost_bar_color};">
-                        {mcost_pct_int}%
-                    </div>
-                </div>
-            </div>"""
-
-            cost_daily_html = ""
-            if daily_cost_limit:
-                cost_daily_html = f"""
-            <div class="usage-section">
-                <div class="usage-label">
-                    <span>Daily Cost</span>
-                    <span class="usage-value">{daily_cost_fmt} / {daily_cost_limit_fmt} ({dcost_pct_str}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {dcost_pct_width}%; background: {daily_cost_bar_color};">
-                        {dcost_pct_int}%
-                    </div>
-                </div>
-            </div>"""
-
-            blocked_by_html = ""
-            if is_cost_issue:
-                blocked_by_html = "<div class='blocked-by'>COST LIMIT</div>"
-            elif is_token_issue:
-                blocked_by_html = "<div class='blocked-by'>TOKEN LIMIT</div>"
-
-            message_html = html_module.escape(message) if message else ("Your access has been blocked due to quota limits." if is_blocked else "You're approaching your quota limit.")
-            if is_blocked:
-                message_html += " Contact your administrator for assistance."
-
-            html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Quota Status - Claude Code</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            margin: 0;
-            padding: 40px;
-            background: #f5f5f5;
-            min-height: 100vh;
-            box-sizing: border-box;
-        }}
-        .container {{
-            max-width: 500px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }}
-        .header {{
-            background: {header_bg};
-            padding: 30px;
-            text-align: center;
-            border-bottom: 1px solid rgba(0,0,0,0.1);
-        }}
-        .header h1 {{
-            margin: 0;
-            color: {status_color};
-            font-size: 28px;
-        }}
-        .content {{
-            padding: 30px;
-        }}
-        .usage-section {{
-            margin-bottom: 25px;
-        }}
-        .usage-label {{
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 8px;
-            font-size: 14px;
-            color: #666;
-        }}
-        .usage-value {{
-            font-weight: 600;
-            color: #333;
-        }}
-        .progress-bar {{
-            height: 24px;
-            background: #e9ecef;
-            border-radius: 12px;
-            overflow: hidden;
-        }}
-        .progress-fill {{
-            height: 100%;
-            border-radius: 12px;
-            transition: width 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            padding-right: 10px;
-            font-size: 12px;
-            font-weight: 600;
-            color: white;
-            box-sizing: border-box;
-        }}
-        .message {{
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
-            font-size: 14px;
-            color: #666;
-            line-height: 1.5;
-            margin-bottom: 20px;
-        }}
-        .footer {{
-            text-align: center;
-            padding: 20px;
-            background: #f8f9fa;
-            font-size: 13px;
-            color: #666;
-        }}
-        .section-title {{
-            font-size: 13px;
-            font-weight: 600;
-            color: #999;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 12px;
-            padding-bottom: 6px;
-            border-bottom: 1px solid #eee;
-        }}
-        .blocked-by {{
-            display: inline-block;
-            background: {status_color};
-            color: white;
-            font-size: 12px;
-            font-weight: 600;
-            padding: 4px 12px;
-            border-radius: 12px;
-            margin-top: 10px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>{status_emoji} {status_text}</h1>
-            {blocked_by_html}
-        </div>
-        <div class="content">
-            {token_monthly_html}
-            {token_daily_html}
-            {cost_monthly_html}
-            {cost_daily_html}
-            <div class="message">
-                {message_html}
-            </div>
-        </div>
-        <div class="footer">
-            Return to your terminal to continue.
-        </div>
-    </div>
-</body>
-</html>"""
-
-            # Start a brief HTTP server to serve the page
-            parent = self
-            page_served = {"done": False}
-
-            class QuotaPageHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    self.send_response(200)
-                    self.send_header("Content-type", "text/html")
-                    self.end_headers()
-                    self.wfile.write(html.encode())
-                    page_served["done"] = True
-
-                def log_message(self, format, *args):
-                    pass  # Suppress logs
-
-            # Use a different port for quota page (8401) to avoid conflict with auth
-            quota_port = self.redirect_port + 1
-            try:
-                server = HTTPServer(("127.0.0.1", quota_port), QuotaPageHandler)
-                server.timeout = 5  # 5 second timeout
-
-                # Open browser
-                webbrowser.open(f"http://localhost:{quota_port}/quota-status")
-
-                # Wait for page to be served (or timeout)
-                while not page_served["done"]:
-                    server.handle_request()
-
-                server.server_close()
-            except OSError:
-                # Port in use or other error - skip browser notification
-                self._debug_print(f"Could not start quota notification server on port {quota_port}")
-
-        except Exception as e:
-            self._debug_print(f"Failed to show browser notification: {e}")
-
-    def _handle_quota_warning(self, quota_result: dict):
-        """Handle quota warning by showing notification without blocking.
-
-        Args:
-            quota_result: Result from quota check API
-        """
-        usage = quota_result.get("usage") or {}
-        monthly_percent = usage.get("monthly_percent", 0)
-        daily_percent = usage.get("daily_percent", 0)
-
-        # Only show warning for significant thresholds (80%+)
-        if monthly_percent < 80 and daily_percent < 80:
-            return
-
-        # Show terminal warning (single print to avoid interleaving with Claude Code UI)
-        lines = [
-            "",
-            "=" * 60,
-            "QUOTA WARNING",
-            "=" * 60,
-        ]
-
-        if usage:
-            if "monthly_tokens" in usage and "monthly_limit" in usage:
-                lines.append(f"  Monthly Tokens: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} ({monthly_percent:.1f}%)")
-            if "daily_tokens" in usage and "daily_limit" in usage:
-                lines.append(f"  Daily Tokens:   {usage['daily_tokens']:,} / {usage['daily_limit']:,} ({daily_percent:.1f}%)")
-            if "estimated_cost" in usage and "monthly_cost_limit" in usage:
-                monthly_cost_pct = usage.get("monthly_cost_percent", 0)
-                lines.append(f"  Monthly Cost:   ${usage['estimated_cost']:,.2f} / ${usage['monthly_cost_limit']:,.2f} ({monthly_cost_pct:.1f}%)")
-            if "daily_cost" in usage and "daily_cost_limit" in usage:
-                daily_cost_pct = usage.get("daily_cost_percent", 0)
-                lines.append(f"  Daily Cost:     ${usage['daily_cost']:,.2f} / ${usage['daily_cost_limit']:,.2f} ({daily_cost_pct:.1f}%)")
-
-        lines.extend(["=" * 60, ""])
-        print("\n".join(lines), file=sys.stderr, flush=True)
-
-        # Show browser notification
-        self._show_quota_browser_notification(quota_result, is_blocked=False)
-
-    # ===========================================
-    # End Quota Check Methods
-    # ===========================================
-
     def _try_silent_refresh(self):
-        """Attempt to refresh AWS credentials using a cached, still-valid OIDC id_token.
+        """Attempt silent credential refresh using cached id_token or refresh_token.
 
         Returns:
             Tuple of (credentials, id_token, token_claims) if successful, (None, None, None) otherwise.
         """
         try:
+            # Try cached id_token first (existing behavior)
             id_token = self.get_monitoring_token()
-            if not id_token:
-                self._debug_print("No valid cached id_token for silent refresh")
-                return None, None, None
-
-            self._debug_print("Found valid cached id_token, attempting silent credential refresh...")
-            token_claims = jwt.decode(id_token, options={"verify_signature": False})
-
-            credentials = self.get_aws_credentials(id_token, token_claims)
-            self.save_credentials(credentials)
-            self.save_monitoring_token(id_token, token_claims)
-            self._debug_print("Silent credential refresh succeeded")
-            return credentials, id_token, token_claims
+            if id_token:
+                self._debug_print("Found valid cached id_token, attempting TVM credential refresh...")
+                token_claims = jwt.decode(id_token, options={"verify_signature": False})
+                credentials = self._call_tvm(id_token, self.otel_helper_status)
+                self.save_credentials(credentials)
+                self.save_monitoring_token(id_token, token_claims)
+                self._debug_print("Silent credential refresh via cached id_token succeeded")
+                return credentials, id_token, token_claims
         except Exception as e:
-            self._debug_print(f"Silent refresh failed, will require browser auth: {e}")
-            return None, None, None
+            self._debug_print(f"Silent refresh with cached id_token failed: {e}")
+
+        # Try refresh_token when id_token is expired
+        try:
+            new_id_token = self._try_refresh_token()
+            if new_id_token:
+                token_claims = jwt.decode(new_id_token, options={"verify_signature": False})
+                credentials = self._call_tvm(new_id_token, self.otel_helper_status)
+                self.save_credentials(credentials)
+                self.save_monitoring_token(new_id_token, token_claims)
+                self._debug_print("Silent credential refresh via refresh_token succeeded")
+                return credentials, new_id_token, token_claims
+        except Exception as e:
+            self._debug_print(f"Silent refresh with refresh_token failed: {e}")
+
+        return None, None, None
 
     def run(self):
         """Main execution flow"""
         try:
-            # Check cache first
+            self._log(f"run() profile={self.profile} provider={self.provider_type} federation={self.config.get('federation_type')}")
+
+            # 1. Check otel-helper integrity (records status, does NOT exit)
+            self.otel_helper_status = self._check_otel_helper_integrity()
+            self._log(f"otel_helper_status={self.otel_helper_status}")
+
+            # 2. Check cache first — cached Bedrock credentials still valid
             cached = self.get_cached_credentials()
             if cached:
-                # Periodic quota re-check even with cached credentials
-                if self._should_recheck_quota():
-                    self._debug_print("Performing periodic quota re-check...")
-                    id_token = self.get_monitoring_token()
-                    token_claims = self._get_cached_token_claims()
-                    if id_token and token_claims:
-                        quota_result = self._check_quota(token_claims, id_token)
-                        self._save_quota_check_timestamp()
-                        if not quota_result.get("allowed", True):
-                            return self._handle_quota_blocked(quota_result)
-                        else:
-                            self._handle_quota_warning(quota_result)
-                    else:
-                        self._debug_print("No cached token for quota re-check, skipping")
-
-                # Output cached credentials (intended behavior for AWS CLI)
-                print(json.dumps(cached))  # noqa: S105
+                self._log("using cached credentials")
+                print(json.dumps(cached))
                 return 0
 
-            # Pre-check quota before browser auth if we have a cached monitoring token.
-            # This avoids forcing re-authentication when the user is already blocked.
-            if self._should_check_quota():
-                cached_id_token = self.get_monitoring_token()
-                cached_token_claims = self._get_cached_token_claims()
-                if cached_id_token and cached_token_claims:
-                    self._debug_print("Pre-checking quota with cached monitoring token...")
-                    quota_result = self._check_quota(cached_token_claims, cached_id_token)
-                    self._save_quota_check_timestamp()
-                    if not quota_result.get("allowed", True):
-                        return self._handle_quota_blocked(quota_result)
-                    self._debug_print("Quota pre-check passed, proceeding with authentication")
-
-            # Try to acquire port lock by testing if we can bind to it
-            # Use the same bind address as the actual callback server
+            # 3. Try to acquire port lock
             bind_host = os.getenv("REDIRECT_BIND", "127.0.0.1")
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 test_socket.bind((bind_host, self.redirect_port))
                 test_socket.close()
-                # We got the port, we can proceed with authentication
                 self._debug_print("Port available, proceeding with authentication")
             except OSError as e:
                 if e.errno == errno.EADDRINUSE:
-                    # Port in use, another auth is in progress
                     self._debug_print(f"Port {self.redirect_port} in use on {bind_host}, checking...")
                     test_socket.close()
-
-                    # Wait for the other process to complete
                     cached = self._wait_for_auth_completion()
                     if cached:
                         print(json.dumps(cached))
                         return 0
                     else:
-                        # Only print error to stderr for actual failures
                         self._debug_print("Authentication timeout or failed in another process")
                         return 1
                 else:
                     test_socket.close()
                     raise
 
-            # Check cache again (another process might have just finished)
+            # 4. Check cache again (another process might have just finished)
             cached = self.get_cached_credentials()
             if cached:
-                # Output cached credentials (intended behavior for AWS CLI)
-                print(json.dumps(cached))  # noqa: S105
+                print(json.dumps(cached))
                 return 0
 
-            # Try silent refresh using cached id_token before opening browser
+            # 5. Try silent refresh (cached id_token -> refresh_token -> TVM)
+            self._log("attempting silent refresh...")
             silent_creds, id_token, token_claims = self._try_silent_refresh()
             if silent_creds:
-                # Check quota if configured (reuse token/claims already fetched above)
-                if self._should_check_quota():
-                    if id_token and token_claims:
-                        quota_result = self._check_quota(token_claims, id_token)
-                        self._save_quota_check_timestamp()
-                        if not quota_result.get("allowed", True):
-                            return self._handle_quota_blocked(quota_result)
-                        else:
-                            self._handle_quota_warning(quota_result)
-
+                self._log("silent refresh succeeded")
                 print(json.dumps(silent_creds))
                 return 0
 
-            # Authenticate with OIDC provider (browser popup - only when id_token is also expired)
+            # 6. Browser auth (only when both id_token and refresh_token are expired)
+            self._log("silent refresh failed, falling back to browser auth")
             self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
             id_token, token_claims = self.authenticate_oidc()
 
-            # Save monitoring token early (before quota check) so subsequent
-            # calls can check quota without re-authenticating via browser
+            # 7. Save tokens
             self.save_monitoring_token(id_token, token_claims)
 
-            # Check quota before issuing credentials (if configured)
-            if self._should_check_quota():
-                self._debug_print("Checking quota before credential issuance...")
-                quota_result = self._check_quota(token_claims, id_token)
-                self._save_quota_check_timestamp()  # Track when quota was checked
-                if not quota_result.get("allowed", True):
-                    return self._handle_quota_blocked(quota_result)
-                else:
-                    # Check for warning threshold (allowed but high usage)
-                    self._handle_quota_warning(quota_result)
+            # 8. Call TVM for Bedrock credentials
+            self._log(f"calling TVM endpoint={self.config.get('tvm_endpoint')}")
+            self._debug_print("Calling TVM Lambda for Bedrock credentials...")
+            try:
+                credentials = self._call_tvm(id_token, self.otel_helper_status)
+                self._log("TVM returned credentials successfully")
+            except Exception as e:
+                self._log(f"TVM ERROR: {e}")
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
 
-            # Get AWS credentials
-            self._debug_print("Exchanging token for AWS credentials...")
-            credentials = self.get_aws_credentials(id_token, token_claims)
-
-            # Cache credentials
+            # 9. Cache and output credentials
             self.save_credentials(credentials)
-
-            # Save monitoring token (non-blocking, failures don't affect AWS auth)
-            self.save_monitoring_token(id_token, token_claims)
-
-            # Output credentials
-            # CodeQL: This is not a security issue - this is an AWS credential provider
-            # that must output credentials to stdout for AWS CLI to consume them.
-            # This is the intended behavior and required for the tool to function.
-            # nosec - Not logging, but outputting credentials as designed
-            print(json.dumps(credentials))  # noqa: S105
+            print(json.dumps(credentials))
             return 0
 
         except KeyboardInterrupt:
-            # User cancelled - no output needed
+            print("\nAuthentication cancelled.", file=sys.stderr)
             return 1
         except Exception as e:
-            error_msg = str(e)
-            # Only print actual errors to stderr
-            if "timeout" not in error_msg.lower():
-                print(f"Error: {error_msg}", file=sys.stderr)
-            else:
-                self._debug_print(f"Error: {error_msg}")
-
-            # Provide specific guidance for common errors
-            if "NotAuthorizedException" in error_msg and "Token is not from a supported provider" in error_msg:
-                print("\nAuthentication failed: Token provider mismatch", file=sys.stderr)
-                print("Identity pool expects tokens from a specific provider configuration.", file=sys.stderr)
-                print("Please verify your Cognito Identity Pool is configured correctly.", file=sys.stderr)
-            elif "timeout" in error_msg.lower():
-                self._debug_print("\nAuthentication timed out. Possible causes:")
-                self._debug_print("- Browser did not complete authentication")
-                self._debug_print("- Network connectivity issues")
-                self._debug_print("- Callback URL was not accessible on localhost:8400")
-            elif "cognito_user_pool_id is required" in error_msg:
-                print("\nConfiguration error: Missing Cognito User Pool ID", file=sys.stderr)
-                print("Please run 'poetry run ccwb init' to reconfigure.", file=sys.stderr)
-
+            print(f"Authentication failed: {e}", file=sys.stderr)
+            if self.debug:
+                traceback.print_exc()
             return 1
 
 
@@ -2243,7 +1849,11 @@ def main():
 
     args = parser.parse_args()
 
-    auth = MultiProviderAuth(profile=args.profile)
+    try:
+        auth = MultiProviderAuth(profile=args.profile)
+    except Exception as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Handle cache clearing request
     if args.clear_cache:

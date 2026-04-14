@@ -67,6 +67,14 @@ Parameters:
     Type: String
     Description: OIDC client ID (audience) for JWT validation
 
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email address for quota and pipeline health alerts (leave empty to skip subscription)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
 Resources:
   # DynamoDB table for quota policies (user, group, default levels)
   QuotaPolicies:
@@ -157,6 +165,14 @@ Resources:
           Value: ClaudeCodeQuotaAlerts
         - Key: Purpose
           Value: Quota monitoring notifications
+
+  QuotaAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref QuotaAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
 
   # IAM Role for Quota Monitor Lambda
   QuotaMonitorRole:
@@ -322,6 +338,7 @@ Resources:
           - '*'
         AllowMethods:
           - GET
+          - POST
           - OPTIONS
         AllowHeaders:
           - Content-Type
@@ -368,6 +385,9 @@ Resources:
       ApiId: !Ref QuotaCheckApi
       StageName: '$default'
       AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
 
   # Permission for API Gateway to invoke Lambda
   QuotaCheckLambdaPermission:
@@ -380,6 +400,436 @@ Resources:
 
   # ============================================
   # End Quota Check API
+  # ============================================
+
+  # ============================================
+  # Cost Management Hardening (TVM + Usage Pipeline)
+  # ============================================
+
+  # --- 1. BedrockUserRole (IAM Role for TVM-issued credentials) ---
+  # --- 1. TVM Lambda + Role (defined BEFORE BedrockUserRole to avoid circular ref) ---
+  TVMLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TVMLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+                  - !GetAtt QuotaPolicies.Arn
+                  - !Sub '${QuotaPolicies.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BedrockPricing.Arn
+
+  BedrockUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockUserRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt TVMLambdaRole.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: '*'
+
+  # Separate policy to grant TVM Lambda sts:AssumeRole on BedrockUserRole
+  # (avoids circular dependency between TVMLambdaRole and BedrockUserRole)
+  TVMAssumeRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: TVMAssumeBedrockUserRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !GetAtt BedrockUserRole.Arn
+      Roles:
+        - !Ref TVMLambdaRole
+
+  TVMFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: claude-code-tvm
+      Description: Token Vending Machine - sole path to Bedrock credentials with quota enforcement
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TVMLambdaRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          POLICIES_TABLE: !Ref QuotaPolicies
+          PRICING_TABLE: !Ref BedrockPricing
+          BEDROCK_USER_ROLE_ARN: !GetAtt BedrockUserRole.Arn
+          TVM_SESSION_DURATION: '900'
+          REQUIRE_OTEL_HELPER: 'false'
+      Code: ./lambda-functions/tvm/
+
+  # --- 3. TVM API Gateway Route (on existing QuotaCheckApi) ---
+  TVMIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref QuotaCheckApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TVMFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  TVMRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref QuotaCheckApi
+      RouteKey: 'POST /tvm'
+      Target: !Sub 'integrations/${TVMIntegration}'
+      AuthorizerId: !Ref QuotaCheckAuthorizer
+      AuthorizationType: JWT
+
+  TVMLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TVMFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${QuotaCheckApi}/*'
+
+  # --- 4. Bedrock Logging Config Custom Resource ---
+  BedrockLoggingConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockLoggingConfigPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                  - bedrock:PutModelInvocationLoggingConfiguration
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                  - s3:HeadBucket
+                Resource: '*'
+
+  BedrockLoggingConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: claude-code-bedrock-logging-config
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt BedrockLoggingConfigRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code: ./lambda-functions/bedrock_logging_config/
+
+  # --- 5. SQS Queue + DLQ for Bedrock Usage Stream ---
+  # NOTE: SQS resources defined BEFORE BedrockLoggingConfig so the Custom Resource
+  # can configure S3 event notifications pointing to the queue
+  BedrockLogDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: claude-code-bedrock-log-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  BedrockLogQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: claude-code-bedrock-log-queue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400  # 24 hours
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BedrockLogDLQ.Arn
+        maxReceiveCount: 3
+
+  BedrockLogQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref BedrockLogQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt BedrockLogQueue.Arn
+
+  # Custom Resource to enable Bedrock logging + configure S3 -> SQS notification
+  # Placed after SQS resources so the queue ARN is available
+  BedrockLoggingConfig:
+    Type: Custom::BedrockLoggingConfig
+    DependsOn:
+      - BedrockLogQueue
+      - BedrockLogQueuePolicy
+    Properties:
+      ServiceToken: !GetAtt BedrockLoggingConfigFunction.Arn
+      SQSQueueArn: !GetAtt BedrockLogQueue.Arn
+      ForceUpdate: '2026-04-14-v2'
+
+  # --- 6. Bedrock Usage Stream Lambda ---
+  BedrockUsageStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockUsageStreamPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 'arn:aws:s3:::*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BedrockPricing.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt BedrockLogQueue.Arn
+
+  BedrockUsageStreamFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: claude-code-bedrock-usage-stream
+      Description: Processes Bedrock invocation logs from S3 via SQS
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockUsageStreamRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          PRICING_TABLE: !Ref BedrockPricing
+      Code: ./lambda-functions/bedrock_usage_stream/
+
+  BedrockUsageStreamEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt BedrockLogQueue.Arn
+      FunctionName: !Ref BedrockUsageStreamFunction
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 60
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # --- 7. Bedrock Usage Reconciler Lambda ---
+  BedrockUsageReconcilerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockUsageReconcilerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - 'arn:aws:s3:::*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BedrockPricing.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt BedrockLogDLQ.Arn
+
+  BedrockUsageReconcilerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: claude-code-bedrock-usage-reconciler
+      Description: Periodic reconciler for missed Bedrock usage events
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockUsageReconcilerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          PRICING_TABLE: !Ref BedrockPricing
+          DLQ_URL: !Ref BedrockLogDLQ
+          BEDROCK_LOG_BUCKET: !GetAtt BedrockLoggingConfig.BucketName
+          BEDROCK_LOG_PREFIX: 'bedrock-raw/'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Code: ./lambda-functions/bedrock_usage_reconciler/
+
+  ReconcilerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: claude-code-reconciler-schedule
+      Description: Trigger Bedrock usage reconciler every 30 minutes
+      ScheduleExpression: rate(30 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BedrockUsageReconcilerFunction.Arn
+          Id: ReconcilerTarget
+
+  ReconcilerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockUsageReconcilerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReconcilerScheduleRule.Arn
+
+  # --- 8. CloudWatch Alarms ---
+  StreamLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: claude-code-bedrock-stream-errors
+      AlarmDescription: Bedrock usage stream Lambda has errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BedrockUsageStreamFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref QuotaAlertTopic
+
+  ReconcilerLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: claude-code-reconciler-errors
+      AlarmDescription: Bedrock usage reconciler Lambda has errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BedrockUsageReconcilerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref QuotaAlertTopic
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: claude-code-dynamodb-throttled
+      AlarmDescription: DynamoDB throttled requests detected
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref UserQuotaMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref QuotaAlertTopic
+
+  # ============================================
+  # End Cost Management Hardening
   # ============================================
 
   # Grant MetricsAggregator permissions to write to quota table and read policies
@@ -473,3 +923,21 @@ Outputs:
     Value: !GetAtt QuotaCheckFunction.Arn
     Export:
       Name: !Sub '${AWS::StackName}-QuotaCheckFunctionArn'
+
+  TVMFunctionArn:
+    Description: ARN of the TVM Lambda function
+    Value: !GetAtt TVMFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TVMFunctionArn'
+
+  TVMEndpoint:
+    Description: TVM endpoint URL for credential-process config
+    Value: !Sub 'https://${QuotaCheckApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-TVMEndpoint'
+
+  BedrockUserRoleArn:
+    Description: ARN of the BedrockUserRole for TVM credential issuance
+    Value: !GetAtt BedrockUserRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockUserRoleArn'

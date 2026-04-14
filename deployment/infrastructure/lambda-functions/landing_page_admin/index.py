@@ -161,7 +161,13 @@ def lambda_handler(event, context):
             return api_get_usage(event)
 
         elif path == "/api/users" and method == "GET":
-            return api_list_users()
+            return api_list_users(event)
+
+        elif path == "/api/user/disable" and method == "POST":
+            return api_disable_user(event)
+
+        elif path == "/api/user/enable" and method == "POST":
+            return api_enable_user(event)
 
         elif path == "/api/unblock" and method == "POST":
             return api_unblock_user(event, user_email)
@@ -170,7 +176,7 @@ def lambda_handler(event, context):
             if method == "GET":
                 return api_list_pricing()
             elif method == "POST":
-                return api_upsert_pricing(event)
+                return api_update_pricing(event)
             elif method == "DELETE":
                 return api_delete_pricing(event)
 
@@ -745,7 +751,7 @@ def api_list_pricing():
         return build_json_response(500, {"error": f"Failed to list pricing: {str(e)}"})
 
 
-def api_upsert_pricing(event):
+def api_update_pricing(event):
     """Create or update a pricing entry."""
     if not pricing_table:
         return build_json_response(400, {"error": "Pricing table not configured."})
@@ -882,8 +888,16 @@ def api_get_usage(event):
         return build_json_response(500, {"error": f"Failed to get usage: {str(e)}"})
 
 
-def api_list_users():
-    """List all users with their usage, join date, and admin status for the current month (UTC+8 boundaries)."""
+def api_list_users(event):
+    """List all users with their usage, join date, status, and admin status for the current month (UTC+8 boundaries).
+
+    Also queries PROFILE records (SK=PROFILE) for user status (active/disabled), first_activated, last_seen.
+    Supports ?status=active|disabled|all query parameter for filtering (default: all).
+    """
+    status_filter = get_query_param(event, "status").strip().lower() or "all"
+    if status_filter not in ("active", "disabled", "all"):
+        status_filter = "all"
+
     now = datetime.now(EFFECTIVE_TZ)
     month_prefix = now.strftime("%Y-%m")
     current_date = now.strftime("%Y-%m-%d")
@@ -893,10 +907,13 @@ def api_list_users():
 
     try:
         users_by_email = {}
+        profiles_by_email = {}
         unblocks_by_email = {}
         scan_kwargs = {
             "FilterExpression": (
-                Attr("sk").eq(f"MONTH#{month_prefix}") | Attr("sk").eq("UNBLOCK#CURRENT")
+                Attr("sk").eq(f"MONTH#{month_prefix}")
+                | Attr("sk").eq("UNBLOCK#CURRENT")
+                | Attr("sk").eq("PROFILE")
             ) & Attr("pk").begins_with("USER#"),
         }
         while True:
@@ -906,7 +923,15 @@ def api_list_users():
                 pk = item.get("pk", "")
                 email_from_pk = pk.replace("USER#", "", 1) if pk.startswith("USER#") else None
 
-                if sk == "UNBLOCK#CURRENT":
+                if sk == "PROFILE":
+                    if not email_from_pk:
+                        continue
+                    profiles_by_email[email_from_pk] = {
+                        "status": item.get("status", "active"),
+                        "first_activated": item.get("first_activated"),
+                        "last_seen": item.get("last_seen"),
+                    }
+                elif sk == "UNBLOCK#CURRENT":
                     if not email_from_pk:
                         continue
                     # Check if unblock has expired
@@ -949,6 +974,26 @@ def api_list_users():
             else:
                 break
 
+        # Merge PROFILE data into user records, and create entries for profile-only users
+        all_emails = set(users_by_email.keys()) | set(profiles_by_email.keys())
+        for email in all_emails:
+            if email not in users_by_email:
+                # User has a PROFILE but no usage this month
+                users_by_email[email] = {
+                    "email": email,
+                    "is_admin": email.lower() in admin_emails,
+                    "first_seen": None,
+                    "total_tokens": 0,
+                    "daily_tokens": 0,
+                    "estimated_cost": 0,
+                    "daily_cost": 0,
+                    "last_updated": None,
+                }
+            profile = profiles_by_email.get(email, {})
+            users_by_email[email]["status"] = profile.get("status", "active")
+            users_by_email[email]["first_activated"] = profile.get("first_activated")
+            users_by_email[email]["last_seen"] = profile.get("last_seen")
+
         # Merge unblock status into user records
         users = list(users_by_email.values())
         for user in users:
@@ -957,6 +1002,10 @@ def api_list_users():
                 user["unblock"] = ub
             else:
                 user["unblock"] = None
+
+        # Apply status filter
+        if status_filter != "all":
+            users = [u for u in users if u.get("status", "active") == status_filter]
 
         # Compute blocked status by checking usage against applicable policies
         try:
@@ -1000,8 +1049,8 @@ def api_list_users():
             for user in users:
                 user.setdefault("is_blocked", False)
 
-        # Sort by total_tokens descending
-        users.sort(key=lambda u: u["total_tokens"], reverse=True)
+        # Sort by last_seen descending (most recent first), with None values at the end
+        users.sort(key=lambda u: u.get("last_seen") or "", reverse=True)
 
         # Also get org aggregate
         org_usage = None
@@ -1021,6 +1070,72 @@ def api_list_users():
     except Exception as e:
         print(f"Error listing users: {e}")
         return build_json_response(500, {"error": f"Failed to list users: {str(e)}"})
+
+
+def api_disable_user(event):
+    """Disable a user by setting status='disabled' on their PROFILE record."""
+    try:
+        body = json.loads(event.get("body", "{}"))
+    except json.JSONDecodeError:
+        return build_json_response(400, {"error": "Invalid JSON body"})
+
+    email = body.get("email", "").strip()
+    if not email:
+        return build_json_response(400, {"error": "email is required."})
+
+    pk = f"USER#{email}"
+    sk = "PROFILE"
+
+    try:
+        response = metrics_table.update_item(
+            Key={"pk": pk, "sk": sk},
+            UpdateExpression="SET #status = :status",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": "disabled"},
+            ReturnValues="ALL_NEW",
+        )
+        print(f"User disabled: {email}")
+        return build_json_response(200, {
+            "message": f"User {email} has been disabled.",
+            "email": email,
+            "status": "disabled",
+        })
+    except Exception as e:
+        print(f"Error disabling user {email}: {e}")
+        return build_json_response(500, {"error": f"Failed to disable user: {str(e)}"})
+
+
+def api_enable_user(event):
+    """Enable a user by setting status='active' on their PROFILE record."""
+    try:
+        body = json.loads(event.get("body", "{}"))
+    except json.JSONDecodeError:
+        return build_json_response(400, {"error": "Invalid JSON body"})
+
+    email = body.get("email", "").strip()
+    if not email:
+        return build_json_response(400, {"error": "email is required."})
+
+    pk = f"USER#{email}"
+    sk = "PROFILE"
+
+    try:
+        response = metrics_table.update_item(
+            Key={"pk": pk, "sk": sk},
+            UpdateExpression="SET #status = :status",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": "active"},
+            ReturnValues="ALL_NEW",
+        )
+        print(f"User enabled: {email}")
+        return build_json_response(200, {
+            "message": f"User {email} has been enabled.",
+            "email": email,
+            "status": "active",
+        })
+    except Exception as e:
+        print(f"Error enabling user {email}: {e}")
+        return build_json_response(500, {"error": f"Failed to enable user: {str(e)}"})
 
 
 def api_unblock_user(event, admin_email):
@@ -1729,7 +1844,7 @@ def generate_admin_page(admin_email):
     <!-- ======== Users / Usage Panel ======== -->
     <div id="panel-usage" class="panel active">
 
-      <p style="color:var(--text-muted);font-size:12px;margin:0 0 16px 0">Shows users who have consumed tokens this month. Users with no usage in the current month will not appear here.</p>
+      <p style="color:var(--text-muted);font-size:12px;margin:0 0 16px 0">Shows all registered users with their activation status and activity information.</p>
 
       <!-- Org summary metric cards -->
       <div id="org-summary" class="org-summary-grid" style="display:none">
@@ -1750,13 +1865,18 @@ def generate_admin_page(admin_email):
         </div>
       </div>
 
-      <!-- Toolbar with styled filter input -->
+      <!-- Toolbar with styled filter input and status filter -->
       <div class="toolbar">
         <div style="display:flex;align-items:center;gap:8px">
           <div style="position:relative;display:flex;align-items:center">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2" style="position:absolute;left:9px;pointer-events:none"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
             <input type="text" id="usage-filter" placeholder="Filter by email…" oninput="filterUsageList()" class="usage-filter-input">
           </div>
+          <select id="usage-status-filter" onchange="loadUsageList()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius);font-size:13px;color:var(--text-primary);background:var(--white)">
+            <option value="all">All Status</option>
+            <option value="active">Active</option>
+            <option value="disabled">Disabled</option>
+          </select>
           <span id="usage-count" style="color:var(--text-muted);font-size:12px;white-space:nowrap"></span>
         </div>
         <button class="btn btn-secondary btn-sm" onclick="loadUsageList()">
@@ -1776,14 +1896,10 @@ def generate_admin_page(admin_email):
         <table class="data-table">
           <thead><tr>
             <th style="min-width:220px">Email</th>
-            <th style="min-width:110px">Joined</th>
-            <th style="min-width:70px">Role</th>
-            <th style="display:none">Total Tokens</th>
-            <th style="display:none">Daily Tokens</th>
-            <th style="display:none">Monthly Cost</th>
-            <th style="display:none">Daily Cost</th>
-            <th>Last Active</th>
-            <th style="min-width:90px">Status</th>
+            <th style="min-width:80px">Status</th>
+            <th style="min-width:110px">First Activated</th>
+            <th>Last Seen</th>
+            <th style="min-width:120px">Actions</th>
           </tr></thead>
           <tbody id="usage-list-body"></tbody>
         </table>
@@ -1793,8 +1909,8 @@ def generate_admin_page(admin_email):
       <!-- Empty state -->
       <div id="usage-empty" class="empty-state" style="display:none">
         <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--border)" stroke-width="1.5" style="display:inline-block;margin-bottom:14px"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        <strong>No users found this month</strong>
-        Users appear here once they make their first API call.
+        <strong>No users found</strong>
+        Users appear here once they activate their account.
       </div>
 
       <!-- Detail card — shown on row click -->
@@ -2325,7 +2441,8 @@ def generate_admin_page(admin_email):
     document.getElementById('usage-list-wrap').style.display = 'none';
     document.getElementById('usage-result').style.display = 'none';
     try {{
-      const resp = await fetch('/api/users');
+      const statusFilter = document.getElementById('usage-status-filter').value;
+      const resp = await fetch('/api/users?status=' + encodeURIComponent(statusFilter));
       const data = await resp.json();
       _usageAllRows = (data.users || []);
       if (data.org_usage) {{
@@ -2356,25 +2473,27 @@ def generate_admin_page(admin_email):
     const start = (_usagePage - 1) * _usagePageSize;
     const pageRows = rows.slice(start, start + _usagePageSize);
 
-    document.getElementById('usage-list-body').innerHTML = pageRows.map(u => `
-      <tr style="cursor:default" onclick="/* showUsageDetail('${{u.email}}') */">
+    document.getElementById('usage-list-body').innerHTML = pageRows.map(u => {{
+      const isDisabled = u.status === 'disabled';
+      const statusBadgeHtml = isDisabled
+        ? '<span class="badge badge-block">Disabled</span>'
+        : '<span class="badge badge-enabled">Active</span>';
+      const actionBtn = isDisabled
+        ? `<button class="btn btn-sm" style="background:var(--ok);color:#fff" onclick="event.stopPropagation();toggleUserStatus('${{u.email}}','enable')">Enable</button>`
+        : `<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();toggleUserStatus('${{u.email}}','disable')">Disable</button>`;
+      const rowStyle = isDisabled ? 'opacity:0.6' : '';
+      return `<tr style="cursor:default;${{rowStyle}}">
         <td class="usage-email-cell">${{u.email}}</td>
-        <td class="usage-date-cell">${{u.first_seen
-          ? new Date(u.first_seen).toLocaleDateString(undefined, {{year:'numeric',month:'short',day:'numeric'}})
+        <td>${{statusBadgeHtml}}</td>
+        <td class="usage-date-cell">${{u.first_activated
+          ? new Date(u.first_activated).toLocaleDateString(undefined, {{year:'numeric',month:'short',day:'numeric'}})
           : '<span style="color:var(--text-muted)">—</span>'}}</td>
-        <td>${{u.is_admin
-          ? '<span class="badge badge-admin">Admin</span>'
-          : '<span class="badge badge-standard">User</span>'}}</td>
-        <td style="display:none">${{fmtTokens(u.total_tokens)}}</td>
-        <td style="display:none">${{fmtTokens(u.daily_tokens)}}</td>
-        <td style="display:none">${{u.estimated_cost ? '$' + parseFloat(u.estimated_cost).toFixed(2) : '$0.00'}}</td>
-        <td style="display:none">${{u.daily_cost ? '$' + parseFloat(u.daily_cost).toFixed(2) : '$0.00'}}</td>
-        <td style="color:var(--text-secondary);font-size:12px">${{u.last_updated ? new Date(u.last_updated).toLocaleString() : '<span style="color:var(--text-muted)">—</span>'}}</td>
-        <td>${{u.is_blocked
-          ? `<span class="badge" style="background:#dc3545;color:#fff;margin-right:6px">Blocked</span><button class="btn btn-primary" style="padding:2px 10px;font-size:12px;min-width:auto" onclick="event.stopPropagation();goToUnblock('${{u.email}}')">Unblock</button>`
-          : (u.unblock ? '<span class="badge" style="background:#856404;color:#fff">Unblocked</span>' : '<span style="color:var(--text-muted)">OK</span>')}}</td>
-      </tr>
-    `).join('');
+        <td style="color:var(--text-secondary);font-size:12px">${{u.last_seen
+          ? new Date(u.last_seen).toLocaleString()
+          : '<span style="color:var(--text-muted)">—</span>'}}</td>
+        <td style="white-space:nowrap">${{actionBtn}}</td>
+      </tr>`;
+    }}).join('');
 
     renderUsagePagination(rows.length, totalPages);
   }}
@@ -2538,6 +2657,27 @@ def generate_admin_page(admin_email):
     switchTab('unblock');
     document.getElementById('unblock-email').value = email;
     document.getElementById('unblock-email').focus();
+  }}
+
+  async function toggleUserStatus(email, action) {{
+    const verb = action === 'disable' ? 'Disable' : 'Enable';
+    if (!confirm(`${{verb}} user "${{email}}"?`)) return;
+    try {{
+      const resp = await fetch('/api/user/' + action, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ email }}),
+      }});
+      const data = await resp.json();
+      if (resp.ok) {{
+        showAlert(data.message, 'success');
+        loadUsageList();
+      }} else {{
+        showAlert(data.error || 'Failed to ' + action + ' user', 'error');
+      }}
+    }} catch (e) {{
+      showAlert('Request failed: ' + e.message, 'error');
+    }}
   }}
 
   // ======== Admins ========
