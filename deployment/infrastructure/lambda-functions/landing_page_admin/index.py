@@ -3,6 +3,7 @@
 
 import os
 import json
+import html
 import base64
 import boto3
 import uuid
@@ -1779,7 +1780,7 @@ def _topbar(admin_email, subtitle="Admin Panel"):
   <div class="topbar-spacer"></div>
   <div class="topbar-user">
     {_USER_SVG}
-    <span>{admin_email or 'unknown'}</span>
+    <span>{html.escape(admin_email or 'unknown')}</span>
     <a class="role-chip admin" href="/admin" style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;background:#F0A500;color:#1A1D23;text-decoration:none;">Admin</a>
     <a href="/logout" onclick="return confirm('Sign out of this portal?')" style="margin-left:8px;color:rgba(255,255,255,.6);font-size:12px;text-decoration:none;border:1px solid rgba(255,255,255,.25);padding:2px 8px;border-radius:3px" onmouseover="this.style.color='rgba(255,255,255,.9)'" onmouseout="this.style.color='rgba(255,255,255,.6)'">Sign Out</a>
   </div>
@@ -1825,7 +1826,7 @@ def generate_forbidden_page(user_email):
         You do not have admin access to the quota management panel.
       </p>
       <p style="color:var(--text-secondary);font-size:13px;margin-bottom:20px">
-        Signed in as <strong style="color:var(--text-primary)">{user_email or 'unknown'}</strong>
+        Signed in as <strong style="color:var(--text-primary)">{html.escape(user_email or 'unknown')}</strong>
       </p>
       <p style="color:var(--text-muted);font-size:12px;margin-bottom:24px">
         Contact your IT administrator to request access.
@@ -2215,8 +2216,12 @@ def generate_admin_page(admin_email):
   </main>
 
   <script>
-  const _adminEmail = '{admin_email or ""}';
+  const _adminEmail = {json.dumps(admin_email or "")};
   const _canViewUsage = _adminEmail.endsWith('@amazon.com');
+
+  // ---- HTML escaping helper (prevent XSS via innerHTML) ----
+  function esc(s) {{ if (s == null) return ''; const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }}
+  function escAttr(s) {{ return esc(s).replace(/'/g, '&#39;').replace(/"/g, '&quot;'); }}
 
   // ---- Tab switching ----
   function switchTab(name) {{
@@ -2293,7 +2298,7 @@ def generate_admin_page(admin_email):
     tbody.innerHTML = policiesData.map(p => `
       <tr>
         <td>${{typeBadge(p.policy_type)}}</td>
-        <td style="font-weight:500">${{p.identifier}}</td>
+        <td style="font-weight:500">${{esc(p.identifier)}}</td>
         <td>${{fmtTokens(p.monthly_token_limit)}}</td>
         <td>${{p.daily_token_limit ? fmtTokens(p.daily_token_limit) : '<span style="color:var(--text-muted)">—</span>'}}</td>
         <td>${{p.monthly_cost_limit ? '$' + parseFloat(p.monthly_cost_limit).toFixed(2) : '<span style="color:var(--text-muted)">—</span>'}}</td>
@@ -2301,8 +2306,8 @@ def generate_admin_page(admin_email):
         <td>${{modeBadge(p.enforcement_mode)}}</td>
         <td>${{statusBadge(p.enabled)}}</td>
         <td style="white-space:nowrap">
-          <button class="btn btn-edit btn-sm" onclick="editPolicy('${{p.policy_type}}','${{p.identifier}}')">Edit</button>
-          <button class="btn btn-danger btn-sm" onclick="deletePolicy('${{p.policy_type}}','${{p.identifier}}')" style="margin-left:4px">Delete</button>
+          <button class="btn btn-edit btn-sm" onclick="editPolicy('${{escAttr(p.policy_type)}}','${{escAttr(p.identifier)}}')">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deletePolicy('${{escAttr(p.policy_type)}}','${{escAttr(p.identifier)}}')" style="margin-left:4px">Delete</button>
         </td>
       </tr>
     `).join('');
@@ -2442,7 +2447,7 @@ def generate_admin_page(admin_email):
         const tbody = document.getElementById('users-body');
         tbody.innerHTML = users.map(u => `
           <tr>
-            <td style="font-weight:500">${{u.email}}</td>
+            <td style="font-weight:500">${{esc(u.email)}}</td>
             <td>${{u.is_admin
               ? '<span class="badge badge-admin">Admin</span>'
               : '<span class="badge badge-standard">User</span>'}}</td>
@@ -2509,14 +2514,15 @@ def generate_admin_page(admin_email):
       const statusBadgeHtml = isDisabled
         ? '<span class="badge badge-block">Disabled</span>'
         : '<span class="badge badge-enabled">Active</span>';
+      const emailSafe = escAttr(u.email);
       const actionBtn = isDisabled
-        ? `<button class="btn btn-sm" style="background:var(--ok);color:#fff" onclick="event.stopPropagation();toggleUserStatus('${{u.email}}','enable')">Enable</button>`
-        : `<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();toggleUserStatus('${{u.email}}','disable')">Disable</button>`;
+        ? `<button class="btn btn-sm" style="background:var(--ok);color:#fff" onclick="event.stopPropagation();toggleUserStatus('${{emailSafe}}','enable')">Enable</button>`
+        : `<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();toggleUserStatus('${{emailSafe}}','disable')">Disable</button>`;
       const rowStyle = isDisabled ? 'opacity:0.6' : '';
-      const clickAttr = _canViewUsage ? `onclick="showUsageDetail('${{u.email}}')"` : '';
+      const clickAttr = _canViewUsage ? `onclick="showUsageDetail('${{emailSafe}}')"` : '';
       const cursorStyle = _canViewUsage ? 'cursor:pointer' : 'cursor:default';
       return `<tr style="${{cursorStyle}};${{rowStyle}}" ${{clickAttr}}>
-        <td class="usage-email-cell">${{u.email}}</td>
+        <td class="usage-email-cell">${{esc(u.email)}}</td>
         <td>${{statusBadgeHtml}}</td>
         <td class="usage-date-cell">${{u.first_activated
           ? new Date(u.first_activated).toLocaleDateString(undefined, {{year:'numeric',month:'short',day:'numeric'}})
@@ -2643,9 +2649,9 @@ def generate_admin_page(admin_email):
               <div class="usage-detail-card warn">
                 <div class="usage-detail-label">Status</div>
                 <div class="usage-detail-value" style="font-size:14px;color:#856404">Temporarily Unblocked</div>
-                <div class="usage-detail-sub">By: ${{data.unblock.unblocked_by || 'unknown'}}</div>
-                <div class="usage-detail-sub">Expires: ${{new Date(data.unblock.expires_at).toLocaleString()}}</div>
-                ${{data.unblock.reason ? `<div class="usage-detail-sub">Reason: ${{data.unblock.reason}}</div>` : ''}}
+                <div class="usage-detail-sub">By: ${{esc(data.unblock.unblocked_by || 'unknown')}}</div>
+                <div class="usage-detail-sub">Expires: ${{esc(new Date(data.unblock.expires_at).toLocaleString())}}</div>
+                ${{data.unblock.reason ? `<div class="usage-detail-sub">Reason: ${{esc(data.unblock.reason)}}</div>` : ''}}
               </div>
             </div>
           </div>
@@ -2749,11 +2755,11 @@ def generate_admin_page(admin_email):
     document.getElementById('admins-empty').style.display = 'none';
     tbody.innerHTML = adminsData.map(a => `
       <tr>
-        <td style="font-weight:500">${{a.email}}</td>
-        <td style="color:var(--text-secondary)">${{a.added_by === 'system:seed' ? '<em style="color:var(--text-muted)">Initial seed</em>' : a.added_by}}</td>
+        <td style="font-weight:500">${{esc(a.email)}}</td>
+        <td style="color:var(--text-secondary)">${{a.added_by === 'system:seed' ? '<em style="color:var(--text-muted)">Initial seed</em>' : esc(a.added_by)}}</td>
         <td style="color:var(--text-secondary)">${{a.added_at ? new Date(a.added_at).toLocaleString() : '—'}}</td>
         <td>
-          <button class="btn btn-danger btn-sm" onclick="removeAdmin('${{a.email}}')">Remove</button>
+          <button class="btn btn-danger btn-sm" onclick="removeAdmin('${{escAttr(a.email)}}')">Remove</button>
         </td>
       </tr>
     `).join('');
@@ -2830,12 +2836,13 @@ def generate_admin_page(admin_email):
     document.getElementById('pricing-empty').style.display = 'none';
     tbody.innerHTML = pricingData.map(p => {{
       const isDefault = p.model_id === 'DEFAULT';
+      const modelSafe = escAttr(p.model_id);
       const idCell = isDefault
-        ? `<span style="font-weight:700">${{p.model_id}}</span> <span class="badge badge-default">fallback</span>`
-        : `<span style="font-weight:500">${{p.model_id}}</span>`;
+        ? `<span style="font-weight:700">${{esc(p.model_id)}}</span> <span class="badge badge-default">fallback</span>`
+        : `<span style="font-weight:500">${{esc(p.model_id)}}</span>`;
       const delBtn = isDefault
         ? ''
-        : `<button class="btn btn-danger btn-sm" onclick="deletePricing('${{p.model_id}}')" style="margin-left:4px">Delete</button>`;
+        : `<button class="btn btn-danger btn-sm" onclick="deletePricing('${{modelSafe}}')" style="margin-left:4px">Delete</button>`;
       return `<tr>
         <td>${{idCell}}</td>
         <td>${{fmtPrice(p.input_per_1m)}}</td>
@@ -2844,7 +2851,7 @@ def generate_admin_page(admin_email):
         <td>${{fmtPrice(p.cache_write_per_1m)}}</td>
         <td>${{fmtPrice(p.cache_write_1h_per_1m)}}</td>
         <td style="white-space:nowrap">
-          <button class="btn btn-edit btn-sm" onclick="editPricing('${{p.model_id}}')">Edit</button>
+          <button class="btn btn-edit btn-sm" onclick="editPricing('${{modelSafe}}')">Edit</button>
           ${{delBtn}}
         </td>
       </tr>`;

@@ -38,6 +38,42 @@ from botocore.config import Config
 
 __version__ = "1.0.0"
 
+
+class QuotaExceededError(Exception):
+    """Raised when TVM returns 429 due to quota limits."""
+
+    # Map TVM reason codes to user-friendly templates
+    _REASON_LABELS = {
+        "daily_cost_exceeded": ("Daily cost limit", "$", True),
+        "monthly_cost_exceeded": ("Monthly cost limit", "$", True),
+        "daily_tokens_exceeded": ("Daily token limit", "", False),
+        "monthly_tokens_exceeded": ("Monthly token limit", "", False),
+    }
+
+    def __init__(self, reason: str, usage=None, limit=None, raw_message: str = ""):
+        self.reason = reason
+        self.usage = usage
+        self.limit = limit
+        self.raw_message = raw_message
+        super().__init__(self._format())
+
+    def _format(self) -> str:
+        label, prefix, is_cost = self._REASON_LABELS.get(
+            self.reason, (self.reason, "", False)
+        )
+        if self.usage is not None and self.limit is not None:
+            if is_cost:
+                used = f"{prefix}{self.usage:,.2f}"
+                cap = f"{prefix}{self.limit:,.2f}"
+            else:
+                used = f"{int(self.usage):,}"
+                cap = f"{int(self.limit):,}"
+            return (
+                f"{label} exceeded — you have used {used} out of {cap}. "
+                "Please wait for the quota to reset or contact your administrator."
+            )
+        return self.raw_message or f"Quota exceeded ({self.reason})"
+
 # OIDC Provider Configurations
 PROVIDER_CONFIGS = {
     "okta": {
@@ -655,6 +691,14 @@ class MultiProviderAuth:
                 return credentials
             elif response.status_code == 401:
                 raise Exception("TVM authentication failed — id_token rejected by API Gateway")
+            elif response.status_code == 429:
+                result = response.json()
+                raise QuotaExceededError(
+                    reason=result.get("reason", "quota_exceeded"),
+                    usage=result.get("usage"),
+                    limit=result.get("limit"),
+                    raw_message=result.get("message", "Quota exceeded"),
+                )
             elif response.status_code == 403:
                 result = response.json()
                 reason = result.get("reason", "unknown")
@@ -1720,6 +1764,8 @@ class MultiProviderAuth:
                 self.save_monitoring_token(id_token, token_claims)
                 self._debug_print("Silent credential refresh via cached id_token succeeded")
                 return credentials, id_token, token_claims
+        except QuotaExceededError:
+            raise  # Don't swallow — must reach the user
         except Exception as e:
             self._debug_print(f"Silent refresh with cached id_token failed: {e}")
 
@@ -1733,6 +1779,8 @@ class MultiProviderAuth:
                 self.save_monitoring_token(new_id_token, token_claims)
                 self._debug_print("Silent credential refresh via refresh_token succeeded")
                 return credentials, new_id_token, token_claims
+        except QuotaExceededError:
+            raise  # Don't swallow — must reach the user
         except Exception as e:
             self._debug_print(f"Silent refresh with refresh_token failed: {e}")
 
@@ -1814,6 +1862,10 @@ class MultiProviderAuth:
             print(json.dumps(credentials))
             return 0
 
+        except QuotaExceededError as e:
+            self._log(f"QUOTA EXCEEDED: {e}")
+            print(f"QUOTA EXCEEDED: {e}", file=sys.stderr)
+            return 1
         except KeyboardInterrupt:
             print("\nAuthentication cancelled.", file=sys.stderr)
             return 1

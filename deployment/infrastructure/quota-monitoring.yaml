@@ -446,6 +446,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: BedrockUserRole
+      MaxSessionDuration: 43200
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -556,10 +557,16 @@ Resources:
                 Action:
                   - s3:CreateBucket
                   - s3:PutBucketPolicy
+                  - s3:HeadBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::bedrock-invocation-logs-${AWS::AccountId}-${AWS::Region}'
+              # Notification config needed on whatever bucket Bedrock logging uses
+              # (may be pre-existing with a different name)
+              - Effect: Allow
+                Action:
                   - s3:GetBucketNotification
                   - s3:PutBucketNotification
-                  - s3:HeadBucket
-                Resource: '*'
+                Resource: 'arn:aws:s3:::*'
 
   BedrockLoggingConfigFunction:
     Type: AWS::Lambda::Function
@@ -652,7 +659,10 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: 'arn:aws:s3:::*'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}/*'
+                    - Bucket: !GetAtt BedrockLoggingConfig.BucketName
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -723,10 +733,18 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - s3:GetObject
                   - s3:ListBucket
                 Resource:
-                  - 'arn:aws:s3:::*'
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}'
+                    - Bucket: !GetAtt BedrockLoggingConfig.BucketName
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}/*'
+                    - Bucket: !GetAtt BedrockLoggingConfig.BucketName
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem

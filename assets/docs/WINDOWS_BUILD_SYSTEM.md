@@ -580,6 +580,66 @@ C:\Python312\python.exe -m nuitka \
 }
 ```
 
+**Code Signing (Future):**
+
+Windows executables should be digitally signed using Authenticode to avoid SmartScreen warnings and prove publisher identity. The typical process is:
+
+1. **Obtain a code signing certificate** from a trusted CA (DigiCert, Sectigo, GlobalSign, etc.)
+   - **OV (Organization Validation)** — standard; needs to accumulate SmartScreen reputation over time
+   - **EV (Extended Validation)** — immediate SmartScreen trust; requires hardware token (HSM/USB)
+
+2. **Sign with signtool.exe** (included in Windows SDK):
+
+   ```powershell
+   # Sign using a PFX certificate file
+   signtool sign /f certificate.pfx /p <password> /tr http://timestamp.digicert.com /td sha256 /fd sha256 credential-process-windows.exe
+
+   # Sign using a certificate from the Windows certificate store (common for EV certs)
+   signtool sign /n "Company Name" /tr http://timestamp.digicert.com /td sha256 /fd sha256 credential-process-windows.exe
+
+   # Verify the signature
+   signtool verify /pa /v credential-process-windows.exe
+   ```
+
+   Key parameters:
+   - `/fd sha256` — file digest algorithm
+   - `/tr` — RFC 3161 timestamp server URL (critical: keeps signature valid after cert expires)
+   - `/td sha256` — timestamp digest algorithm
+
+3. **Always timestamp the signature.** Without a timestamp, the signature becomes invalid when the certificate expires (typically 1–3 years). With a timestamp, it remains valid indefinitely.
+
+4. **Dual signing (optional)** for legacy OS compatibility:
+
+   ```powershell
+   # First pass: SHA-1
+   signtool sign /f cert.pfx /p pass /t http://timestamp.digicert.com /fd sha1 myapp.exe
+   # Append SHA-256
+   signtool sign /f cert.pfx /p pass /tr http://timestamp.digicert.com /td sha256 /fd sha256 /as myapp.exe
+   ```
+
+5. **CI/CD integration options** for CodeBuild:
+
+   | Approach | Description |
+   |----------|-------------|
+   | AWS KMS / CloudHSM | Private key in HSM, sign via API — most secure |
+   | Secrets Manager + PFX | Store PFX in Secrets Manager, retrieve at build time |
+   | Third-party cloud signing | SignPath.io, DigiCert KeyLocker, etc. |
+
+   Example with Secrets Manager (add to buildspec post_build phase):
+
+   ```powershell
+   # Retrieve certificate
+   aws secretsmanager get-secret-value --secret-id code-signing-cert --query SecretBinary --output text |
+     [System.Convert]::FromBase64String($_) | Set-Content -Path cert.pfx -Encoding Byte
+
+   # Sign both executables
+   signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 credential-process-windows.exe
+   signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 otel-helper-windows.exe
+
+   # Clean up
+   Remove-Item cert.pfx
+   ```
+
 ### Cost Analysis
 
 **Per build:**

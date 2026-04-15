@@ -15,6 +15,7 @@ from botocore.exceptions import ClientError
 from bedrock_usage_utils import (
     PricingCache,
     calculate_cost,
+    check_processed_marker,
     compute_marker_hash,
     parse_log_entry,
     read_and_parse_s3_log,
@@ -298,6 +299,11 @@ def _process_s3_key(bucket: str, s3_key: str) -> None:
     extract user identity and token counts, calculate cost, and update
     DynamoDB usage records. Identical logic to the stream Lambda.
     """
+    # Guard: skip if already processed (prevents double-counting on DLQ retry)
+    if check_processed_marker(quota_table, s3_key):
+        logger.info("Already processed (marker exists), skipping: %s", s3_key)
+        return
+
     # Skip raw body files in data/ subfolder
     if "/data/" in s3_key:
         logger.info("Skipping body file (data/ subfolder): %s", s3_key)

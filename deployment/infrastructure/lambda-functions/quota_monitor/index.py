@@ -329,6 +329,20 @@ def load_all_policies():
     return policies
 
 
+def _policy_restrictiveness(p: dict) -> tuple:
+    """Sort key: lower tuple = more restrictive.
+
+    Matches the TVM Lambda's selection logic so that alerts and enforcement
+    always agree on which policy applies to a multi-group user.
+    """
+    return (
+        p.get("monthly_token_limit") or float("inf"),
+        p.get("monthly_cost_limit") or float("inf"),
+        p.get("daily_token_limit") or float("inf"),
+        p.get("daily_cost_limit") or float("inf"),
+    )
+
+
 def resolve_user_quota(email, groups, policies_cache):
     """
     Resolve the effective quota policy for a user.
@@ -372,8 +386,9 @@ def resolve_user_quota(email, groups, policies_cache):
                 group_policies.append(policy)
 
     if group_policies:
-        # Most restrictive = lowest monthly_token_limit
-        return min(group_policies, key=lambda p: p["monthly_token_limit"])
+        # Most restrictive: compare (monthly_tokens, monthly_cost, daily_tokens, daily_cost).
+        # Aligned with TVM's _policy_restrictiveness — lower tuple = more restrictive.
+        return min(group_policies, key=_policy_restrictiveness)
 
     # 3. Fall back to default policy
     default_key = "default:default"
@@ -668,19 +683,23 @@ def send_alerts(alerts):
                 message = format_monthly_alert(alert)
 
             # Send to SNS
+            message_attributes = {
+                "user": {"DataType": "String", "StringValue": alert["user"]},
+                "alert_type": {"DataType": "String", "StringValue": alert_type},
+                "alert_level": {"DataType": "String", "StringValue": alert_level},
+            }
+            if "percentage" in alert:
+                message_attributes["percentage"] = {"DataType": "Number", "StringValue": str(alert["percentage"])}
+
             sns_client.publish(
                 TopicArn=SNS_TOPIC_ARN,
                 Subject=subject,
                 Message=message,
-                MessageAttributes={
-                    "user": {"DataType": "String", "StringValue": alert["user"]},
-                    "alert_type": {"DataType": "String", "StringValue": alert_type},
-                    "alert_level": {"DataType": "String", "StringValue": alert_level},
-                    "percentage": {"DataType": "Number", "StringValue": str(alert["percentage"])},
-                },
+                MessageAttributes=message_attributes,
             )
 
-            print(f"Sent {alert_type} {alert_level} alert for {alert['user']} ({alert['percentage']:.1f}%)")
+            pct_str = f" ({alert['percentage']:.1f}%)" if "percentage" in alert else ""
+            print(f"Sent {alert_type} {alert_level} alert for {alert['user']}{pct_str}")
 
         except Exception as e:
             print(f"Error sending alert for {alert['user']}: {str(e)}")

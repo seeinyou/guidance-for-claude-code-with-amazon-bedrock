@@ -5,7 +5,7 @@
 
 import json
 import re
-import base64
+
 import time
 import boto3
 import os
@@ -80,24 +80,6 @@ def lambda_handler(event, context):
         jwt_claims = authorizer_ctx.get("jwt", {}).get("claims", {})
         email = jwt_claims.get("email")
 
-        # Fallback: decode JWT from Authorization header (token already
-        # validated by API GW — we only need the claims payload).
-        if not email:
-            auth_header = (event.get("headers") or {}).get("authorization", "")
-            if auth_header.startswith("Bearer "):
-                try:
-                    token = auth_header[7:]
-                    payload_b64 = token.split(".")[1]
-                    padding = 4 - len(payload_b64) % 4
-                    if padding != 4:
-                        payload_b64 += "=" * padding
-                    jwt_claims = json.loads(base64.b64decode(payload_b64))
-                    email = jwt_claims.get("email")
-                    if email:
-                        print(f"[TVM] Email from Authorization header fallback: {email}")
-                except Exception as fb_err:
-                    print(f"[TVM] Fallback JWT decode failed: {fb_err}")
-
         if not email:
             print(f"[TVM] JWT missing email claim. Available claims: {list(jwt_claims.keys())}")
             return _error(403, "missing_email", "JWT token does not contain an email claim")
@@ -119,11 +101,18 @@ def lambda_handler(event, context):
             )
 
         # -- 3. Upsert user profile ------------------------------------------
-        _upsert_profile(email, jwt_claims, groups)
+        try:
+            _upsert_profile(email, jwt_claims, groups)
+        except Exception as exc:
+            print(f"[TVM] Profile upsert failed, denying request: {exc}")
+            return _error(500, "internal_error", "Unable to verify user profile. Please try again.")
 
         # -- 4. Check profile status (disabled?) ------------------------------
         profile = _get_profile(email)
-        if profile and profile.get("status") == "disabled":
+        if profile is None:
+            print(f"[TVM] Profile read failed after upsert, denying request for {email}")
+            return _error(500, "internal_error", "Unable to verify user profile. Please try again.")
+        if profile.get("status") == "disabled":
             return _error(
                 403,
                 "user_disabled",
@@ -166,7 +155,7 @@ def lambda_handler(event, context):
     except Exception as exc:
         print(f"[TVM] Unhandled error: {exc}")
         traceback.print_exc()
-        return _error(500, "internal_error", f"Internal error: {exc}")
+        return _error(500, "internal_error", "An internal error occurred. Please try again or contact your administrator.")
 
 
 # ===================================================================
@@ -242,6 +231,7 @@ def _upsert_profile(email: str, claims: dict, groups: list | None = None) -> Non
         )
     except Exception as exc:
         print(f"[TVM] Error upserting profile for {email}: {exc}")
+        raise
 
 
 def _get_profile(email: str) -> dict | None:
@@ -521,6 +511,8 @@ def _check_quota_limits(usage: dict, policy: dict) -> dict | None:
     if monthly_limit > 0 and monthly_tokens >= monthly_limit:
         return {
             "reason": "monthly_tokens_exceeded",
+            "usage": int(monthly_tokens),
+            "limit": int(monthly_limit),
             "message": (
                 f"Monthly token quota exceeded: {int(monthly_tokens):,} / "
                 f"{int(monthly_limit):,} tokens "
@@ -532,6 +524,8 @@ def _check_quota_limits(usage: dict, policy: dict) -> dict | None:
     if monthly_cost_limit and monthly_cost_limit > 0 and estimated_cost >= monthly_cost_limit:
         return {
             "reason": "monthly_cost_exceeded",
+            "usage": round(float(estimated_cost), 2),
+            "limit": round(float(monthly_cost_limit), 2),
             "message": (
                 f"Monthly cost quota exceeded: ${estimated_cost:,.2f} / "
                 f"${monthly_cost_limit:,.2f} "
@@ -543,6 +537,8 @@ def _check_quota_limits(usage: dict, policy: dict) -> dict | None:
     if daily_limit and daily_limit > 0 and daily_tokens >= daily_limit:
         return {
             "reason": "daily_tokens_exceeded",
+            "usage": int(daily_tokens),
+            "limit": int(daily_limit),
             "message": (
                 f"Daily token quota exceeded: {int(daily_tokens):,} / "
                 f"{int(daily_limit):,} tokens "
@@ -554,6 +550,8 @@ def _check_quota_limits(usage: dict, policy: dict) -> dict | None:
     if daily_cost_limit and daily_cost_limit > 0 and daily_cost >= daily_cost_limit:
         return {
             "reason": "daily_cost_exceeded",
+            "usage": round(float(daily_cost), 2),
+            "limit": round(float(daily_cost_limit), 2),
             "message": (
                 f"Daily cost quota exceeded: ${daily_cost:,.2f} / "
                 f"${daily_cost_limit:,.2f} "
@@ -574,6 +572,14 @@ def _compute_session_duration(usage: dict, policy: dict | None) -> tuple[int, in
     Compute an adaptive STS session duration based on how close the user
     is to their quota limits.
 
+    Uses two strategies and takes the shorter result:
+
+    1. **Ratio-based** — percentage of limit consumed (existing logic).
+    2. **Remaining-based** — absolute cost remaining across all cost
+       dimensions.  Because the usage pipeline is asynchronous (minutes
+       of lag), small-quota users can blow past their limit in a single
+       long session.  Capping by absolute remaining compensates for this.
+
     Returns:
         ``(max_duration, effective_seconds)``
         where ``max_duration = max(900, effective_seconds)`` (STS minimum).
@@ -582,7 +588,9 @@ def _compute_session_duration(usage: dict, policy: dict | None) -> tuple[int, in
         # No policy — unlimited; use configured default
         return (max(900, TVM_SESSION_DURATION), TVM_SESSION_DURATION)
 
-    # Gather usage / limit pairs for every configured dimension
+    # ------------------------------------------------------------------
+    # Strategy 1: ratio-based (percentage of limit consumed)
+    # ------------------------------------------------------------------
     dimensions = []
 
     monthly_limit = policy.get("monthly_token_limit", 0)
@@ -607,15 +615,37 @@ def _compute_session_duration(usage: dict, policy: dict | None) -> tuple[int, in
 
     max_ratio = max(dimensions)
 
-    # Map ratio to session duration
     if max_ratio < 0.80:
-        effective = 900
+        ratio_effective = 900
     elif max_ratio < 0.90:
-        effective = 300
+        ratio_effective = 300
     elif max_ratio < 0.95:
-        effective = 120
+        ratio_effective = 120
     else:
-        effective = 60
+        ratio_effective = 60
+
+    # ------------------------------------------------------------------
+    # Strategy 2: absolute cost remaining
+    # ------------------------------------------------------------------
+    remaining_effective = 900
+
+    cost_remaining = []
+    if monthly_cost_limit and monthly_cost_limit > 0:
+        cost_remaining.append(monthly_cost_limit - usage.get("estimated_cost", 0))
+    if daily_cost_limit and daily_cost_limit > 0:
+        cost_remaining.append(daily_cost_limit - usage.get("daily_cost", 0))
+
+    if cost_remaining:
+        min_remaining = min(cost_remaining)
+        if min_remaining < 5:
+            remaining_effective = 60
+        elif min_remaining < 10:
+            remaining_effective = 300
+
+    # ------------------------------------------------------------------
+    # Final: take the shorter of both strategies
+    # ------------------------------------------------------------------
+    effective = min(ratio_effective, remaining_effective)
 
     return (max(900, effective), effective)
 
