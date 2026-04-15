@@ -79,11 +79,23 @@ Parameters:
       - 'false'
     Description: Enable CloudTrail tracking of Bedrock API calls for monitoring and cost analysis
 
+  TVMEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      When true, Bedrock InvokeModel permissions are removed from the Identity Pool auth role.
+      Bedrock credentials are issued exclusively via the TVM Lambda (quota-monitoring stack).
+      Only enable after TVM is deployed and credential-process clients are updated.
+
 Conditions:
   UseExternalOIDC: !Equals [!Ref AuthProviderType, 'ExternalOIDC']
   UseCognitoUserPool: !Equals [!Ref AuthProviderType, 'CognitoUserPool']
   MonitoringEnabled: !Equals [!Ref EnableMonitoring, 'true']
   BedrockTrackingEnabled: !Equals [!Ref EnableBedrockTracking, 'true']
+  TVMDisabled: !Equals [!Ref TVMEnabled, 'false']
   # Partition-aware conditions for Cognito Identity service principals
   IsGovCloudWest: !Equals [!Ref 'AWS::Region', 'us-gov-west-1']
   IsGovCloudEast: !Equals [!Ref 'AWS::Region', 'us-gov-east-1']
@@ -132,17 +144,23 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowBedrockInvoke
-            Effect: Allow
-            Action:
-              - 'bedrock:InvokeModel'
-              - 'bedrock:InvokeModelWithResponseStream'
-            Resource:
-              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
-              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*'
-            Condition:
-              StringEquals:
-                'aws:RequestedRegion': !Ref AllowedBedrockRegions
+          # Bedrock Invoke permissions — only when TVM is NOT enabled.
+          # When TVM is enabled, Bedrock credentials are issued via the TVM Lambda
+          # (BedrockUserRole in quota-monitoring stack), not via the Identity Pool role.
+          - !If
+            - TVMDisabled
+            - Sid: AllowBedrockInvoke
+              Effect: Allow
+              Action:
+                - 'bedrock:InvokeModel'
+                - 'bedrock:InvokeModelWithResponseStream'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*'
+              Condition:
+                StringEquals:
+                  'aws:RequestedRegion': !Ref AllowedBedrockRegions
+            - !Ref 'AWS::NoValue'
           - Sid: AllowBedrockList
             Effect: Allow
             Action:

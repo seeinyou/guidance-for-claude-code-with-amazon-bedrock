@@ -16,19 +16,11 @@
 
 ---
 
-## Issue 3 (Performance): Reconciler S3 prefix too broad
+## Issue 3: RESOLVED -- reconciler now uses hour-level S3 prefixes
 
-**File:** `deployment/infrastructure/lambda-functions/bedrock_usage_reconciler/index.py:188-219`
+**Original:** `_build_s3_prefixes()` returned only a broad prefix covering all regions and dates, causing full-bucket ListObjectsV2 pagination that could exceed the 5-minute Lambda timeout.
 
-**Description:**
-
-`_build_s3_prefixes()` returns only:
-```
-bedrock-raw/AWSLogs/{account}/BedrockModelInvocationLogs/
-```
-This lists **all objects across all regions and dates**, then filters by `LastModified` in `_list_s3_keys()`. For a bucket with thousands of historical logs, the ListObjectsV2 pagination could exceed the 5-minute Lambda timeout.
-
-**Fix:** Build hour-level prefixes covering the 35-minute window. Enumerate each distinct `{region}/{YYYY}/{MM}/{DD}/{HH}/` path between `window_start` and `window_end`. If regions are unknown, at minimum include date-level prefixes to narrow the listing scope.
+**Fix:** `_build_s3_prefixes()` now builds hour-level prefixes: `{prefix}AWSLogs/{account}/BedrockModelInvocationLogs/{region}/{YYYY}/{MM}/{DD}/{HH}/`. A 35-minute window spans at most 2 distinct hours. Uses `AWS_REGION` for the entry region (cross-region inference logs still use the entry region in the S3 key).
 
 ---
 

@@ -158,6 +158,8 @@ def lambda_handler(event, context):
                 return api_remove_admin(event)
 
         elif path == "/api/usage" and method == "GET":
+            if not user_email or not user_email.lower().endswith("@amazon.com"):
+                return build_json_response(403, {"error": "Usage detail restricted"})
             return api_get_usage(event)
 
         elif path == "/api/users" and method == "GET":
@@ -744,6 +746,7 @@ def api_list_pricing():
                 "output_per_1m": float(item.get("output_per_1m", 0)),
                 "cache_read_per_1m": float(item.get("cache_read_per_1m", 0)),
                 "cache_write_per_1m": float(item.get("cache_write_per_1m", 0)),
+                "cache_write_1h_per_1m": float(item.get("cache_write_1h_per_1m", 0)),
             })
         return build_json_response(200, {"pricing": pricing})
     except Exception as e:
@@ -771,6 +774,7 @@ def api_update_pricing(event):
             "output_per_1m": Decimal(str(body.get("output_per_1m", 0))),
             "cache_read_per_1m": Decimal(str(body.get("cache_read_per_1m", 0))),
             "cache_write_per_1m": Decimal(str(body.get("cache_write_per_1m", 0))),
+            "cache_write_1h_per_1m": Decimal(str(body.get("cache_write_1h_per_1m", 0))),
         }
         pricing_table.put_item(Item=item)
         print(f"Pricing upserted: {model_id}")
@@ -826,30 +830,33 @@ def api_get_usage(event):
     current_date = now.strftime("%Y-%m-%d")
 
     pk = f"USER#{email}"
-    sk = f"MONTH#{month_prefix}"
 
     try:
-        response = metrics_table.get_item(Key={"pk": pk, "sk": sk})
-        item = response.get("Item")
+        # Monthly usage from Bedrock pipeline
+        month_sk = f"MONTH#{month_prefix}#BEDROCK"
+        month_resp = metrics_table.get_item(Key={"pk": pk, "sk": month_sk})
+        month_item = month_resp.get("Item", {})
 
-        if not item:
-            return build_json_response(200, {
-                "email": email,
-                "month": month_prefix,
-                "total_tokens": 0,
-                "daily_tokens": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_tokens": 0,
-                "estimated_cost": 0,
-                "daily_cost": 0,
-            })
+        # Daily usage from Bedrock pipeline
+        day_sk = f"DAY#{current_date}#BEDROCK"
+        day_resp = metrics_table.get_item(Key={"pk": pk, "sk": day_sk})
+        day_item = day_resp.get("Item", {})
 
-        daily_tokens = float(item.get("daily_tokens", 0))
-        daily_cost = float(item.get("daily_cost", 0))
-        if item.get("daily_date") != current_date:
-            daily_tokens = 0
-            daily_cost = 0
+        # Profile for first_activated
+        profile_resp = metrics_table.get_item(Key={"pk": pk, "sk": "PROFILE"})
+        profile_item = profile_resp.get("Item", {})
+
+        total_tokens = int(float(month_item.get("total_tokens", 0)))
+        input_tokens = int(float(month_item.get("input_tokens", 0)))
+        output_tokens = int(float(month_item.get("output_tokens", 0)))
+        cache_read_tokens = int(float(month_item.get("cache_read_tokens", 0)))
+        cache_write_tokens = int(float(month_item.get("cache_write_tokens", 0)))
+        estimated_cost = round(float(month_item.get("estimated_cost", 0)), 2)
+
+        daily_tokens = int(float(day_item.get("total_tokens", 0)))
+        daily_cost = round(float(day_item.get("estimated_cost", 0)), 2)
+
+        first_seen = profile_item.get("first_activated")
 
         # Look up active unblock record
         unblock = None
@@ -873,14 +880,15 @@ def api_get_usage(event):
         return build_json_response(200, {
             "email": email,
             "month": month_prefix,
-            "total_tokens": int(float(item.get("total_tokens", 0))),
-            "daily_tokens": int(daily_tokens),
-            "input_tokens": int(float(item.get("input_tokens", 0))),
-            "output_tokens": int(float(item.get("output_tokens", 0))),
-            "cache_tokens": int(float(item.get("cache_tokens", 0))),
-            "estimated_cost": round(float(item.get("estimated_cost", 0)), 2),
-            "daily_cost": round(daily_cost, 2),
-            "first_seen": item.get("first_seen"),
+            "total_tokens": total_tokens,
+            "daily_tokens": daily_tokens,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "estimated_cost": estimated_cost,
+            "daily_cost": daily_cost,
+            "first_seen": first_seen,
             "unblock": unblock,
         })
     except Exception as e:
@@ -909,9 +917,11 @@ def api_list_users(event):
         users_by_email = {}
         profiles_by_email = {}
         unblocks_by_email = {}
+        daily_data_by_email = {}
         scan_kwargs = {
             "FilterExpression": (
-                Attr("sk").eq(f"MONTH#{month_prefix}")
+                Attr("sk").eq(f"MONTH#{month_prefix}#BEDROCK")
+                | Attr("sk").eq(f"DAY#{current_date}#BEDROCK")
                 | Attr("sk").eq("UNBLOCK#CURRENT")
                 | Attr("sk").eq("PROFILE")
             ) & Attr("pk").begins_with("USER#"),
@@ -950,29 +960,41 @@ def api_list_users(event):
                             "expires_at": expires_at,
                             "reason": item.get("reason"),
                         }
-                else:
-                    email = item.get("email")
-                    if not email:
+                elif sk.endswith("#BEDROCK") and sk.startswith("DAY#"):
+                    if not email_from_pk:
                         continue
-                    daily_tokens = float(item.get("daily_tokens", 0))
-                    daily_cost = float(item.get("daily_cost", 0))
-                    if item.get("daily_date") != current_date:
-                        daily_tokens = 0
-                        daily_cost = 0
-                    users_by_email[email] = {
-                        "email": email,
-                        "is_admin": email.lower() in admin_emails,
-                        "first_seen": item.get("first_seen"),
+                    daily_data_by_email[email_from_pk] = {
+                        "daily_tokens": int(float(item.get("total_tokens", 0))),
+                        "daily_cost": round(float(item.get("estimated_cost", 0)), 2),
+                    }
+                else:
+                    # MONTH#YYYY-MM#BEDROCK record
+                    if not email_from_pk:
+                        continue
+                    cache_read = float(item.get("cache_read_tokens", 0))
+                    cache_write = float(item.get("cache_write_tokens", 0))
+                    users_by_email[email_from_pk] = {
+                        "email": email_from_pk,
+                        "is_admin": email_from_pk.lower() in admin_emails,
+                        "first_seen": None,
                         "total_tokens": int(float(item.get("total_tokens", 0))),
-                        "daily_tokens": int(daily_tokens),
+                        "daily_tokens": 0,
+                        "daily_cost": 0,
                         "estimated_cost": round(float(item.get("estimated_cost", 0)), 2),
-                        "daily_cost": round(daily_cost, 2),
+                        "cache_read_tokens": int(cache_read),
+                        "cache_write_tokens": int(cache_write),
                         "last_updated": item.get("last_updated"),
                     }
             if "LastEvaluatedKey" in response:
                 scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
             else:
                 break
+
+        # Merge daily data into user records
+        for email, daily in daily_data_by_email.items():
+            if email in users_by_email:
+                users_by_email[email]["daily_tokens"] = daily["daily_tokens"]
+                users_by_email[email]["daily_cost"] = daily["daily_cost"]
 
         # Merge PROFILE data into user records, and create entries for profile-only users
         all_emails = set(users_by_email.keys()) | set(profiles_by_email.keys())
@@ -992,6 +1014,7 @@ def api_list_users(event):
             profile = profiles_by_email.get(email, {})
             users_by_email[email]["status"] = profile.get("status", "active")
             users_by_email[email]["first_activated"] = profile.get("first_activated")
+            users_by_email[email]["first_seen"] = profile.get("first_activated")
             users_by_email[email]["last_seen"] = profile.get("last_seen")
 
         # Merge unblock status into user records
@@ -1055,13 +1078,13 @@ def api_list_users(event):
         # Also get org aggregate
         org_usage = None
         try:
-            org_resp = metrics_table.get_item(Key={"pk": "ORG#global", "sk": f"MONTH#{month_prefix}"})
+            org_resp = metrics_table.get_item(Key={"pk": "ORG#global", "sk": f"MONTH#{month_prefix}#BEDROCK"})
             org_item = org_resp.get("Item")
             if org_item:
                 org_usage = {
                     "total_tokens": int(float(org_item.get("total_tokens", 0))),
                     "estimated_cost": round(float(org_item.get("estimated_cost", 0)), 2),
-                    "user_count": int(org_item.get("user_count", 0)),
+                    "user_count": len(users_by_email),
                 }
         except Exception:
             pass
@@ -2147,8 +2170,12 @@ def generate_admin_page(admin_email):
             <input type="text" id="price-cache-read" placeholder="0.3">
           </div>
           <div class="form-group">
-            <label>Cache Write / 1M Tokens ($)</label>
+            <label>Cache Write 5m / 1M Tokens ($)</label>
             <input type="text" id="price-cache-write" placeholder="3.75">
+          </div>
+          <div class="form-group">
+            <label>Cache Write 1h / 1M Tokens ($)</label>
+            <input type="text" id="price-cache-write-1h" placeholder="6.00">
           </div>
         </div>
         <div class="form-actions">
@@ -2166,7 +2193,8 @@ def generate_admin_page(admin_email):
               <th>Input / 1M</th>
               <th>Output / 1M</th>
               <th>Cache Read / 1M</th>
-              <th>Cache Write / 1M</th>
+              <th>CW 5m / 1M</th>
+              <th>CW 1h / 1M</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -2187,6 +2215,9 @@ def generate_admin_page(admin_email):
   </main>
 
   <script>
+  const _adminEmail = '{admin_email or ""}';
+  const _canViewUsage = _adminEmail.endsWith('@amazon.com');
+
   // ---- Tab switching ----
   function switchTab(name) {{
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -2482,7 +2513,9 @@ def generate_admin_page(admin_email):
         ? `<button class="btn btn-sm" style="background:var(--ok);color:#fff" onclick="event.stopPropagation();toggleUserStatus('${{u.email}}','enable')">Enable</button>`
         : `<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();toggleUserStatus('${{u.email}}','disable')">Disable</button>`;
       const rowStyle = isDisabled ? 'opacity:0.6' : '';
-      return `<tr style="cursor:default;${{rowStyle}}">
+      const clickAttr = _canViewUsage ? `onclick="showUsageDetail('${{u.email}}')"` : '';
+      const cursorStyle = _canViewUsage ? 'cursor:pointer' : 'cursor:default';
+      return `<tr style="${{cursorStyle}};${{rowStyle}}" ${{clickAttr}}>
         <td class="usage-email-cell">${{u.email}}</td>
         <td>${{statusBadgeHtml}}</td>
         <td class="usage-date-cell">${{u.first_activated
@@ -2585,7 +2618,8 @@ def generate_admin_page(admin_email):
               ${{tokenCard('Total', data.total_tokens)}}
               ${{tokenCard('Input', data.input_tokens)}}
               ${{tokenCard('Output', data.output_tokens)}}
-              ${{tokenCard('Cache Read', data.cache_tokens)}}
+              ${{tokenCard('Cache Read', data.cache_read_tokens)}}
+              ${{tokenCard('Cache Write', data.cache_write_tokens)}}
             </div>
           </div>
 
@@ -2808,6 +2842,7 @@ def generate_admin_page(admin_email):
         <td>${{fmtPrice(p.output_per_1m)}}</td>
         <td>${{fmtPrice(p.cache_read_per_1m)}}</td>
         <td>${{fmtPrice(p.cache_write_per_1m)}}</td>
+        <td>${{fmtPrice(p.cache_write_1h_per_1m)}}</td>
         <td style="white-space:nowrap">
           <button class="btn btn-edit btn-sm" onclick="editPricing('${{p.model_id}}')">Edit</button>
           ${{delBtn}}
@@ -2830,6 +2865,7 @@ def generate_admin_page(admin_email):
     document.getElementById('price-output').value = p ? p.output_per_1m : '';
     document.getElementById('price-cache-read').value = p ? p.cache_read_per_1m : '';
     document.getElementById('price-cache-write').value = p ? p.cache_write_per_1m : '';
+    document.getElementById('price-cache-write-1h').value = p ? p.cache_write_1h_per_1m : '';
     document.getElementById('pricing-form').style.display = 'block';
     document.getElementById('pricing-form').scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
   }}
@@ -2852,6 +2888,7 @@ def generate_admin_page(admin_email):
       output_per_1m: document.getElementById('price-output').value || '0',
       cache_read_per_1m: document.getElementById('price-cache-read').value || '0',
       cache_write_per_1m: document.getElementById('price-cache-write').value || '0',
+      cache_write_1h_per_1m: document.getElementById('price-cache-write-1h').value || '0',
     }};
     try {{
       const resp = await fetch('/api/pricing', {{

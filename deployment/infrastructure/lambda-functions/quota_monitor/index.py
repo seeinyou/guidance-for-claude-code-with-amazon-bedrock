@@ -55,7 +55,7 @@ def lambda_handler(event, context):
 
     try:
         # Get user usage data for this month
-        user_usage_data = get_monthly_usage(month_name)
+        user_usage_data = get_monthly_usage(current_date)
 
         if not user_usage_data:
             print("No user metrics found for current month")
@@ -90,10 +90,6 @@ def lambda_handler(event, context):
             daily_tokens = float(usage.get("daily_tokens", 0))
             estimated_cost = float(usage.get("estimated_cost", 0))
             daily_cost_val = float(usage.get("daily_cost", 0))
-
-            # Reset daily cost if date has changed
-            if usage.get("daily_cost_date") != current_date:
-                daily_cost_val = 0.0
 
             # Check all limit types and generate alerts
             alerts = check_limits_and_generate_alerts(
@@ -130,10 +126,23 @@ def lambda_handler(event, context):
                     # Record alert to prevent duplicates
                     record_sent_alert(month_name, email, alert["alert_type"], alert["alert_level"], alert)
 
+        # Check reconciler heartbeat
+        heartbeat_alerts = check_reconciler_heartbeat(
+            month_name=month_name,
+            current_date=current_date,
+            sent_alerts=sent_alerts,
+        )
+        for alert in heartbeat_alerts:
+            alert_key = f"SYSTEM#reconciler#reconciler_heartbeat#{current_date}#stale"
+            if alert_key not in sent_alerts:
+                alerts_to_send.append(alert)
+                record_sent_alert(month_name, "SYSTEM#reconciler", alert["alert_type"], alert["alert_level"], alert)
+
         # Check org-wide limits
         org_policy = policies_cache.get("org:global") if policies_cache else None
         if org_policy:
             org_usage = get_org_usage()
+            org_usage["user_count"] = stats["total_users"]
             org_alerts = check_org_limits_and_generate_alerts(
                 org_usage=org_usage,
                 policy=org_policy,
@@ -177,58 +186,77 @@ def lambda_handler(event, context):
         return {"statusCode": 500, "body": json.dumps(f"Error: {str(e)}")}
 
 
-def get_monthly_usage(month_name):
+def get_monthly_usage(current_date):
     """
     Query the UserQuotaMetrics table for all users in the current month.
+    Scans for MONTH#BEDROCK, DAY#BEDROCK, and PROFILE records in one pass.
     Returns dict of email -> usage data including token types and cost.
-    """
-    user_usage = {}
 
-    # Extract YYYY-MM format (UTC+8 boundaries)
-    now = datetime.now(EFFECTIVE_TZ)
-    month_prefix = now.strftime("%Y-%m")
+    Args:
+        current_date: Current date string in YYYY-MM-DD format.
+    """
+    # Extract YYYY-MM format from current_date
+    month_prefix = current_date[:7]  # "YYYY-MM"
+
+    scan_filter = (
+        Attr("sk").eq(f"MONTH#{month_prefix}#BEDROCK")
+        | Attr("sk").eq(f"DAY#{current_date}#BEDROCK")
+        | Attr("sk").eq("PROFILE")
+    ) & Attr("pk").begins_with("USER#")
 
     try:
-        # Scan for all users in this month with enhanced fields
-        response = quota_table.scan(
-            FilterExpression=Attr("sk").eq(f"MONTH#{month_prefix}"),
-            ProjectionExpression="email, total_tokens, daily_tokens, daily_date, input_tokens, output_tokens, cache_tokens, estimated_cost, daily_cost, daily_cost_date, #groups",
-            ExpressionAttributeNames={"#groups": "groups"},
-        )
-
-        def _parse_usage_item(item):
-            return {
-                "total_tokens": float(item.get("total_tokens", 0)),
-                "daily_tokens": float(item.get("daily_tokens", 0)),
-                "daily_date": item.get("daily_date"),
-                "input_tokens": float(item.get("input_tokens", 0)),
-                "output_tokens": float(item.get("output_tokens", 0)),
-                "cache_tokens": float(item.get("cache_tokens", 0)),
-                "estimated_cost": float(item.get("estimated_cost", 0)),
-                "daily_cost": float(item.get("daily_cost", 0)),
-                "daily_cost_date": item.get("daily_cost_date"),
-                "groups": item.get("groups", []),
-            }
-
-        # Process results
-        for item in response.get("Items", []):
-            email = item.get("email")
-            if email:
-                user_usage[email] = _parse_usage_item(item)
+        # Scan for all three record types in one pass
+        response = quota_table.scan(FilterExpression=scan_filter)
+        items = list(response.get("Items", []))
 
         # Handle pagination
         while "LastEvaluatedKey" in response:
             response = quota_table.scan(
-                FilterExpression=Attr("sk").eq(f"MONTH#{month_prefix}"),
-                ProjectionExpression="email, total_tokens, daily_tokens, daily_date, input_tokens, output_tokens, cache_tokens, estimated_cost, daily_cost, daily_cost_date, #groups",
-                ExpressionAttributeNames={"#groups": "groups"},
+                FilterExpression=scan_filter,
                 ExclusiveStartKey=response["LastEvaluatedKey"],
             )
+            items.extend(response.get("Items", []))
 
-            for item in response.get("Items", []):
-                email = item.get("email")
-                if email:
-                    user_usage[email] = _parse_usage_item(item)
+        # Classify items by record type
+        monthly_data = {}   # email -> MONTH#BEDROCK data
+        daily_data = {}     # email -> DAY#BEDROCK data
+        profiles = {}       # email -> PROFILE data
+
+        for item in items:
+            pk = item.get("pk", "")
+            sk = item.get("sk", "")
+            if not pk.startswith("USER#"):
+                continue
+            email = pk[len("USER#"):]
+
+            if sk.endswith("#BEDROCK") and sk.startswith("MONTH#"):
+                monthly_data[email] = item
+            elif sk.endswith("#BEDROCK") and sk.startswith("DAY#"):
+                daily_data[email] = item
+            elif sk == "PROFILE":
+                profiles[email] = item
+
+        # Merge into per-user usage dicts
+        user_usage = {}
+        all_emails = set(monthly_data) | set(daily_data) | set(profiles)
+        for email in all_emails:
+            month = monthly_data.get(email, {})
+            day = daily_data.get(email, {})
+            profile = profiles.get(email, {})
+
+            cache_read = float(month.get("cache_read_tokens", 0))
+            cache_write = float(month.get("cache_write_tokens", 0))
+
+            user_usage[email] = {
+                "total_tokens": float(month.get("total_tokens", 0)),
+                "daily_tokens": float(day.get("total_tokens", 0)),
+                "input_tokens": float(month.get("input_tokens", 0)),
+                "output_tokens": float(month.get("output_tokens", 0)),
+                "cache_tokens": cache_read + cache_write,
+                "estimated_cost": float(month.get("estimated_cost", 0)),
+                "daily_cost": float(day.get("estimated_cost", 0)),
+                "groups": profile.get("groups", []),
+            }
 
         print(f"Found {len(user_usage)} users with usage in {month_prefix}")
 
@@ -517,7 +545,7 @@ def get_sent_alerts(month_name):
                 alert_type = sk_parts[3]
                 alert_level = sk_parts[4]
                 # For daily alerts, include date
-                if alert_type == "daily" and len(sk_parts) >= 6:
+                if alert_type in ("daily", "daily_cost", "reconciler_heartbeat") and len(sk_parts) >= 6:
                     date = sk_parts[5]
                     sent_alerts.add(f"{email}#{alert_type}#{date}#{alert_level}")
                 else:
@@ -561,7 +589,7 @@ def record_sent_alert(month_name, email, alert_type, alert_level, alert_data):
         month_prefix = effective_now.strftime("%Y-%m")
 
         # Build SK based on alert type
-        if alert_type == "daily":
+        if alert_type in ("daily", "daily_cost", "reconciler_heartbeat"):
             date = alert_data.get("date", effective_now.strftime("%Y-%m-%d"))
             sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}#{date}"
         else:
@@ -615,9 +643,13 @@ def send_alerts(alerts):
                 "daily_cost": "Daily Cost Quota",
                 "org_monthly_tokens": "Org-Wide Monthly Token Quota",
                 "org_monthly_cost": "Org-Wide Monthly Cost Quota",
+                "reconciler_heartbeat": "Reconciler Heartbeat",
             }.get(alert_type, "Quota")
 
-            subject = f"Claude Code {level_prefix} - {type_label} - {alert['percentage']:.0f}%"
+            if alert_type == "reconciler_heartbeat":
+                subject = f"Claude Code {level_prefix} - {type_label} Stale"
+            else:
+                subject = f"Claude Code {level_prefix} - {type_label} - {alert['percentage']:.0f}%"
 
             # Format the message body based on alert type
             if alert_type == "monthly":
@@ -630,6 +662,8 @@ def send_alerts(alerts):
                 message = format_cost_alert(alert, "Daily")
             elif alert_type in ("org_monthly_tokens", "org_monthly_cost"):
                 message = format_org_alert(alert)
+            elif alert_type == "reconciler_heartbeat":
+                message = format_reconciler_heartbeat_alert(alert)
             else:
                 message = format_monthly_alert(alert)
 
@@ -774,7 +808,7 @@ To increase their cost quota:
 def get_org_usage():
     """Get org aggregate usage for current month (UTC+8 boundaries)."""
     now = datetime.now(EFFECTIVE_TZ)
-    sk = f"MONTH#{now.strftime('%Y-%m')}"
+    sk = f"MONTH#{now.strftime('%Y-%m')}#BEDROCK"
     try:
         response = quota_table.get_item(Key={"pk": "ORG#global", "sk": sk})
         item = response.get("Item")
@@ -783,7 +817,7 @@ def get_org_usage():
         return {
             "total_tokens": float(item.get("total_tokens", 0)),
             "estimated_cost": float(item.get("estimated_cost", 0)),
-            "user_count": int(item.get("user_count", 0)),
+            "user_count": 0,  # Bedrock ORG record does not carry user_count; caller injects it
         }
     except Exception as e:
         print(f"Error getting org usage: {e}")
@@ -884,4 +918,122 @@ To update the organization limit:
 
 =====================================
 This alert is sent once per threshold level per month.
+"""
+
+
+RECONCILER_HEARTBEAT_STALE_MINUTES = 45
+
+
+def check_reconciler_heartbeat(month_name, current_date, sent_alerts):
+    """
+    Check if the bedrock_usage_reconciler Lambda has run recently.
+
+    Reads the SYSTEM#reconciler HEARTBEAT record from DynamoDB.
+    If last_run is older than 45 minutes (or missing), generates an alert.
+    Uses daily dedup key so the alert fires at most once per day.
+    """
+    alerts = []
+    alert_key = f"SYSTEM#reconciler#reconciler_heartbeat#{current_date}#stale"
+    if alert_key in sent_alerts:
+        return alerts
+
+    try:
+        response = quota_table.get_item(
+            Key={"pk": "SYSTEM#reconciler", "sk": "HEARTBEAT"}
+        )
+        item = response.get("Item")
+
+        if not item:
+            alerts.append({
+                "user": "SYSTEM#reconciler",
+                "alert_type": "reconciler_heartbeat",
+                "alert_level": "stale",
+                "date": current_date,
+                "month": month_name,
+                "last_run": "never",
+                "minutes_stale": -1,
+            })
+            return alerts
+
+        last_run_str = item.get("last_run", "")
+        try:
+            last_run = datetime.fromisoformat(last_run_str.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            last_run = None
+
+        if last_run is None:
+            alerts.append({
+                "user": "SYSTEM#reconciler",
+                "alert_type": "reconciler_heartbeat",
+                "alert_level": "stale",
+                "date": current_date,
+                "month": month_name,
+                "last_run": last_run_str or "unparseable",
+                "minutes_stale": -1,
+            })
+            return alerts
+
+        now_utc = datetime.now(timezone.utc)
+        minutes_since = (now_utc - last_run).total_seconds() / 60
+
+        if minutes_since > RECONCILER_HEARTBEAT_STALE_MINUTES:
+            alerts.append({
+                "user": "SYSTEM#reconciler",
+                "alert_type": "reconciler_heartbeat",
+                "alert_level": "stale",
+                "date": current_date,
+                "month": month_name,
+                "last_run": last_run_str,
+                "minutes_stale": int(minutes_since),
+            })
+
+    except Exception as e:
+        print(f"Error checking reconciler heartbeat: {e}")
+
+    return alerts
+
+
+def format_reconciler_heartbeat_alert(alert):
+    """Format reconciler heartbeat staleness alert message."""
+    last_run = alert.get("last_run", "unknown")
+    minutes_stale = alert.get("minutes_stale", -1)
+
+    if minutes_stale < 0:
+        staleness_detail = f"Last run: {last_run}"
+    else:
+        staleness_detail = f"Last run: {last_run} ({minutes_stale} minutes ago)"
+
+    return f"""
+=====================================
+PIPELINE HEALTH ALERT
+=====================================
+
+COMPONENT: bedrock_usage_reconciler Lambda
+STATUS: STALE — has not run in over {RECONCILER_HEARTBEAT_STALE_MINUTES} minutes
+DATE: {alert.get('date', 'N/A')}
+
+-------------------------------------
+DETAILS
+-------------------------------------
+{staleness_detail}
+Expected: every 30 minutes (EventBridge schedule)
+Threshold: {RECONCILER_HEARTBEAT_STALE_MINUTES} minutes
+
+-------------------------------------
+IMPACT
+-------------------------------------
+Missed Bedrock usage events will not be reconciled.
+Quota enforcement may be based on stale usage data.
+
+-------------------------------------
+ACTION REQUIRED
+-------------------------------------
+1. Check the reconciler Lambda CloudWatch logs for errors
+2. Verify the EventBridge schedule rule is enabled:
+   aws events describe-rule --name claude-code-reconciler-schedule
+3. Redeploy if needed:
+   ccwb deploy quota
+
+=====================================
+This alert is sent once per day while the reconciler remains stale.
 """

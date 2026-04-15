@@ -394,6 +394,20 @@ class TestCommand(Command):
                 else:
                     test_results.append(("Quota Monitoring", "-", "Skipped (not enabled)"))
 
+                # Test 7: TVM Endpoint (if configured)
+                tvm_endpoint = getattr(profile, "tvm_endpoint", None)
+                if tvm_endpoint:
+                    task = progress.add_task("Testing TVM endpoint...", total=None)
+                    tvm_profile = self._get_package_profile_name(package_dir)
+                    if tvm_profile:
+                        result = self._test_tvm_endpoint(credential_binary, tvm_endpoint, package_dir, tvm_profile)
+                        test_results.append(("TVM Endpoint", result["status"], result["details"]))
+                    else:
+                        test_results.append(("TVM Endpoint", "!", "Could not determine profile from package"))
+                    progress.update(task, completed=True)
+                else:
+                    test_results.append(("TVM Endpoint", "-", "Skipped (tvm_endpoint not configured)"))
+
         # Display results
         console.print("\n")
         for test_name, status, details in test_results:
@@ -863,6 +877,63 @@ class TestCommand(Command):
         except Exception as e:
             return {"status": "✗", "details": str(e)[:50]}
 
+    def _test_tvm_endpoint(
+        self, credential_binary: Path, tvm_endpoint: str, package_dir: Path, profile_name: str
+    ) -> dict:
+        """Test TVM (Token Vending Machine) endpoint for credential issuance."""
+        import urllib.error
+        import urllib.request
+
+        try:
+            # Get JWT token using the monitoring token flag
+            token_result = subprocess.run(
+                [str(credential_binary), "--profile", profile_name, "--get-monitoring-token"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=package_dir,
+            )
+
+            if token_result.returncode != 0 or not token_result.stdout.strip():
+                err_msg = token_result.stderr.strip()[:50] if token_result.stderr else "no output"
+                return {"status": "!", "details": f"Could not get JWT token: {err_msg}"}
+
+            jwt_token = token_result.stdout.strip()
+
+            # Call POST /tvm
+            url = f"{tvm_endpoint.rstrip('/')}/tvm"
+            req = urllib.request.Request(url, method="POST", data=b"")
+            req.add_header("Authorization", f"Bearer {jwt_token}")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("X-OTEL-Helper-Status", "not-configured")
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+
+                if "credentials" in data:
+                    session_duration = data.get("session_duration", "?")
+                    return {"status": "✓", "details": f"TVM issued credentials (session={session_duration}s)"}
+                else:
+                    message = data.get("message", "unexpected response format")
+                    return {"status": "!", "details": f"TVM responded but no credentials: {message}"}
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()[:100]
+                err_data = json.loads(body)
+                reason = err_data.get("reason", "")
+                message = err_data.get("message", "")
+                return {"status": "✗", "details": f"TVM denied ({e.code}): {reason} — {message[:60]}"}
+            except Exception:
+                return {"status": "✗", "details": f"HTTP {e.code}: {body[:60]}"}
+        except urllib.error.URLError as e:
+            return {"status": "✗", "details": f"Connection failed: {str(e.reason)[:50]}"}
+        except subprocess.TimeoutExpired:
+            return {"status": "✗", "details": "Request timed out"}
+        except Exception as e:
+            return {"status": "✗", "details": str(e)[:50]}
+
     def _test_model_invocation(self, profile_name: str, region: str, selected_model: str = None) -> dict:
         """Test actual model invocation using the configured inference profile."""
         try:
@@ -1087,7 +1158,7 @@ class TestCommand(Command):
 
     def _get_user_usage(self, profile, email: str) -> dict:
         """Fetch user usage data from UserQuotaMetrics table."""
-        from datetime import datetime
+        from datetime import datetime, timedelta, timezone
 
         table_name = getattr(profile, "user_quota_metrics_table", None)
         if not table_name:
@@ -1097,19 +1168,26 @@ class TestCommand(Command):
             dynamodb = boto3.resource("dynamodb", region_name=profile.aws_region)
             table = dynamodb.Table(table_name)
 
-            # Get current month
-            current_month = datetime.utcnow().strftime("%Y-%m")
+            # Use UTC+8 to match Bedrock usage pipeline partitioning
+            utc8 = timezone(timedelta(hours=8))
+            now = datetime.now(utc8)
+            current_month = now.strftime("%Y-%m")
+            current_date = now.strftime("%Y-%m-%d")
+            pk = f"USER#{email}"
 
-            # Query for user's monthly usage
-            response = table.get_item(Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"})
+            # Fetch monthly and daily Bedrock usage
+            month_resp = table.get_item(Key={"pk": pk, "sk": f"MONTH#{current_month}#BEDROCK"})
+            day_resp = table.get_item(Key={"pk": pk, "sk": f"DAY#{current_date}#BEDROCK"})
 
-            item = response.get("Item", {})
+            month_item = month_resp.get("Item", {})
+            day_item = day_resp.get("Item", {})
+
             return {
-                "total_tokens": int(item.get("total_tokens", 0)),
-                "daily_tokens": int(item.get("daily_tokens", 0)),
-                "input_tokens": int(item.get("input_tokens", 0)),
-                "output_tokens": int(item.get("output_tokens", 0)),
-                "estimated_cost": item.get("estimated_cost", "0"),
+                "total_tokens": int(month_item.get("total_tokens", 0)),
+                "daily_tokens": int(day_item.get("total_tokens", 0)),
+                "input_tokens": int(month_item.get("input_tokens", 0)),
+                "output_tokens": int(month_item.get("output_tokens", 0)),
+                "estimated_cost": month_item.get("estimated_cost", "0"),
             }
         except Exception:
             return {}

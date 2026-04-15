@@ -976,7 +976,7 @@ class QuotaUsageCommand(Command):
         Returns:
             Dictionary with usage data (total_tokens, daily_tokens, etc.).
         """
-        from datetime import datetime
+        from datetime import datetime, timedelta, timezone
 
         import boto3
 
@@ -995,22 +995,33 @@ class QuotaUsageCommand(Command):
             dynamodb = boto3.resource("dynamodb", region_name=profile.aws_region)
             table = dynamodb.Table(table_name)
 
-            # Get current month
-            current_month = datetime.utcnow().strftime("%Y-%m")
+            # Use UTC+8 to match Bedrock usage pipeline partitioning
+            utc8 = timezone(timedelta(hours=8))
+            now = datetime.now(utc8)
+            current_month = now.strftime("%Y-%m")
+            current_date = now.strftime("%Y-%m-%d")
+            pk = f"USER#{email}"
 
-            # Query for user's monthly usage
-            response = table.get_item(Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"})
+            # Fetch monthly Bedrock usage, daily Bedrock usage, and PROFILE
+            month_resp = table.get_item(Key={"pk": pk, "sk": f"MONTH#{current_month}#BEDROCK"})
+            day_resp = table.get_item(Key={"pk": pk, "sk": f"DAY#{current_date}#BEDROCK"})
+            profile_resp = table.get_item(Key={"pk": pk, "sk": "PROFILE"})
 
-            item = response.get("Item", {})
+            month_item = month_resp.get("Item", {})
+            day_item = day_resp.get("Item", {})
+            profile_item = profile_resp.get("Item", {})
+
+            cache_read = float(month_item.get("cache_read_tokens", 0))
+            cache_write = float(month_item.get("cache_write_tokens", 0))
+
             return {
-                "total_tokens": int(item.get("total_tokens", 0)),
-                "daily_tokens": int(item.get("daily_tokens", 0)),
-                "daily_date": item.get("daily_date"),
-                "input_tokens": int(item.get("input_tokens", 0)),
-                "output_tokens": int(item.get("output_tokens", 0)),
-                "cache_tokens": int(item.get("cache_tokens", 0)),
-                "estimated_cost": item.get("estimated_cost", "0"),
-                "groups": item.get("groups", []),
+                "total_tokens": int(month_item.get("total_tokens", 0)),
+                "daily_tokens": int(day_item.get("total_tokens", 0)),
+                "input_tokens": int(month_item.get("input_tokens", 0)),
+                "output_tokens": int(month_item.get("output_tokens", 0)),
+                "cache_tokens": int(cache_read + cache_write),
+                "estimated_cost": month_item.get("estimated_cost", "0"),
+                "groups": profile_item.get("groups", []),
             }
 
         except Exception:
@@ -1456,57 +1467,63 @@ class QuotaImportCommand(Command):
 # Default pricing for Claude models on Bedrock (per 1M tokens in USD)
 # Source: https://docs.anthropic.com/en/docs/about-claude/pricing
 # Note: 4.6 models use shorter IDs without :0 suffix (e.g. anthropic.claude-opus-4-6-v1)
-# Note: cache_write uses 5-minute cache (1.25x input). 1-hour cache is 2x input.
+# Note: cache_write_per_1m is 5-minute ephemeral cache (1.25x input).
+# cache_write_1h_per_1m is 1-hour ephemeral cache (2x input).
+# The response body provides cache_creation.ephemeral_5m/1h breakdown.
 DEFAULT_BEDROCK_PRICING = {
     # Claude 4.6 (no :0 suffix)
     "anthropic.claude-opus-4-6-v1": {
         "input_per_1m": "5.00", "output_per_1m": "25.00",
-        "cache_read_per_1m": "0.50", "cache_write_per_1m": "6.25",
+        "cache_read_per_1m": "0.50", "cache_write_per_1m": "6.25", "cache_write_1h_per_1m": "10.00",
     },
     "anthropic.claude-sonnet-4-6": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
-        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75", "cache_write_1h_per_1m": "6.00",
     },
     # Claude 4.5
+    "anthropic.claude-opus-4-5-20251101-v1:0": {
+        "input_per_1m": "5.00", "output_per_1m": "25.00",
+        "cache_read_per_1m": "0.50", "cache_write_per_1m": "6.25", "cache_write_1h_per_1m": "10.00",
+    },
     "anthropic.claude-sonnet-4-5-20250929-v1:0": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
-        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75", "cache_write_1h_per_1m": "6.00",
     },
     # Claude 4.1
     "anthropic.claude-opus-4-1-20250805-v1:0": {
         "input_per_1m": "15.00", "output_per_1m": "75.00",
-        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
+        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75", "cache_write_1h_per_1m": "30.00",
     },
     # Claude 4
     "anthropic.claude-sonnet-4-20250514-v1:0": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
-        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75", "cache_write_1h_per_1m": "6.00",
     },
     "anthropic.claude-opus-4-20250514-v1:0": {
         "input_per_1m": "15.00", "output_per_1m": "75.00",
-        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75",
+        "cache_read_per_1m": "1.50", "cache_write_per_1m": "18.75", "cache_write_1h_per_1m": "30.00",
     },
     # Claude Haiku 4.5
     "anthropic.claude-haiku-4-5-20251001-v1:0": {
         "input_per_1m": "1.00", "output_per_1m": "5.00",
-        "cache_read_per_1m": "0.10", "cache_write_per_1m": "1.25",
+        "cache_read_per_1m": "0.10", "cache_write_per_1m": "1.25", "cache_write_1h_per_1m": "2.00",
     },
     # Claude 3.x
     "anthropic.claude-3-7-sonnet-20250219-v1:0": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
-        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75", "cache_write_1h_per_1m": "6.00",
     },
     "anthropic.claude-3-5-sonnet-20241022-v2:0": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
-        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75", "cache_write_1h_per_1m": "6.00",
     },
     "anthropic.claude-3-5-haiku-20241022-v1:0": {
         "input_per_1m": "0.80", "output_per_1m": "4.00",
-        "cache_read_per_1m": "0.08", "cache_write_per_1m": "1.00",
+        "cache_read_per_1m": "0.08", "cache_write_per_1m": "1.00", "cache_write_1h_per_1m": "1.60",
     },
     "DEFAULT": {
         "input_per_1m": "3.00", "output_per_1m": "15.00",
-        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75",
+        "cache_read_per_1m": "0.30", "cache_write_per_1m": "3.75", "cache_write_1h_per_1m": "6.00",
     },
 }
 
@@ -1593,6 +1610,7 @@ class QuotaSetPricingCommand(Command):
                     "output_per_1m": Decimal(prices["output_per_1m"]),
                     "cache_read_per_1m": Decimal(prices["cache_read_per_1m"]),
                     "cache_write_per_1m": Decimal(prices["cache_write_per_1m"]),
+                    "cache_write_1h_per_1m": Decimal(prices.get("cache_write_1h_per_1m", "0")),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
                 pricing_table.put_item(Item=item)
@@ -1626,7 +1644,8 @@ class QuotaSetPricingCommand(Command):
             table.add_column("Input/1M", justify="right")
             table.add_column("Output/1M", justify="right")
             table.add_column("Cache Read/1M", justify="right")
-            table.add_column("Cache Write/1M", justify="right")
+            table.add_column("CW 5m/1M", justify="right")
+            table.add_column("CW 1h/1M", justify="right")
 
             for item in sorted(items, key=lambda x: x.get("model_id", "")):
                 table.add_row(
@@ -1635,6 +1654,7 @@ class QuotaSetPricingCommand(Command):
                     f"${item.get('output_per_1m', 0)}",
                     f"${item.get('cache_read_per_1m', 0)}",
                     f"${item.get('cache_write_per_1m', 0)}",
+                    f"${item.get('cache_write_1h_per_1m', 0)}",
                 )
 
             console.print(table)

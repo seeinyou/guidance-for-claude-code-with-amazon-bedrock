@@ -55,6 +55,7 @@ def load_pricing_cache():
                     "output_per_1m": Decimal(str(item.get("output_per_1m", "0"))),
                     "cache_read_per_1m": Decimal(str(item.get("cache_read_per_1m", "0"))),
                     "cache_write_per_1m": Decimal(str(item.get("cache_write_per_1m", "0"))),
+                    "cache_write_1h_per_1m": Decimal(str(item.get("cache_write_1h_per_1m", "0"))),
                 }
 
         # Handle pagination
@@ -68,6 +69,7 @@ def load_pricing_cache():
                         "output_per_1m": Decimal(str(item.get("output_per_1m", "0"))),
                         "cache_read_per_1m": Decimal(str(item.get("cache_read_per_1m", "0"))),
                         "cache_write_per_1m": Decimal(str(item.get("cache_write_per_1m", "0"))),
+                        "cache_write_1h_per_1m": Decimal(str(item.get("cache_write_1h_per_1m", "0"))),
                     }
 
         print(f"Loaded pricing for {len(_pricing_cache)} models")

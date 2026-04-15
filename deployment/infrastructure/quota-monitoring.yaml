@@ -620,6 +620,17 @@ Resources:
       SQSQueueArn: !GetAtt BedrockLogQueue.Arn
       ForceUpdate: '2026-04-14-v2'
 
+  # --- Shared Lambda Layer for Bedrock usage utilities ---
+  BedrockUsageUtilsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: ClaudeCode-BedrockUsageUtils
+      Description: Shared utilities for Bedrock usage tracking (stream + reconciler)
+      Content: ./lambda-functions/layer/
+      CompatibleRuntimes:
+        - python3.12
+      LicenseInfo: MIT
+
   # --- 6. Bedrock Usage Stream Lambda ---
   BedrockUsageStreamRole:
     Type: AWS::IAM::Role
@@ -678,6 +689,8 @@ Resources:
         Variables:
           QUOTA_TABLE: !Ref UserQuotaMetrics
           PRICING_TABLE: !Ref BedrockPricing
+      Layers:
+        - !Ref BedrockUsageUtilsLayer
       Code: ./lambda-functions/bedrock_usage_stream/
 
   BedrockUsageStreamEventSource:
@@ -755,6 +768,8 @@ Resources:
           BEDROCK_LOG_BUCKET: !GetAtt BedrockLoggingConfig.BucketName
           BEDROCK_LOG_PREFIX: 'bedrock-raw/'
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Layers:
+        - !Ref BedrockUsageUtilsLayer
       Code: ./lambda-functions/bedrock_usage_reconciler/
 
   ReconcilerScheduleRule:

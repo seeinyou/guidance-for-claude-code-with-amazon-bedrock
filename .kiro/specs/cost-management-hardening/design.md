@@ -6,7 +6,7 @@ The current quota/cost management system has several vulnerabilities: it relies 
 
 **Scope**: This design targets **Cognito User Pool** as the sole identity provider. Other IdP integrations (Okta, Azure AD, etc.) are out of scope for this iteration.
 
-The core principle is that **no single client-side component should be able to disable quota enforcement**. The TVM pattern ensures all Bedrock credential issuance flows through a server-side Lambda that validates identity, checks quota, and issues short-lived credentials via STS AssumeRole. **Bedrock Model Invocation Logging (S3) is the single source of truth for usage tracking** — it is AWS-managed, tamper-proof, and independent of any client-side component. The OTEL pipeline remains for real-time operational dashboards but is not used for quota enforcement.
+The core principle is that **no single client-side component should be able to disable quota enforcement**. The TVM pattern ensures all Bedrock credential issuance flows through a server-side Lambda that validates identity, checks quota, and issues short-lived credentials via STS AssumeRole. **Bedrock Model Invocation Logging (S3) is the single source of truth for usage tracking** — it is AWS-managed, tamper-proof, and independent of any client-side component. All consumers (TVM, quota_monitor, landing_page_admin, CLI commands) read from Bedrock records (`MONTH#YYYY-MM#BEDROCK`, `DAY#YYYY-MM-DD#BEDROCK`). The OTEL pipeline (`metrics_aggregator` → `MONTH#YYYY-MM`) still writes records but has no active readers.
 
 ## Architecture
 
@@ -159,8 +159,8 @@ def _call_tvm(self, id_token: str, otel_helper_status: str) -> dict:
 def handle_tvm_request(event: dict) -> dict:
     """Validate JWT, upsert profile, check quota, assume role, return Bedrock credentials."""
 
-def _upsert_profile(email: str) -> None:
-    """Create/update USER#{email} PROFILE record."""
+def _upsert_profile(email: str, claims: dict, groups: list | None = None) -> None:
+    """Create/update USER#{email} PROFILE record. Persists groups from JWT claims."""
 
 def get_user_usage(email: str) -> dict:
     """Read MONTH# and DAY# Bedrock usage records (two point reads, no rollover logic)."""
@@ -296,7 +296,7 @@ PK=USER#{email}, SK=PROFILE
     last_seen: ISO8601 timestamp,        # updated each TVM request
     status: "active" | "disabled",
     sub: str,
-    groups: list[str]
+    groups: list[str]                    # persisted from JWT claims on every TVM request
 }
 
 Bedrock Monthly Usage (new):
@@ -346,7 +346,7 @@ PK=ORG#global, SK=MONTH#YYYY-MM#BEDROCK
 }
 
 Processed Marker (new — written by stream Lambda and reconciler):
-PK=PROCESSED#{sha256(s3_key)[:16]}  (no SK)
+PK=PROCESSED#{sha256(s3_key)[:16]}, SK=MARKER
 {
     s3_key: str,                # original S3 key for debugging
     processed_at: ISO8601 timestamp,
@@ -421,6 +421,7 @@ Note: Every credential-process invocation calls the TVM Lambda. There is no `quo
 - `first_activated` is set only if it did not exist before (DynamoDB `if_not_exists`)
 - `last_seen` is updated to current timestamp
 - `status` defaults to `"active"` on first creation
+- `groups` is overwritten on every call with the current JWT groups (or empty list)
 
 ### _compute_session_duration()
 
@@ -453,7 +454,7 @@ PROCEDURE tvm_handle_request(request)
   IF REQUIRE_OTEL_HELPER AND helper_status != "valid" THEN
     RETURN error "otel-helper required"
 
-  _upsert_profile(email)
+  _upsert_profile(email, claims, groups)
 
   profile ← dynamodb.get(PK="USER#" + email, SK="PROFILE")
   IF profile.status = "disabled" THEN
@@ -801,7 +802,7 @@ The following is the actual JSON schema of a Bedrock Model Invocation Log record
 - For all Bedrock invocations: usage is recorded in both MONTH# and DAY# DynamoDB records within 30 minutes (stream Lambda or reconciler)
 - For all Bedrock invocations: daily usage records (DAY#) are independent per day — event ordering and concurrency cannot corrupt daily totals (all writes are unconditional ADD)
 - For all successfully processed S3 objects: a `PROCESSED#{sha256(s3_key)[:16]}` marker exists in DynamoDB (TTL 48h), preventing duplicate processing by the reconciler
-- For all TVM Lambda calls: `first_activated` is set only on the first call for a given email (idempotent)
+- For all TVM Lambda calls: `first_activated` is set only on the first call for a given email (idempotent); `groups` is overwritten on every call with current JWT groups
 - For all TVM-issued credentials: if `usage/limit >= 0.95`, Bedrock access expires within 60 seconds (server-side via session policy `aws:EpochTime`, client-side via overridden `Expiration`)
 - For all TVM-issued credentials: even if the client caches STS credentials beyond `Expiration`, the session policy denies Bedrock access after `effective_seconds`
 - For all periodic credential refreshes: if both id_token and refresh_token are expired, cached credentials are cleared

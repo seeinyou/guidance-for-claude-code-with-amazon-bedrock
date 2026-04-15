@@ -57,10 +57,22 @@ Parameters:
       - 'false'
     Description: Enable CloudWatch monitoring for Bedrock usage
 
+  TVMEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      When true, Bedrock InvokeModel permissions are removed from the auth role.
+      Bedrock credentials are issued exclusively via the TVM Lambda (quota-monitoring stack).
+      Only enable after TVM is deployed and credential-process clients are updated.
+
 Conditions:
   UseDirectIAM: !Equals [!Ref FederationType, direct]
   UseCognitoIdentity: !Equals [!Ref FederationType, cognito]
   MonitoringEnabled: !Equals [!Ref EnableMonitoring, 'true']
+  TVMDisabled: !Equals [!Ref TVMEnabled, 'false']
   # Partition-aware conditions for Cognito Identity service principals
   IsGovCloudWest: !Equals [!Ref 'AWS::Region', 'us-gov-west-1']
   IsGovCloudEast: !Equals [!Ref 'AWS::Region', 'us-gov-east-1']
@@ -97,32 +109,41 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowBedrockInvokeRegional
-            Effect: Allow
-            Action:
-              - 'bedrock:InvokeModel'
-              - 'bedrock:InvokeModelWithResponseStream'
-              - 'bedrock-runtime:InvokeModel'
-              - 'bedrock-runtime:InvokeModelWithResponseStream'
-              - 'bedrock-runtime:ConverseStream'
-              - 'bedrock-runtime:Converse'
-            Resource:
-              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
-              - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*'
-            Condition:
-              StringEquals:
-                'aws:RequestedRegion': !Ref AllowedBedrockRegions
-          - Sid: AllowBedrockInvokeGlobal
-            Effect: Allow
-            Action:
-              - 'bedrock:InvokeModel'
-              - 'bedrock:InvokeModelWithResponseStream'
-              - 'bedrock-runtime:InvokeModel'
-              - 'bedrock-runtime:InvokeModelWithResponseStream'
-              - 'bedrock-runtime:ConverseStream'
-              - 'bedrock-runtime:Converse'
-            Resource:
-              - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*'
+          # Bedrock Invoke permissions — only when TVM is NOT enabled.
+          # When TVM is enabled, Bedrock credentials are issued via the TVM Lambda
+          # (BedrockUserRole in quota-monitoring stack), not via the auth role.
+          - !If
+            - TVMDisabled
+            - Sid: AllowBedrockInvokeRegional
+              Effect: Allow
+              Action:
+                - 'bedrock:InvokeModel'
+                - 'bedrock:InvokeModelWithResponseStream'
+                - 'bedrock-runtime:InvokeModel'
+                - 'bedrock-runtime:InvokeModelWithResponseStream'
+                - 'bedrock-runtime:ConverseStream'
+                - 'bedrock-runtime:Converse'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*'
+              Condition:
+                StringEquals:
+                  'aws:RequestedRegion': !Ref AllowedBedrockRegions
+            - !Ref 'AWS::NoValue'
+          - !If
+            - TVMDisabled
+            - Sid: AllowBedrockInvokeGlobal
+              Effect: Allow
+              Action:
+                - 'bedrock:InvokeModel'
+                - 'bedrock:InvokeModelWithResponseStream'
+                - 'bedrock-runtime:InvokeModel'
+                - 'bedrock-runtime:InvokeModelWithResponseStream'
+                - 'bedrock-runtime:ConverseStream'
+                - 'bedrock-runtime:Converse'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:::foundation-model/*'
+            - !Ref 'AWS::NoValue'
           - Sid: AllowBedrockListRegional
             Effect: Allow
             Action:

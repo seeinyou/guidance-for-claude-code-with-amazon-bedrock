@@ -119,7 +119,7 @@ def lambda_handler(event, context):
             )
 
         # -- 3. Upsert user profile ------------------------------------------
-        _upsert_profile(email, jwt_claims)
+        _upsert_profile(email, jwt_claims, groups)
 
         # -- 4. Check profile status (disabled?) ------------------------------
         profile = _get_profile(email)
@@ -206,13 +206,14 @@ def _cors_headers() -> dict:
 #  USER PROFILE
 # ===================================================================
 
-def _upsert_profile(email: str, claims: dict) -> None:
+def _upsert_profile(email: str, claims: dict, groups: list | None = None) -> None:
     """
     Create-or-update the user profile record.
 
     Sets ``first_activated`` only on first call (if_not_exists), and
     refreshes ``last_seen`` on every invocation.  ``status`` defaults to
     ``active`` on first creation but is never overwritten afterwards.
+    ``groups`` is overwritten on every call to keep it current.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     sub = claims.get("sub", "")
@@ -224,16 +225,19 @@ def _upsert_profile(email: str, claims: dict) -> None:
                 "SET first_activated = if_not_exists(first_activated, :now), "
                 "last_seen = :now, "
                 "#st = if_not_exists(#st, :active), "
-                "#sub = :sub"
+                "#sub = :sub, "
+                "#groups = :groups"
             ),
             ExpressionAttributeNames={
                 "#st": "status",
                 "#sub": "sub",
+                "#groups": "groups",
             },
             ExpressionAttributeValues={
                 ":now": now_iso,
                 ":active": "active",
                 ":sub": sub,
+                ":groups": groups or [],
             },
         )
     except Exception as exc:

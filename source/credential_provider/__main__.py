@@ -9,7 +9,6 @@ Supports multiple OIDC providers for Bedrock access
 import base64
 import errno
 import hashlib
-import html as html_module
 import json
 import os
 import platform
@@ -21,6 +20,8 @@ import threading
 import time
 import traceback
 import webbrowser
+import logging
+import logging.handlers
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -80,7 +81,7 @@ class MultiProviderAuth:
         self.debug = os.getenv("COGNITO_AUTH_DEBUG", "").lower() in ("1", "true", "yes")
 
         # File logging - always enabled, writes to ~/claude-code-with-bedrock/logs/
-        self._log_file = None
+        self._logger = None
         self._init_file_logging()
 
         try:
@@ -123,23 +124,24 @@ class MultiProviderAuth:
             log_dir = Path.home() / "claude-code-with-bedrock" / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "credential-process.log"
-            # Rotate: keep max 1MB, truncate if larger
-            if log_path.exists() and log_path.stat().st_size > 1_048_576:
-                # Keep last 500KB
-                content = log_path.read_bytes()
-                log_path.write_bytes(content[-524_288:])
-            self._log_file = open(log_path, "a")
+            handler = logging.handlers.TimedRotatingFileHandler(
+                log_path, when="midnight", backupCount=3, utc=True,
+            )
+            fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            fmt.converter = time.gmtime
+            handler.setFormatter(fmt)
+            self._logger = logging.getLogger("credential-process")
+            self._logger.setLevel(logging.DEBUG)
+            self._logger.addHandler(handler)
             self._log(f"--- session start (pid={os.getpid()}) ---")
         except Exception:
-            self._log_file = None  # Non-fatal: logging is best-effort
+            self._logger = None  # Non-fatal: logging is best-effort
 
     def _log(self, message):
         """Write a timestamped message to the log file (always, regardless of debug mode)."""
-        if self._log_file:
+        if self._logger:
             try:
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                self._log_file.write(f"{ts}  {message}\n")
-                self._log_file.flush()
+                self._logger.info(message)
             except Exception:
                 pass
 
@@ -356,6 +358,7 @@ class MultiProviderAuth:
 
                     if not all([keys_json, token1, token2, meta_json]):
                         return None
+                    assert keys_json is not None and token1 is not None and token2 is not None and meta_json is not None
 
                     # Reconstruct credentials
                     keys = json.loads(keys_json)
@@ -1198,7 +1201,7 @@ class MultiProviderAuth:
                 """
                 self.wfile.write(html.encode())
 
-            def log_message(self, format, *args):
+            def log_message(self, _format, *_args):
                 pass  # Suppress logs
 
         return CallbackHandler

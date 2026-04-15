@@ -735,59 +735,45 @@ class QuotaPolicy:
 @dataclass
 class UserQuotaUsage:
     """
-    Tracks a user's quota usage for monitoring and alerting.
+    Tracks a user's quota usage from Bedrock invocation logs.
 
-    Enhanced schema for fine-grained quota tracking including daily limits,
-    cost tracking, and policy attribution.
+    Monthly aggregate record: PK=USER#{email}, SK=MONTH#YYYY-MM#BEDROCK
+    Daily data lives in separate DAY#YYYY-MM-DD#BEDROCK records.
+    Groups and first_activated live on the PROFILE record.
     """
 
     email: str
     month: str  # YYYY-MM format
     total_tokens: int = 0
 
-    # Daily tracking
-    daily_tokens: int = 0
-    daily_date: str | None = None  # YYYY-MM-DD, resets when day changes
-
-    # Token type breakdown for cost calculation
+    # Token type breakdown
     input_tokens: int = 0
     output_tokens: int = 0
-    cache_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
     # Cost tracking
     estimated_cost: Decimal = field(default_factory=lambda: Decimal("0"))
-    daily_cost: Decimal = field(default_factory=lambda: Decimal("0"))
-    daily_cost_date: str | None = None  # YYYY-MM-DD, resets when day changes
 
     # Policy attribution
     applied_policy_type: PolicyType | None = None
     applied_policy_id: str | None = None
-    groups: list[str] = field(default_factory=list)
 
     # Metadata
     last_updated: datetime | None = None
-    first_seen: str | None = None  # ISO timestamp of first appearance
 
     def to_dynamodb_item(self) -> dict[str, Any]:
         """Convert usage to DynamoDB item format."""
         item = {
             "pk": f"USER#{self.email}",
-            "sk": f"MONTH#{self.month}",
-            "email": self.email,
+            "sk": f"MONTH#{self.month}#BEDROCK",
             "total_tokens": self.total_tokens,
-            "daily_tokens": self.daily_tokens,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
-            "cache_tokens": self.cache_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
             "estimated_cost": str(self.estimated_cost),
-            "daily_cost": str(self.daily_cost),
         }
-
-        if self.daily_cost_date:
-            item["daily_cost_date"] = self.daily_cost_date
-
-        if self.daily_date:
-            item["daily_date"] = self.daily_date
 
         if self.applied_policy_type:
             item["applied_policy_type"] = self.applied_policy_type.value
@@ -795,35 +781,27 @@ class UserQuotaUsage:
         if self.applied_policy_id:
             item["applied_policy_id"] = self.applied_policy_id
 
-        if self.groups:
-            item["groups"] = self.groups
-
         if self.last_updated:
             item["last_updated"] = self.last_updated.isoformat()
-
-        if self.first_seen:
-            item["first_seen"] = self.first_seen
 
         return item
 
     @classmethod
     def from_dynamodb_item(cls, item: dict[str, Any]) -> "UserQuotaUsage":
         """Create usage from DynamoDB item."""
+        sk = item["sk"]
+        month = sk.replace("MONTH#", "").replace("#BEDROCK", "")
+        email = item.get("email", item["pk"].replace("USER#", "", 1))
         return cls(
-            email=item["email"],
-            month=item["sk"].replace("MONTH#", ""),
+            email=email,
+            month=month,
             total_tokens=int(item.get("total_tokens", 0)),
-            daily_tokens=int(item.get("daily_tokens", 0)),
-            daily_date=item.get("daily_date"),
             input_tokens=int(item.get("input_tokens", 0)),
             output_tokens=int(item.get("output_tokens", 0)),
-            cache_tokens=int(item.get("cache_tokens", 0)),
+            cache_read_tokens=int(item.get("cache_read_tokens", 0)),
+            cache_write_tokens=int(item.get("cache_write_tokens", 0)),
             estimated_cost=Decimal(item.get("estimated_cost", "0")),
-            daily_cost=Decimal(item.get("daily_cost", "0")),
-            daily_cost_date=item.get("daily_cost_date"),
             applied_policy_type=PolicyType(item["applied_policy_type"]) if item.get("applied_policy_type") else None,
             applied_policy_id=item.get("applied_policy_id"),
-            groups=item.get("groups", []),
             last_updated=datetime.fromisoformat(item["last_updated"]) if item.get("last_updated") else None,
-            first_seen=item.get("first_seen"),
         )
