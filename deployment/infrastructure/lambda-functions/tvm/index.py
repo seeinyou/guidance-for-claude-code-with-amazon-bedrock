@@ -256,17 +256,20 @@ def _get_profile(email: str) -> dict | None:
 
 def get_user_usage(email: str) -> dict:
     """
-    Get usage for the current month (UTC+8 boundaries).
+    Get usage for the current month and current day (UTC+8 boundaries).
 
-    Reads the single ``MONTH#YYYY-MM#BEDROCK`` record — the authoritative
-    source of truth written by the metrics aggregator.
+    Reads two records:
+      - ``MONTH#YYYY-MM#BEDROCK`` for monthly totals
+      - ``DAY#YYYY-MM-DD#BEDROCK`` for today's daily totals
+
+    Both are authoritative — written by the stream / reconciler Lambdas
+    from Bedrock invocation logs.
     """
     now = datetime.now(EFFECTIVE_TZ)
     month = now.strftime("%Y-%m")
     current_date = now.strftime("%Y-%m-%d")
 
     pk = f"USER#{email}"
-    sk = f"MONTH#{month}#BEDROCK"
 
     zero = {
         "total_tokens": 0,
@@ -281,30 +284,31 @@ def get_user_usage(email: str) -> dict:
     }
 
     try:
-        resp = quota_table.get_item(Key={"pk": pk, "sk": sk})
-        item = resp.get("Item")
-        if not item:
+        # Monthly totals
+        month_resp = quota_table.get_item(
+            Key={"pk": pk, "sk": f"MONTH#{month}#BEDROCK"}
+        )
+        month_item = month_resp.get("Item")
+
+        # Daily totals — separate record, no rollover logic needed
+        day_resp = quota_table.get_item(
+            Key={"pk": pk, "sk": f"DAY#{current_date}#BEDROCK"}
+        )
+        day_item = day_resp.get("Item")
+
+        if not month_item and not day_item:
             return zero
 
-        # Reset daily counters if the date has rolled over
-        daily_date = item.get("daily_date")
-        daily_tokens = float(item.get("daily_tokens", 0))
-        daily_cost = float(item.get("daily_cost", 0))
-
-        if daily_date != current_date:
-            daily_tokens = 0
-            daily_cost = 0.0
-
         return {
-            "total_tokens": float(item.get("total_tokens", 0)),
-            "daily_tokens": daily_tokens,
-            "daily_date": daily_date,
-            "estimated_cost": float(item.get("estimated_cost", 0)),
-            "daily_cost": daily_cost,
-            "input_tokens": float(item.get("input_tokens", 0)),
-            "output_tokens": float(item.get("output_tokens", 0)),
-            "cache_read_tokens": float(item.get("cache_read_tokens", 0)),
-            "cache_write_tokens": float(item.get("cache_write_tokens", 0)),
+            "total_tokens": float((month_item or {}).get("total_tokens", 0)),
+            "estimated_cost": float((month_item or {}).get("estimated_cost", 0)),
+            "input_tokens": float((month_item or {}).get("input_tokens", 0)),
+            "output_tokens": float((month_item or {}).get("output_tokens", 0)),
+            "cache_read_tokens": float((month_item or {}).get("cache_read_tokens", 0)),
+            "cache_write_tokens": float((month_item or {}).get("cache_write_tokens", 0)),
+            "daily_tokens": float((day_item or {}).get("total_tokens", 0)),
+            "daily_cost": float((day_item or {}).get("estimated_cost", 0)),
+            "daily_date": current_date,
         }
     except Exception as exc:
         print(f"[TVM] Error reading usage for {email}: {exc}")

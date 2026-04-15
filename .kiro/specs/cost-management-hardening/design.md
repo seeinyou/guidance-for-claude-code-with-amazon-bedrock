@@ -163,7 +163,7 @@ def _upsert_profile(email: str) -> None:
     """Create/update USER#{email} PROFILE record."""
 
 def get_user_usage(email: str) -> dict:
-    """Read Bedrock usage record (single source of truth from invocation logs)."""
+    """Read MONTH# and DAY# Bedrock usage records (two point reads, no rollover logic)."""
 
 def _compute_session_duration(usage: dict, policy: dict) -> Tuple[int, int]:
     """Compute STS DurationSeconds and effective session duration based on quota proximity.
@@ -208,11 +208,11 @@ def extract_email_from_arn(identity_arn: str) -> Optional[str]:
 **Responsibilities**:
 - Consume SQS messages (batches of up to 100, max 60s window)
 - Parse Bedrock invocation log JSON (see [Bedrock Invocation Log Schema](#bedrock-invocation-log-schema-reference) below): extract top-level `timestamp`, `modelId` (full ARN — extract short model ID via last path segment for pricing lookup), `identity.arn` (IAM principal), and nested token counts: `input.inputTokenCount`, `output.outputTokenCount`, `input.cacheReadInputTokenCount`, `input.cacheWriteInputTokenCount`
-- Convert log `timestamp` (UTC) to UTC+8 — use the converted timestamp for both `MONTH#YYYY-MM` partition key and `daily_date` (NOT Lambda wall clock, which would be wrong for delayed/DLQ/reconciler events)
+- Convert log `timestamp` (UTC) to UTC+8 — use the converted timestamp for both `MONTH#YYYY-MM` and `DAY#YYYY-MM-DD` partition keys (NOT Lambda wall clock, which would be wrong for delayed/DLQ/reconciler events)
 - Extract email from RoleSessionName in the IAM principal ARN (strip `ccwb-` prefix: `ccwb-user@example.com` -> `user@example.com`)
 - After reading and parsing each S3 object, write processed marker `PK=PROCESSED#{sha256(s3_key)[:16]}` with TTL=48h — written before email check so that non-TVM logs (IAM users, other roles) are also marked, preventing reconciler from re-reading them on every scan
 - If email cannot be parsed from ARN (non-TVM invocation), log warning and skip — marker already written
-- Atomically `ADD` tokens/cost to `USER#{email} MONTH#YYYY-MM#BEDROCK` record
+- Atomically `ADD` tokens/cost to two independent records: `USER#{email} MONTH#YYYY-MM#BEDROCK` (monthly aggregate) and `USER#{email} DAY#YYYY-MM-DD#BEDROCK` (daily record). Both are unconditional ADD — no conditional expressions, no rollover logic, safe under any event ordering or concurrency
 - Return `ReportBatchItemFailures` for partial batch failures
 
 ### bedrock_usage_reconciler Lambda (New)
@@ -299,7 +299,7 @@ PK=USER#{email}, SK=PROFILE
     groups: list[str]
 }
 
-Bedrock Usage (new):
+Bedrock Monthly Usage (new):
 PK=USER#{email}, SK=MONTH#YYYY-MM#BEDROCK
 {
     input_tokens: int,          # from log.input.inputTokenCount
@@ -308,11 +308,24 @@ PK=USER#{email}, SK=MONTH#YYYY-MM#BEDROCK
     cache_write_tokens: int,    # from log.input.cacheWriteInputTokenCount
     total_tokens: int,          # inputTokenCount + outputTokenCount + cacheReadInputTokenCount + cacheWriteInputTokenCount
     estimated_cost: Decimal,
-    daily_tokens: int,
-    daily_cost: Decimal,
-    daily_date: str,            # YYYY-MM-DD (UTC+8), for conditional daily reset
     last_updated: ISO8601 timestamp
 }
+
+Bedrock Daily Usage (new):
+PK=USER#{email}, SK=DAY#YYYY-MM-DD#BEDROCK
+{
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    total_tokens: int,
+    estimated_cost: Decimal,
+    last_updated: ISO8601 timestamp
+}
+Note: One record per user per day (UTC+8 boundary). Independent of the monthly
+record — no rollover logic needed. Eliminates concurrency/ordering issues.
+TVM reads DAY#{today} for daily quota checks; admin panel can query DAY# range
+for per-day usage history.
 
 Pricing Config (existing BedrockPricing table):
 PK=model_id  (HASH key, no prefix — e.g., "us.anthropic.claude-3-7-sonnet-20250805-v1:0" or "DEFAULT")
@@ -385,12 +398,14 @@ Note: Every credential-process invocation calls the TVM Lambda. There is no `quo
 **Preconditions:**
 - `email` is a non-empty string
 - DynamoDB table is accessible
-- Month prefix is current YYYY-MM
+- Month prefix is current YYYY-MM, day prefix is current YYYY-MM-DD (UTC+8)
 
 **Postconditions:**
 - Returns dict with fields: `total_tokens`, `daily_tokens`, `estimated_cost`, `daily_cost`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`
-- Values come from `MONTH#YYYY-MM#BEDROCK` record (Bedrock invocation logs — single source of truth)
-- Missing record treated as zero for all fields
+- Monthly values come from `MONTH#YYYY-MM#BEDROCK` record
+- Daily values (`daily_tokens`, `daily_cost`) come from `DAY#YYYY-MM-DD#BEDROCK` record for today
+- Missing records treated as zero for all fields
+- Two point reads (monthly + daily), no conditional logic or rollover
 - No side effects
 
 **Loop Invariants:** N/A (single point read, no loops)
@@ -595,44 +610,23 @@ PROCEDURE process_sqs_batch(sqs_event)
 
       cost ← calculate_cost(model_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
       month_sk ← "MONTH#" + log_month + "#BEDROCK"
+      day_sk ← "DAY#" + log_date + "#BEDROCK"
 
-      // Monthly totals: always ADD (atomic, safe for concurrency)
-      // Daily totals: three-step conditional update to handle date rollover safely
-      TRY
-        // Step 1: same day or new record — ADD all fields
-        dynamodb.update(
-          PK="USER#" + email, SK=month_sk,
-          ADD total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost,
-          ADD daily_tokens += total_tokens,
-          ADD daily_cost += cost,
-          ConditionExpression="daily_date = :d OR attribute_not_exists(daily_date)",
-          ExpressionAttributeValues={":d": log_date}
-        )
-      CATCH ConditionalCheckFailedException
-        // Date rolled over — need to reset daily totals
-        TRY
-          // Step 2: first instance to roll over — SET daily, ADD monthly
-          dynamodb.update(
-            PK="USER#" + email, SK=month_sk,
-            ADD total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost,
-            SET daily_tokens = total_tokens,
-            SET daily_cost = cost,
-            SET daily_date = log_date,
-            ConditionExpression="daily_date <> :d",
-            ExpressionAttributeValues={":d": log_date}
-          )
-        CATCH ConditionalCheckFailedException
-          // Another instance already rolled over — daily_date is now today, safe to ADD
-          dynamodb.update(
-            PK="USER#" + email, SK=month_sk,
-            ADD total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost,
-            ADD daily_tokens += total_tokens,
-            ADD daily_cost += cost
-          )
-        END TRY
-      END TRY
+      // Monthly aggregate — unconditional ADD (atomic, safe for concurrency)
+      dynamodb.update(
+        PK="USER#" + email, SK=month_sk,
+        ADD total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost
+      )
 
-      // Update org aggregate (monthly totals only — no daily reset complexity at org level)
+      // Daily record — unconditional ADD to separate record per day
+      // No rollover logic needed; each day is an independent record.
+      // Event ordering does not matter — ADD is commutative.
+      dynamodb.update(
+        PK="USER#" + email, SK=day_sk,
+        ADD total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost
+      )
+
+      // Org aggregate (monthly totals only)
       dynamodb.update(
         PK="ORG#global", SK=month_sk,
         ADD total_tokens += total_tokens,
@@ -730,11 +724,18 @@ def run(self):
 ```
 
 ```python
-# TVM Lambda — get_user_usage() single source (Bedrock invocation logs)
+# TVM Lambda — get_user_usage() reads two records (monthly + daily)
 def get_user_usage(email: str) -> dict:
-    month_sk = f"MONTH#{get_month_prefix()}#BEDROCK"
-    record = _get_usage_record(email, month_sk)
-    return record or _zero_usage()
+    now = datetime.now(EFFECTIVE_TZ)  # UTC+8
+    month_item = get_item(f"USER#{email}", f"MONTH#{now:%Y-%m}#BEDROCK")
+    day_item = get_item(f"USER#{email}", f"DAY#{now:%Y-%m-%d}#BEDROCK")
+    return {
+        "total_tokens": month_item.total_tokens,       # from MONTH#
+        "estimated_cost": month_item.estimated_cost,    # from MONTH#
+        "daily_tokens": day_item.total_tokens,          # from DAY#
+        "daily_cost": day_item.estimated_cost,          # from DAY#
+        ...
+    }
 ```
 
 ## Bedrock Invocation Log Schema Reference
@@ -797,7 +798,8 @@ The following is the actual JSON schema of a Bedrock Model Invocation Log record
 - For all credential-process invocations: if `REQUIRE_OTEL_HELPER` is enabled on the server and helper status is not `"valid"`, no credentials are issued (server-side enforcement)
 - For all credential-process invocations: if TVM Lambda is unreachable, no Bedrock credentials are issued (naturally fail-closed)
 - For all Bedrock invocations via TVM: the ARN contains the user's email in RoleSessionName, enabling direct attribution
-- For all Bedrock invocations: usage is recorded in DynamoDB within 30 minutes (stream Lambda or reconciler)
+- For all Bedrock invocations: usage is recorded in both MONTH# and DAY# DynamoDB records within 30 minutes (stream Lambda or reconciler)
+- For all Bedrock invocations: daily usage records (DAY#) are independent per day — event ordering and concurrency cannot corrupt daily totals (all writes are unconditional ADD)
 - For all successfully processed S3 objects: a `PROCESSED#{sha256(s3_key)[:16]}` marker exists in DynamoDB (TTL 48h), preventing duplicate processing by the reconciler
 - For all TVM Lambda calls: `first_activated` is set only on the first call for a given email (idempotent)
 - For all TVM-issued credentials: if `usage/limit >= 0.95`, Bedrock access expires within 60 seconds (server-side via session policy `aws:EpochTime`, client-side via overridden `Expiration`)
@@ -882,7 +884,7 @@ The following is the actual JSON schema of a Bedrock Model Invocation Log record
 - DynamoDB `ADD` atomic updates are concurrency-safe — no locking needed for parallel stream Lambda invocations
 - Reconciler scans only last 35-minute S3 window (not full bucket) — bounded execution time
 - TVM Lambda caches org policy in memory for 60s — reduces DynamoDB reads
-- `get_user_usage()` does 1 DynamoDB point read (single source: BEDROCK record) — O(1) latency
+- `get_user_usage()` does 2 DynamoDB point reads (MONTH# + DAY#) — O(1) latency each, no conditional logic
 - Org-level quota check does 1 point read on `ORG#global MONTH#YYYY-MM#BEDROCK` — maintained by stream Lambda, no user scan needed
 
 ## Security Considerations

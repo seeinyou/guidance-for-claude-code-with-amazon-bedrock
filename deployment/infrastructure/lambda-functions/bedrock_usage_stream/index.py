@@ -14,7 +14,6 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
 import boto3
-from botocore.exceptions import ClientError
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -180,8 +179,11 @@ def process_invocation_log(bucket: str, s3_key: str) -> None:
 
 def _process_single_entry(log_entry: dict, s3_key: str, bucket: str) -> None:
     """Process a single Bedrock invocation log entry."""
-    # Extract email from identity ARN
-    identity_arn = log_entry.get("identity", {}).get("arn", "")
+    # Extract email from identity ARN (identity may be a dict or list)
+    identity = log_entry.get("identity", {})
+    if isinstance(identity, list):
+        identity = identity[0] if identity else {}
+    identity_arn = identity.get("arn", "") if isinstance(identity, dict) else ""
     email = extract_email_from_arn(identity_arn)
     if email is None:
         logger.warning(
@@ -400,7 +402,7 @@ def _load_pricing_cache() -> None:
 
 
 # ===================================================================
-# Helper: DynamoDB user usage update (three-step conditional)
+# Helper: DynamoDB user usage updates
 # ===================================================================
 
 def _update_user_usage(
@@ -417,17 +419,18 @@ def _update_user_usage(
     now_iso: str,
 ) -> None:
     """
-    Update the per-user monthly usage record using a three-step conditional
-    write pattern for atomic daily reset:
+    Update per-user usage with two independent records:
 
-    Step 1: ADD monthly + daily, conditioned on same day or new record.
-    Step 2 (if Step 1 fails): SET daily to new values + ADD monthly,
-            conditioned on different day (we are the one rolling over).
-    Step 3 (if Step 2 fails): ADD everything (another invocation already
-            rolled over the daily counters).
+    1. MONTH#YYYY-MM#BEDROCK — monthly aggregate (ADD only, no conditions)
+    2. DAY#YYYY-MM-DD#BEDROCK — daily record (ADD only, no conditions)
+
+    Both writes are unconditional ADD operations, so they are safe under
+    concurrency and event ordering does not matter.  Each day's record is
+    independent — no rollover logic needed.
     """
     pk = f"USER#{email}"
-    sk = f"MONTH#{month_key}#BEDROCK"
+    month_sk = f"MONTH#{month_key}#BEDROCK"
+    day_sk = f"DAY#{date_key}#BEDROCK"
 
     token_values = {
         ":input": Decimal(str(input_tokens)),
@@ -436,59 +439,28 @@ def _update_user_usage(
         ":cache_write": Decimal(str(cache_write_tokens)),
         ":total": Decimal(str(total_tokens)),
         ":cost": cost,
-        ":daily_total": Decimal(str(total_tokens)),
-        ":daily_cost": cost,
-        ":date": date_key,
         ":now": now_iso,
     }
 
-    # --- Step 1: same day or brand-new record ---
-    try:
-        quota_table.update_item(
-            Key={"pk": pk, "sk": sk},
-            UpdateExpression=(
-                "ADD input_tokens :input, output_tokens :output, "
-                "cache_read_tokens :cache_read, cache_write_tokens :cache_write, "
-                "total_tokens :total, estimated_cost :cost, "
-                "daily_tokens :daily_total, daily_cost :daily_cost "
-                "SET last_updated = :now"
-            ),
-            ConditionExpression="daily_date = :date OR attribute_not_exists(daily_date)",
-            ExpressionAttributeValues=token_values,
-        )
-        return
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-
-    # --- Step 2: we perform the daily rollover ---
-    try:
-        quota_table.update_item(
-            Key={"pk": pk, "sk": sk},
-            UpdateExpression=(
-                "ADD input_tokens :input, output_tokens :output, "
-                "cache_read_tokens :cache_read, cache_write_tokens :cache_write, "
-                "total_tokens :total, estimated_cost :cost "
-                "SET daily_tokens = :daily_total, daily_cost = :daily_cost, "
-                "daily_date = :date, last_updated = :now"
-            ),
-            ConditionExpression="daily_date <> :date",
-            ExpressionAttributeValues=token_values,
-        )
-        logger.info("Daily rollover for %s on %s", email, date_key)
-        return
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-
-    # --- Step 3: another invocation already rolled over, just ADD ---
+    # --- Monthly aggregate ---
     quota_table.update_item(
-        Key={"pk": pk, "sk": sk},
+        Key={"pk": pk, "sk": month_sk},
         UpdateExpression=(
             "ADD input_tokens :input, output_tokens :output, "
             "cache_read_tokens :cache_read, cache_write_tokens :cache_write, "
-            "total_tokens :total, estimated_cost :cost, "
-            "daily_tokens :daily_total, daily_cost :daily_cost "
+            "total_tokens :total, estimated_cost :cost "
+            "SET last_updated = :now"
+        ),
+        ExpressionAttributeValues=token_values,
+    )
+
+    # --- Daily record ---
+    quota_table.update_item(
+        Key={"pk": pk, "sk": day_sk},
+        UpdateExpression=(
+            "ADD input_tokens :input, output_tokens :output, "
+            "cache_read_tokens :cache_read, cache_write_tokens :cache_write, "
+            "total_tokens :total, estimated_cost :cost "
             "SET last_updated = :now"
         ),
         ExpressionAttributeValues=token_values,

@@ -604,6 +604,9 @@ Resources:
               Service: s3.amazonaws.com
             Action: sqs:SendMessage
             Resource: !GetAtt BedrockLogQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
 
   # Custom Resource to enable Bedrock logging + configure S3 -> SQS notification
   # Placed after SQS resources so the queue ARN is available
