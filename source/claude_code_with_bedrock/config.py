@@ -78,7 +78,8 @@ class Profile:
     # Claude Code settings configuration
     include_coauthored_by: bool = True  # Whether to include "co-authored-by Claude" in git commits
 
-    otel_helper_hash: str | None = None  # SHA256 hash of otel-helper binary for integrity verification
+    otel_helper_hash: str | None = None  # SHA256 hash of otel-helper binary for integrity verification (legacy single-platform)
+    otel_helper_hashes: dict | None = None  # Per-platform SHA256 hashes: {"macos-arm64": "...", "windows": "...", ...}
 
     # Legacy field support
     @property

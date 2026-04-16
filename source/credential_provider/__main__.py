@@ -620,16 +620,34 @@ class MultiProviderAuth:
         Returns status: 'valid', 'missing', 'hash-mismatch', 'not-configured'.
         Does NOT exit — status is reported to TVM Lambda for server-side enforcement.
         """
-        expected_hash = self.config.get("otel_helper_hash")
-        if not expected_hash:
+        # Support per-platform hashes (new) and legacy single hash (old)
+        hashes = self.config.get("otel_helper_hashes")
+        legacy_hash = self.config.get("otel_helper_hash")
+
+        if not hashes and not legacy_hash:
             print("Warning: otel_helper_hash not configured — integrity check skipped", file=sys.stderr)
             return "not-configured"
 
-        # Determine binary path based on platform
+        # Resolve expected hash for current platform
+        if hashes:
+            platform_key = self._get_otel_platform_key()
+            expected_hash = hashes.get(platform_key)
+            if not expected_hash:
+                print(f"Warning: no otel-helper hash for platform '{platform_key}' — integrity check skipped", file=sys.stderr)
+                return "not-configured"
+        else:
+            expected_hash = legacy_hash
+
+        # Determine binary path — hash the actual binary (otel-helper-bin), not the shell wrapper
         if platform.system() == "Windows":
             helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper.exe"
         else:
-            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
+            # Prefer otel-helper-bin (the PyInstaller binary that was hashed at build time)
+            # The shell wrapper (otel-helper) is a cache layer and not what was hashed
+            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper-bin"
+            if not helper_path.exists():
+                # Fallback: no shell wrapper installed, binary is otel-helper directly
+                helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
 
         if not helper_path.exists():
             print(f"Warning: otel-helper binary not found at {helper_path}", file=sys.stderr)
@@ -648,6 +666,24 @@ class MultiProviderAuth:
 
         self._debug_print("otel-helper integrity check passed")
         return "valid"
+
+    @staticmethod
+    def _get_otel_platform_key() -> str:
+        """Return the otel_helper_hashes key for the current OS+arch."""
+        system = platform.system().lower()
+        machine = platform.machine().lower()
+
+        if system == "darwin":
+            if machine == "arm64":
+                return "macos-arm64"
+            return "macos-intel"
+        elif system == "windows":
+            return "windows"
+        elif system == "linux":
+            if machine in ("aarch64", "arm64"):
+                return "linux-arm64"
+            return "linux-x64"
+        return f"{system}-{machine}"
 
     def _call_tvm(self, id_token: str, otel_helper_status: str) -> dict:
         """Call TVM Lambda via API Gateway to obtain Bedrock credentials.

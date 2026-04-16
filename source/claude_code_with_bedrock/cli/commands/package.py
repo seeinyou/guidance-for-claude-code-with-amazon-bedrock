@@ -329,18 +329,18 @@ class PackageCommand(Command):
                         console.print(f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]")
 
         # Compute SHA256 hash of built otel-helper binaries for integrity verification
-        otel_helper_hash = None
+        otel_helper_hashes = {}
         if built_otel_helpers:
-            # Use the first built helper's hash (all should be platform-specific,
-            # the hash for the user's platform will be set during installation)
+            import hashlib
             for platform_name, otel_helper_path in built_otel_helpers:
-                import hashlib
                 sha256 = hashlib.sha256()
                 with open(otel_helper_path, "rb") as f:
                     for chunk in iter(lambda: f.read(8192), b""):
                         sha256.update(chunk)
-                otel_helper_hash = sha256.hexdigest()
-                console.print(f"  [dim]SHA256 ({platform_name}): {otel_helper_hash}[/dim]")
+                # Normalize generic platform names to specific keys that match runtime detection
+                hash_key = self._normalize_otel_platform_key(platform_name)
+                otel_helper_hashes[hash_key] = sha256.hexdigest()
+                console.print(f"  [dim]SHA256 ({hash_key}): {otel_helper_hashes[hash_key]}[/dim]")
 
         # Check if any binaries were built
         if not built_executables:
@@ -352,7 +352,7 @@ class PackageCommand(Command):
         console.print("\n[cyan]Creating configuration...[/cyan]")
         # Pass the appropriate identifier based on federation type
         federation_identifier = federated_role_arn if federation_type == "direct" else identity_pool_id
-        self._create_config(output_dir, profile, federation_identifier, federation_type, profile_name, otel_helper_hash=otel_helper_hash)
+        self._create_config(output_dir, profile, federation_identifier, federation_type, profile_name, otel_helper_hashes=otel_helper_hashes)
 
         # Create installer
         console.print("[cyan]Creating installer script...[/cyan]")
@@ -1426,6 +1426,22 @@ RUN pyinstaller \
 
         return source_zip
 
+    @staticmethod
+    def _normalize_otel_platform_key(platform_name: str) -> str:
+        """Normalize build-time platform names to the canonical keys used at runtime.
+
+        Build can produce generic names like "macos" or "linux"; runtime detection
+        always returns specific keys like "macos-arm64" or "linux-x64".
+        """
+        import platform as platform_module
+
+        if platform_name == "macos":
+            return "macos-arm64" if platform_module.machine().lower() == "arm64" else "macos-intel"
+        if platform_name == "linux":
+            machine = platform_module.machine().lower()
+            return "linux-arm64" if machine in ("aarch64", "arm64") else "linux-x64"
+        return platform_name
+
     def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build executable for OTEL helper script."""
         # Windows uses Nuitka via CodeBuild
@@ -1683,7 +1699,7 @@ RUN pyinstaller \
         federation_identifier: str,
         federation_type: str = "cognito",
         profile_name: str = "ClaudeCode",
-        otel_helper_hash: str | None = None,
+        otel_helper_hashes: dict | None = None,
     ) -> Path:
         """Create the configuration file.
 
@@ -1693,6 +1709,7 @@ RUN pyinstaller \
             federation_identifier: Identity pool ID or role ARN
             federation_type: "cognito" or "direct"
             profile_name: Name to use as key in config.json (defaults to "ClaudeCode" for backward compatibility)
+            otel_helper_hashes: Per-platform SHA256 hashes, e.g. {"macos-arm64": "abc...", "windows": "def..."}
         """
         profile_data = {
             "provider_domain": profile.provider_domain,
@@ -1732,9 +1749,9 @@ RUN pyinstaller \
         if hasattr(profile, 'tvm_request_timeout') and profile.tvm_request_timeout:
             config[profile_name]["tvm_request_timeout"] = profile.tvm_request_timeout
 
-        # Add otel-helper hash for integrity verification
-        if otel_helper_hash:
-            config[profile_name]["otel_helper_hash"] = otel_helper_hash
+        # Add otel-helper hashes for integrity verification (per-platform)
+        if otel_helper_hashes:
+            config[profile_name]["otel_helper_hashes"] = otel_helper_hashes
 
         config_path = output_dir / "config.json"
         with open(config_path, "w") as f:
@@ -1802,20 +1819,7 @@ echo
 echo "Organization: {profile.provider_domain}"
 echo
 
-
-# Check prerequisites
-echo "Checking prerequisites..."
-
-if ! command -v aws &> /dev/null; then
-    echo "❌ AWS CLI is not installed"
-    echo "   Please install from https://aws.amazon.com/cli/"
-    exit 1
-fi
-
-echo "✓ Prerequisites found"
-
 # Detect platform and architecture
-echo
 echo "Detecting platform and architecture..."
 if [[ "$OSTYPE" == "darwin"* ]]; then
     PLATFORM="macos"
@@ -1961,23 +1965,31 @@ else
     DEFAULT_REGION="{profile.aws_region}"
 fi
 
-# Configure each profile
+# Back up existing config before modifying
+[ -f ~/.aws/config ] && cp ~/.aws/config ~/.aws/config.bak
+
+# Configure each profile (idempotent — safe to re-run)
 for PROFILE_NAME in $PROFILES; do
     echo "Configuring AWS profile: $PROFILE_NAME"
-
-    # Remove old profile if exists
-    sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
 
     # Get profile-specific region from config.json
     PROFILE_REGION=$(python3 -c "import json; print(json.load(open('config.json')).get('$PROFILE_NAME', \
     {{}}).get('aws_region', '$DEFAULT_REGION'))")
 
-    # Add new profile with --profile flag (cross-platform, no shell required)
-    cat >> ~/.aws/config << EOF
-[profile $PROFILE_NAME]
-credential_process = $HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME
-region = $PROFILE_REGION
-EOF
+    # Use Python configparser for safe, idempotent ini writes (no duplicates on re-install)
+    python3 -c "
+import configparser, os
+config_path = os.path.expanduser('~/.aws/config')
+c = configparser.RawConfigParser()
+c.read(config_path)
+section = 'profile $PROFILE_NAME'
+if not c.has_section(section):
+    c.add_section(section)
+c.set(section, 'credential_process', '$HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME')
+c.set(section, 'region', '$PROFILE_REGION')
+with open(config_path, 'w') as f:
+    c.write(f)
+"
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
 done
 
@@ -2030,20 +2042,6 @@ echo.
 echo Organization: {profile.provider_domain}
 echo.
 
-REM Check prerequisites
-echo Checking prerequisites...
-
-where aws >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: AWS CLI is not installed
-    echo        Please install from https://aws.amazon.com/cli/
-    pause
-    exit /b 1
-)
-
-echo OK Prerequisites found
-echo.
-
 REM Create directory
 echo Installing authentication tools...
 if not exist "%USERPROFILE%\\claude-code-with-bedrock" mkdir "%USERPROFILE%\\claude-code-with-bedrock"
@@ -2068,64 +2066,65 @@ echo Copying configuration...
 copy /Y "config.json" "%USERPROFILE%\\claude-code-with-bedrock\\" >nul
 
 REM Copy Claude Code settings if they exist
-if exist "claude-settings" (
-    echo Copying Claude Code telemetry settings...
-    if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
+if not exist "claude-settings" goto :skip_settings
+if not exist "claude-settings\\settings.json" goto :skip_settings
 
-    REM Copy settings and replace placeholders
-    if exist "claude-settings\\settings.json" (
-        set SKIP_SETTINGS=false
-        if exist "%USERPROFILE%\\.claude\\settings.json" (
-            echo Existing Claude Code settings found
-            set /p OVERWRITE="Overwrite with new settings? (y/n): "
-            if /i not "%OVERWRITE%"=="y" (
-                echo Skipping Claude Code settings...
-                set SKIP_SETTINGS=true
-            )
-        )
+echo Copying Claude Code telemetry settings...
+if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
 
-        if not "%SKIP_SETTINGS%"=="true" (
-            REM Use PowerShell to replace placeholders
-            powershell -Command ^
-            "$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
-            -replace '\\\\\\\\', '/'; ^
-            $credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
-            -replace '\\\\\\\\', '/'; ^
-            (Get-Content 'claude-settings\\\\settings.json') ^
-            -replace '__OTEL_HELPER_PATH__', $otelPath ^
-            -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | ^
-            Set-Content '%USERPROFILE%\\\\.claude\\\\settings.json'"
-            echo OK Claude Code settings configured
-        )
-    )
+REM Check if settings file already exists and prompt user
+set SKIP_SETTINGS=false
+if exist "%USERPROFILE%\\.claude\\settings.json" (
+    echo Existing Claude Code settings found
+    set /p OVERWRITE="Overwrite with new settings? (y/n): "
 )
+if defined OVERWRITE if /i not "%OVERWRITE%"=="y" set SKIP_SETTINGS=true
+
+if "%SKIP_SETTINGS%"=="true" (
+    echo Skipping Claude Code settings...
+    goto :skip_settings
+)
+
+REM Use PowerShell to replace placeholders and write settings
+powershell -Command ^
+"$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
+-replace '\\\\', '/'; ^
+$credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
+-replace '\\\\', '/'; ^
+(Get-Content 'claude-settings\\\\settings.json') ^
+-replace '__OTEL_HELPER_PATH__', $otelPath ^
+-replace '__CREDENTIAL_PROCESS_PATH__', $credPath | ^
+Set-Content '%USERPROFILE%\\\\.claude\\\\settings.json'"
+echo OK Claude Code settings configured
+
+:skip_settings
 
 REM Configure AWS profiles
 echo.
 echo Configuring AWS profiles...
 
-REM Read profiles from config.json using PowerShell
-for /f %%p in ('powershell -Command "(ConvertFrom-Json -InputObject (Get-Content config.json -Raw)).PSObject.Properties.Name"') do (
-    echo Configuring AWS profile: %%p
-
-    REM Get profile-specific region
-    for /f %%r in ('powershell -Command "(ConvertFrom-Json -InputObject (Get-Content config.json -Raw)).'%%p'.aws_region"') do set PROFILE_REGION=%%r
-
-
-    REM Set credential process with --profile flag (cross-platform, no wrapper needed)
-    aws configure set credential_process ^
-    "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe --profile %%p" --profile %%p
-
-
-    REM Set region
-    if defined PROFILE_REGION (
-        aws configure set region !PROFILE_REGION! --profile %%p
-    ) else (
-        aws configure set region {profile.aws_region} --profile %%p
-    )
-
-    echo   OK Created AWS profile '%%p'
-)
+REM Read profiles from config.json and configure AWS profiles using PowerShell (idempotent)
+powershell -Command ^
+"$configJson = ConvertFrom-Json -InputObject (Get-Content config.json -Raw); ^
+$awsDir = \"$env:USERPROFILE\\.aws\"; ^
+if (!(Test-Path $awsDir)) {{ New-Item -ItemType Directory -Path $awsDir | Out-Null }}; ^
+$configPath = \"$awsDir\\config\"; ^
+if (Test-Path $configPath) {{ Copy-Item $configPath \"$configPath.bak\" }}; ^
+$content = if (Test-Path $configPath) {{ Get-Content $configPath -Raw }} else {{ '' }}; ^
+foreach ($p in $configJson.PSObject.Properties.Name) {{ ^
+    Write-Host \"Configuring AWS profile: $p\"; ^
+    $region = if ($configJson.$p.aws_region) {{ $configJson.$p.aws_region }} else {{ '{profile.aws_region}' }}; ^
+    $credProc = \"$env:USERPROFILE\\claude-code-with-bedrock\\credential-process.exe --profile $p\"; ^
+    $section = \"[profile $p]\"; ^
+    $newBlock = \"$section`r`ncredential_process = $credProc`r`nregion = $region`r`n\"; ^
+    if ($content -match \"(?ms)\\[profile $p\\].*?(?=\\[|\\z)\") {{ ^
+        $content = $content -replace \"(?ms)\\[profile $p\\].*?(?=\\[|\\z)\", $newBlock; ^
+    }} else {{ ^
+        $content = $content.TrimEnd() + \"`r`n`r`n\" + $newBlock; ^
+    }}; ^
+    Write-Host \"  OK Created AWS profile '$p'\"; ^
+}}; ^
+Set-Content -Path $configPath -Value $content.TrimEnd()"
 
 echo.
 echo ======================================

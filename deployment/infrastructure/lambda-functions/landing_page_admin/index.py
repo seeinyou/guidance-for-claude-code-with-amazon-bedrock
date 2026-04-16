@@ -1062,12 +1062,16 @@ def api_list_users(event):
                 daily_cost_limit = float(policy["daily_cost_limit"]) if policy.get("daily_cost_limit") else None
                 if monthly_limit > 0 and user["total_tokens"] >= monthly_limit:
                     user["is_blocked"] = True
+                    user["blocked_reason"] = "monthly_tokens"
                 elif monthly_cost_limit and monthly_cost_limit > 0 and user["estimated_cost"] >= monthly_cost_limit:
                     user["is_blocked"] = True
+                    user["blocked_reason"] = "monthly_cost"
                 elif daily_limit and daily_limit > 0 and user["daily_tokens"] >= daily_limit:
                     user["is_blocked"] = True
+                    user["blocked_reason"] = "daily_tokens"
                 elif daily_cost_limit and daily_cost_limit > 0 and user["daily_cost"] >= daily_cost_limit:
                     user["is_blocked"] = True
+                    user["blocked_reason"] = "daily_cost"
         except Exception as e:
             print(f"Error computing blocked status: {e}")
             for user in users:
@@ -1461,6 +1465,7 @@ html, body {
 .badge-alert   { background: var(--warn-bg); color: var(--warn); }
 .badge-block   { background: #FDE7E9; color: #C42B1C; }
 .badge-enabled  { background: var(--ok-bg); color: var(--ok); }
+.badge-unblocked { background: var(--warn-bg); color: #B45309; }
 .badge-disabled { background: var(--surface); color: var(--text-muted); }
 .badge-admin   { background: #F0A500; color: #1A1D23; }
 .badge-standard { background: var(--surface); color: var(--text-secondary); }
@@ -2511,9 +2516,22 @@ def generate_admin_page(admin_email):
 
     document.getElementById('usage-list-body').innerHTML = pageRows.map(u => {{
       const isDisabled = u.status === 'disabled';
-      const statusBadgeHtml = isDisabled
-        ? '<span class="badge badge-block">Disabled</span>'
-        : '<span class="badge badge-enabled">Active</span>';
+      let statusBadgeHtml;
+      if (isDisabled) {{
+        statusBadgeHtml = '<span class="badge badge-disabled">Disabled</span>';
+      }} else if (u.is_blocked && !u.unblock) {{
+        const reasonMap = {{monthly_tokens:'Monthly tokens',monthly_cost:'Monthly cost',daily_tokens:'Daily tokens',daily_cost:'Daily cost'}};
+        const reason = reasonMap[u.blocked_reason] || 'Quota';
+        statusBadgeHtml = `<span class="badge badge-block" title="${{reason}} limit reached">Blocked</span>`
+          + `<span style="display:block;font-size:10px;color:#C42B1C;margin-top:2px">${{reason}}</span>`;
+      }} else if (u.unblock) {{
+        const exp = escAttr(new Date(u.unblock.expires_at).toLocaleString());
+        const by = escAttr(u.unblock.unblocked_by || 'unknown');
+        statusBadgeHtml = `<span class="badge badge-unblocked" title="By: ${{by}}&#10;Expires: ${{exp}}">Unblocked</span>`
+          + `<span style="display:block;font-size:10px;color:#B45309;margin-top:2px">until ${{new Date(u.unblock.expires_at).toLocaleDateString(undefined,{{month:'short',day:'numeric'}})}}</span>`;
+      }} else {{
+        statusBadgeHtml = '<span class="badge badge-enabled">Active</span>';
+      }}
       const emailSafe = escAttr(u.email);
       const actionBtn = isDisabled
         ? `<button class="btn btn-sm" style="background:var(--ok);color:#fff" onclick="event.stopPropagation();toggleUserStatus('${{emailSafe}}','enable')">Enable</button>`

@@ -134,16 +134,27 @@ def lambda_handler(event, context):
         # -- 7. Get current usage ---------------------------------------------
         usage = get_user_usage(email)
 
-        # -- 8. Check all quota dimensions ------------------------------------
-        if policy is not None:
+        # -- 8. Check for active unblock override -----------------------------
+        unblock_remaining = _get_unblock_remaining(email)
+        is_unblocked = unblock_remaining is not None
+        if is_unblocked:
+            print(f"[TVM] User {email} is temporarily unblocked — {unblock_remaining}s remaining, skipping quota enforcement")
+
+        # -- 9. Check all quota dimensions ------------------------------------
+        if policy is not None and not is_unblocked:
             block = _check_quota_limits(usage, policy)
             if block:
                 return _error(429, block["reason"], block["message"])
 
-        # -- 9. Compute adaptive session duration -----------------------------
+        # -- 10. Compute adaptive session duration ----------------------------
         max_duration, effective_seconds = _compute_session_duration(usage, policy)
 
-        # -- 10. Assume role and return credentials ---------------------------
+        # Cap to unblock remaining time (min 60s, max 900s)
+        if is_unblocked and unblock_remaining < effective_seconds:
+            effective_seconds = max(60, min(unblock_remaining, 900))
+            print(f"[TVM] Capped session to {effective_seconds}s (unblock expiry)")
+
+        # -- 11. Assume role and return credentials ---------------------------
         credentials = _assume_role_for_user(email, effective_seconds)
 
         return _success(200, {
@@ -482,6 +493,36 @@ def check_org_limits() -> dict | None:
         }
 
     return None
+
+
+# ===================================================================
+#  UNBLOCK CHECK
+# ===================================================================
+
+def _get_unblock_remaining(email: str) -> int | None:
+    """Return remaining seconds on an active unblock override, or None."""
+    try:
+        resp = quota_table.get_item(
+            Key={"pk": f"USER#{email}", "sk": "UNBLOCK#CURRENT"}
+        )
+        item = resp.get("Item")
+        if not item:
+            return None
+
+        expires_at = item.get("expires_at")
+        if not expires_at:
+            # No expiry recorded — treat as indefinitely unblocked
+            return 900
+
+        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        remaining = int((expires_dt - datetime.now(timezone.utc)).total_seconds())
+        if remaining <= 0:
+            return None
+
+        return remaining
+    except Exception as exc:
+        print(f"[TVM] Error checking unblock status for {email}: {exc}")
+        return None
 
 
 # ===================================================================
