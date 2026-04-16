@@ -654,10 +654,17 @@ class MultiProviderAuth:
                 if not helper_path.exists():
                     helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
         else:
-            # Linux: prefer otel-helper-bin (the PyInstaller binary that was hashed at build time)
-            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper-bin"
-            if not helper_path.exists():
-                helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
+            # Linux: try directory-mode path first (PyInstaller --onedir), then legacy flat paths
+            arch = platform.machine().lower()
+            suffix = "arm64" if arch in ("aarch64", "arm64") else "x64"
+            dir_path = Path.home() / "claude-code-with-bedrock" / f"otel-helper-linux-{suffix}" / f"otel-helper-linux-{suffix}"
+            if dir_path.exists():
+                helper_path = dir_path
+            else:
+                # Fallback to legacy flat paths
+                helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper-bin"
+                if not helper_path.exists():
+                    helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
 
         if not helper_path.exists():
             print(f"Warning: otel-helper binary not found at {helper_path}", file=sys.stderr)

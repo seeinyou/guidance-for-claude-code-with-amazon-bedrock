@@ -668,11 +668,8 @@ class PackageCommand(Command):
             f"--output-dir={str(output_dir)}",
         ]
 
-        # Windows uses --standalone only (directory mode) to avoid antivirus
-        # false positives caused by --onefile self-extraction behavior.
-        # Other platforms keep --onefile for single-binary distribution.
-        if target_platform != "windows":
-            nuitka_flags.append("--onefile")
+        # All platforms use --standalone (directory mode) to avoid antivirus
+        # false positives and self-extraction startup latency from --onefile.
 
         # Only add --quiet if not in verbose mode
         verbose = self.option("build-verbose")
@@ -698,11 +695,7 @@ class PackageCommand(Command):
                 ]
             )
         elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",  # No icon for Linux
-                ]
-            )
+            pass  # No additional flags needed for Linux standalone mode
 
         # Add the source file
         cmd.append(str(src_file))
@@ -859,12 +852,13 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command — use --onedir (directory mode) for faster startup.
+        # --onefile extracts to a temp dir on every launch, adding 1-2s latency.
         cmd = [
             "poetry",
             "run",
             "pyinstaller",
-            "--onefile",
+            "--onedir",
             "--clean",
             "--noconfirm",
             f"--name={binary_name}",
@@ -892,13 +886,15 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
+        # --onedir produces output_dir/binary_name/ directory with binary_name inside
+        dir_path = output_dir / binary_name
+        exe_path = dir_path / binary_name
+        if dir_path.exists() and exe_path.exists():
+            exe_path.chmod(0o755)
             console.print("[green]✓ Linux binary built successfully with PyInstaller[/green]")
-            return binary_path
+            return exe_path
         else:
-            raise RuntimeError(f"Binary not created: {binary_path}")
+            raise RuntimeError(f"Binary directory not created: {dir_path}")
 
     def _build_linux_via_docker(self, output_dir: Path, arch: str = "x64") -> Path:
         """Build Linux binaries using Docker with PyInstaller."""
@@ -989,9 +985,9 @@ WORKDIR /build
 # Copy source code
 COPY credential_provider /build/credential_provider
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller (--onedir for faster startup)
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -1009,7 +1005,7 @@ RUN pyinstaller \
     --hidden-import dateutil \
     credential_provider/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The output will be in /output/{binary_name}/ directory
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1052,7 +1048,7 @@ RUN pyinstaller \
             if build_result.returncode != 0:
                 raise RuntimeError(f"Docker build failed: {build_result.stderr}")
 
-            # Run container and copy binary out
+            # Run container and copy directory out
             import time
 
             container_name = f"ccwb-extract-{arch}-{int(time.time())}"
@@ -1068,7 +1064,7 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy directory from container (--onedir produces /output/binary_name/ directory)
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1078,16 +1074,17 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
-                if not binary_path.exists():
-                    raise RuntimeError(f"Linux {arch} binary was not created successfully")
+                # Verify the directory and executable were created
+                dir_path = output_dir / binary_name
+                exe_path = dir_path / binary_name
+                if not dir_path.exists() or not exe_path.exists():
+                    raise RuntimeError(f"Linux {arch} binary directory was not created successfully")
 
                 # Make it executable
-                binary_path.chmod(0o755)
+                exe_path.chmod(0o755)
 
                 console.print(f"[green]✓ Linux {arch} binary built successfully via Docker[/green]")
-                return binary_path
+                return exe_path
 
             finally:
                 # Clean up container and image
@@ -1172,9 +1169,9 @@ WORKDIR /build
 # Copy source code
 COPY otel_helper /build/otel_helper
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller (--onedir for faster startup)
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -1186,7 +1183,7 @@ RUN pyinstaller \
     --hidden-import six.moves \
     otel_helper/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The output will be in /output/{binary_name}/ directory
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1229,7 +1226,7 @@ RUN pyinstaller \
             if build_result.returncode != 0:
                 raise RuntimeError(f"Docker build failed for OTEL helper: {build_result.stderr}")
 
-            # Run container and copy binary out
+            # Run container and copy directory out
             import time
 
             container_name = f"ccwb-otel-extract-{arch}-{int(time.time())}"
@@ -1245,7 +1242,7 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy directory from container (--onedir produces /output/binary_name/ directory)
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1255,16 +1252,17 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy OTEL binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
-                if not binary_path.exists():
-                    raise RuntimeError(f"Linux {arch} OTEL helper binary was not created successfully")
+                # Verify the directory and executable were created
+                dir_path = output_dir / binary_name
+                exe_path = dir_path / binary_name
+                if not dir_path.exists() or not exe_path.exists():
+                    raise RuntimeError(f"Linux {arch} OTEL helper directory was not created successfully")
 
                 # Make it executable
-                binary_path.chmod(0o755)
+                exe_path.chmod(0o755)
 
                 console.print(f"[green]✓ Linux {arch} OTEL helper built successfully via Docker[/green]")
-                return binary_path
+                return exe_path
 
             finally:
                 # Clean up container and image
@@ -1552,10 +1550,10 @@ RUN pyinstaller \
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command — use --onedir for macOS (faster startup),
-        # --onefile for Linux (simpler deployment in Docker/containers)
-        onedir = platform_name == "macos"
-        mode_flag = "--onedir" if onedir else "--onefile"
+        # Build PyInstaller command — use --onedir (directory mode) for faster startup.
+        # --onefile extracts to a temp dir on every launch, adding 1-2s latency.
+        onedir = True
+        mode_flag = "--onedir"
 
         if use_x86_python:
             # Use x86_64 Python environment
@@ -1881,12 +1879,12 @@ else
     exit 1
 fi
 
-# Check if binary for platform exists (directory mode for macOS, single file for Linux)
+# Check if binary for platform exists (directory mode for all platforms, single file as fallback)
 CREDENTIAL_BINARY="credential-process-$BINARY_SUFFIX"
 OTEL_BINARY="otel-helper-$BINARY_SUFFIX"
 
 if [ -d "$CREDENTIAL_BINARY" ]; then
-    # Directory mode (macOS) — exe is inside the directory
+    # Directory mode — exe is inside the directory
     if [ ! -f "$CREDENTIAL_BINARY/$CREDENTIAL_BINARY" ]; then
         echo "❌ Binary not found inside directory: $CREDENTIAL_BINARY/$CREDENTIAL_BINARY"
         exit 1
@@ -1909,7 +1907,7 @@ mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
 if [ "$BINARY_MODE" = "dir" ]; then
-    # Directory mode — copy entire directory
+    # Directory mode — copy entire directory tree
     rm -rf ~/claude-code-with-bedrock/"$CREDENTIAL_BINARY"
     cp -r "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/
     chmod +x ~/claude-code-with-bedrock/"$CREDENTIAL_BINARY"/"$CREDENTIAL_BINARY"
@@ -1973,7 +1971,7 @@ fi
 
 # Copy OTEL helper executable
 if [ -d "$OTEL_BINARY" ] && [ -f "$OTEL_BINARY/$OTEL_BINARY" ]; then
-    # Directory mode (macOS) — copy entire directory
+    # Directory mode — copy entire directory
     echo
     echo "Installing OTEL helper..."
     rm -rf ~/claude-code-with-bedrock/"$OTEL_BINARY"
@@ -1982,7 +1980,7 @@ if [ -d "$OTEL_BINARY" ] && [ -f "$OTEL_BINARY/$OTEL_BINARY" ]; then
     xattr -d com.apple.quarantine ~/claude-code-with-bedrock/"$OTEL_BINARY"/"$OTEL_BINARY" 2>/dev/null || true
     echo "✓ OTEL helper installed"
 elif [ -f "$OTEL_BINARY" ]; then
-    # Single file mode (Linux)
+    # Single file mode (legacy fallback)
     echo
     echo "Installing OTEL helper..."
     cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
