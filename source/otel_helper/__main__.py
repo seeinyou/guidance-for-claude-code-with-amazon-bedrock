@@ -267,6 +267,15 @@ def get_token_via_credential_process():
         credential_process = os.path.expanduser(
             "~/claude-code-with-bedrock/credential-process-windows/credential-process.exe"
         )
+    elif platform.system() == "Darwin":
+        # macOS: try directory-mode path first (PyInstaller --onedir), then flat path
+        arch = platform.machine().lower()
+        suffix = "arm64" if arch == "arm64" else "intel"
+        dir_path = os.path.expanduser(
+            f"~/claude-code-with-bedrock/credential-process-macos-{suffix}/credential-process-macos-{suffix}"
+        )
+        flat_path = os.path.expanduser("~/claude-code-with-bedrock/credential-process")
+        credential_process = dir_path if os.path.exists(dir_path) else flat_path
     else:
         credential_process = os.path.expanduser("~/claude-code-with-bedrock/credential-process")
 

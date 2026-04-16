@@ -771,14 +771,15 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command — use --onedir (directory mode) for faster startup
+        # PyInstaller --onefile extracts to a temp dir on every launch, adding 1-2s latency.
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -799,7 +800,7 @@ class PackageCommand(Command):
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--target-arch={arch}",
@@ -824,13 +825,15 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
+        # --onedir produces output_dir/binary_name/ directory with binary_name inside
+        dir_path = output_dir / binary_name
+        exe_path = dir_path / binary_name
+        if dir_path.exists() and exe_path.exists():
+            exe_path.chmod(0o755)
             console.print(f"[green]✓ macOS {arch} binary built successfully with PyInstaller[/green]")
-            return binary_path
+            return exe_path
         else:
-            raise RuntimeError(f"Binary not created: {binary_path}")
+            raise RuntimeError(f"Binary directory not created: {dir_path}")
 
     def _build_linux_pyinstaller(self, output_dir: Path) -> Path:
         """Build Linux executable using PyInstaller."""
@@ -1549,14 +1552,18 @@ RUN pyinstaller \
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command — use --onedir for macOS (faster startup),
+        # --onefile for Linux (simpler deployment in Docker/containers)
+        onedir = platform_name == "macos"
+        mode_flag = "--onedir" if onedir else "--onefile"
+
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                mode_flag,
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1572,7 +1579,7 @@ RUN pyinstaller \
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                mode_flag,
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1595,13 +1602,24 @@ RUN pyinstaller \
             console.print(f"[red]PyInstaller build failed for OTEL helper: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
-            console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
-            return binary_path
+        if onedir:
+            # --onedir produces output_dir/binary_name/ directory with binary_name inside
+            dir_path = output_dir / binary_name
+            exe_path = dir_path / binary_name
+            if dir_path.exists() and exe_path.exists():
+                exe_path.chmod(0o755)
+                console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
+                return exe_path
+            else:
+                raise RuntimeError(f"OTEL helper directory not created: {dir_path}")
         else:
-            raise RuntimeError(f"OTEL helper binary not created: {binary_path}")
+            binary_path = output_dir / binary_name
+            if binary_path.exists():
+                binary_path.chmod(0o755)
+                console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
+                return binary_path
+            else:
+                raise RuntimeError(f"OTEL helper binary not created: {binary_path}")
 
     def _build_native_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build OTEL helper using native Nuitka compiler."""
@@ -1863,11 +1881,20 @@ else
     exit 1
 fi
 
-# Check if binary for platform exists
+# Check if binary for platform exists (directory mode for macOS, single file for Linux)
 CREDENTIAL_BINARY="credential-process-$BINARY_SUFFIX"
 OTEL_BINARY="otel-helper-$BINARY_SUFFIX"
 
-if [ ! -f "$CREDENTIAL_BINARY" ]; then
+if [ -d "$CREDENTIAL_BINARY" ]; then
+    # Directory mode (macOS) — exe is inside the directory
+    if [ ! -f "$CREDENTIAL_BINARY/$CREDENTIAL_BINARY" ]; then
+        echo "❌ Binary not found inside directory: $CREDENTIAL_BINARY/$CREDENTIAL_BINARY"
+        exit 1
+    fi
+    BINARY_MODE="dir"
+elif [ -f "$CREDENTIAL_BINARY" ]; then
+    BINARY_MODE="file"
+else
     echo "❌ Binary not found for your platform: $CREDENTIAL_BINARY"
     echo "   Please ensure you have the correct package for your architecture."
     exit 1
@@ -1881,11 +1908,19 @@ echo "Installing authentication tools..."
 mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
-cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+if [ "$BINARY_MODE" = "dir" ]; then
+    # Directory mode — copy entire directory
+    rm -rf ~/claude-code-with-bedrock/"$CREDENTIAL_BINARY"
+    cp -r "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/
+    chmod +x ~/claude-code-with-bedrock/"$CREDENTIAL_BINARY"/"$CREDENTIAL_BINARY"
+else
+    # Single file mode
+    cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+    chmod +x ~/claude-code-with-bedrock/credential-process
+fi
 
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
-chmod +x ~/claude-code-with-bedrock/credential-process
 
 # macOS Keychain Notice
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1921,40 +1956,57 @@ if [ -d "claude-settings" ]; then
 
         if [ "$SKIP_SETTINGS" != "true" ]; then
             # Replace placeholders and write settings
-            sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
-                -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
-                "claude-settings/settings.json" > ~/.claude/settings.json
+            # Directory mode: exe is inside a subdirectory named after the binary
+            if [ "$BINARY_MODE" = "dir" ]; then
+                sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/$OTEL_BINARY/$OTEL_BINARY|g" \
+                    -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/$CREDENTIAL_BINARY/$CREDENTIAL_BINARY|g" \
+                    "claude-settings/settings.json" > ~/.claude/settings.json
+            else
+                sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
+                    -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
+                    "claude-settings/settings.json" > ~/.claude/settings.json
+            fi
             echo "✓ Claude Code settings configured"
         fi
     fi
 fi
 
-# Copy OTEL helper executable and shell wrapper if present
-if [ -f "$OTEL_BINARY" ]; then
+# Copy OTEL helper executable
+if [ -d "$OTEL_BINARY" ] && [ -f "$OTEL_BINARY/$OTEL_BINARY" ]; then
+    # Directory mode (macOS) — copy entire directory
     echo
     echo "Installing OTEL helper..."
-    # Install PyInstaller binary as otel-helper-bin (fallback for cache miss)
+    rm -rf ~/claude-code-with-bedrock/"$OTEL_BINARY"
+    cp -r "$OTEL_BINARY" ~/claude-code-with-bedrock/
+    chmod +x ~/claude-code-with-bedrock/"$OTEL_BINARY"/"$OTEL_BINARY"
+    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/"$OTEL_BINARY"/"$OTEL_BINARY" 2>/dev/null || true
+    echo "✓ OTEL helper installed"
+elif [ -f "$OTEL_BINARY" ]; then
+    # Single file mode (Linux)
+    echo
+    echo "Installing OTEL helper..."
     cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
     chmod +x ~/claude-code-with-bedrock/otel-helper-bin
-    # Install shell wrapper as otel-helper (fast cache check, avoids PyInstaller startup)
+    # Install shell wrapper as otel-helper (fast cache check, avoids startup latency)
     if [ -f "otel-helper.sh" ]; then
         cp "otel-helper.sh" ~/claude-code-with-bedrock/otel-helper
         chmod +x ~/claude-code-with-bedrock/otel-helper
-        xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
     else
-        # Fallback: if shell wrapper not in package, point directly to binary
         cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
         chmod +x ~/claude-code-with-bedrock/otel-helper
-        xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
     fi
     echo "✓ OTEL helper installed"
 fi
 
 # Add debug info if OTEL helper was installed
-if [ -f ~/claude-code-with-bedrock/otel-helper ]; then
+if [ -d ~/claude-code-with-bedrock/"$OTEL_BINARY" ] || [ -f ~/claude-code-with-bedrock/otel-helper ]; then
     echo "The OTEL helper will extract user attributes from authentication tokens"
     echo "and include them in metrics. To test the helper, run:"
-    echo "  ~/claude-code-with-bedrock/otel-helper-bin --test"
+    if [ "$BINARY_MODE" = "dir" ]; then
+        echo "  ~/claude-code-with-bedrock/$OTEL_BINARY/$OTEL_BINARY --test"
+    else
+        echo "  ~/claude-code-with-bedrock/otel-helper-bin --test"
+    fi
 fi
 
 # Update AWS config
@@ -1981,6 +2033,13 @@ else
     DEFAULT_REGION="{profile.aws_region}"
 fi
 
+# Resolve credential process path based on binary mode
+if [ "$BINARY_MODE" = "dir" ]; then
+    CRED_PROC_PATH="$HOME/claude-code-with-bedrock/$CREDENTIAL_BINARY/$CREDENTIAL_BINARY"
+else
+    CRED_PROC_PATH="$HOME/claude-code-with-bedrock/credential-process"
+fi
+
 # Back up existing config before modifying
 [ -f ~/.aws/config ] && cp ~/.aws/config ~/.aws/config.bak
 
@@ -2001,7 +2060,7 @@ c.read(config_path)
 section = 'profile $PROFILE_NAME'
 if not c.has_section(section):
     c.add_section(section)
-c.set(section, 'credential_process', '$HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME')
+c.set(section, 'credential_process', '$CRED_PROC_PATH --profile $PROFILE_NAME')
 c.set(section, 'region', '$PROFILE_REGION')
 with open(config_path, 'w') as f:
     c.write(f)
