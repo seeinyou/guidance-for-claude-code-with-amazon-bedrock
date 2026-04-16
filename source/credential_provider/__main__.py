@@ -640,7 +640,7 @@ class MultiProviderAuth:
 
         # Determine binary path — hash the actual binary (otel-helper-bin), not the shell wrapper
         if platform.system() == "Windows":
-            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper.exe"
+            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper-windows" / "otel-helper.exe"
         else:
             # Prefer otel-helper-bin (the PyInstaller binary that was hashed at build time)
             # The shell wrapper (otel-helper) is a cache layer and not what was hashed

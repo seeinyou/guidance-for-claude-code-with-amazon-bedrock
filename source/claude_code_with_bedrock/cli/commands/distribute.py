@@ -106,7 +106,7 @@ class DistributeCommand(Command):
             "credential-process-macos-intel",
             "credential-process-linux-x64",
             "credential-process-linux-arm64",
-            "credential-process-windows.exe",
+            "credential-process-windows",
             "config.json",
             "install.sh",
         ]
@@ -166,7 +166,7 @@ class DistributeCommand(Command):
             "macos-intel": "credential-process-macos-intel",
             "linux-x64": "credential-process-linux-x64",
             "linux-arm64": "credential-process-linux-arm64",
-            "windows": "credential-process-windows.exe",
+            "windows": "credential-process-windows",
         }
 
         for platform, filename in platform_files.items():
@@ -476,7 +476,7 @@ class DistributeCommand(Command):
 
         # Check for Windows binaries and auto-download if needed
         console.print("\n[bold]Checking for Windows binaries...[/bold]")
-        windows_exe = package_path / "credential-process-windows.exe"
+        windows_exe = package_path / "credential-process-windows"
         if not windows_exe.exists():
             # Check if Windows build is completed and download it
             try:
@@ -520,9 +520,10 @@ class DistributeCommand(Command):
         # Platform file mappings
         platform_files = {
             "windows": [
-                ("credential-process-windows.exe", "credential-process-windows.exe"),
-                ("otel-helper-windows.exe", "otel-helper-windows.exe"),
+                ("credential-process-windows", "credential-process-windows"),
+                ("otel-helper-windows", "otel-helper-windows"),
                 ("install.bat", "install.bat"),
+                ("configure-profiles.ps1", "configure-profiles.ps1"),
                 ("config.json", "config.json"),
                 ("README.md", "README.md"),
             ],
@@ -628,7 +629,14 @@ class DistributeCommand(Command):
                     for source_file, archive_name in files:
                         source_path = package_path / source_file
                         if source_path.exists():
-                            zipf.write(source_path, f"claude-code-package/{archive_name}")
+                            if source_path.is_dir():
+                                # Add entire directory tree (e.g. Windows standalone builds)
+                                for child in source_path.rglob("*"):
+                                    if child.is_file():
+                                        rel = child.relative_to(source_path)
+                                        zipf.write(child, f"claude-code-package/{archive_name}/{rel}")
+                            else:
+                                zipf.write(source_path, f"claude-code-package/{archive_name}")
 
                     # Include claude-settings if it exists
                     settings_dir = package_path / "claude-settings"
@@ -706,8 +714,8 @@ class DistributeCommand(Command):
             console.print(f"  ✓ macOS Intel executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
             found_platforms.append("macos-intel")
 
-        # Check for Windows executables
-        windows_exe = package_path / "credential-process-windows.exe"
+        # Check for Windows executables (standalone directory build)
+        windows_exe = package_path / "credential-process-windows"
         windows_exe_time = None
         if windows_exe.exists():
             from datetime import timezone
@@ -1131,16 +1139,17 @@ class DistributeCommand(Command):
             "credential-process-macos-intel",
             "credential-process-linux-x64",
             "credential-process-linux-arm64",
-            "credential-process-windows.exe",
+            "credential-process-windows",
             # OTEL helpers
             "otel-helper-macos-arm64",
             "otel-helper-macos-intel",
             "otel-helper-linux-x64",
             "otel-helper-linux-arm64",
-            "otel-helper-windows.exe",
+            "otel-helper-windows",
             # Installation scripts
             "install.sh",
             "install.bat",
+            "configure-profiles.ps1",
             # Configuration
             "config.json",
             "README.md",
@@ -1151,11 +1160,14 @@ class DistributeCommand(Command):
         if settings_dir.exists() and settings_dir.is_dir():
             shutil.copytree(settings_dir, package_temp_dir / "claude-settings")
 
-        # Copy only the required files
+        # Copy only the required files/directories
         for filename in required_files:
             source_file = package_path / filename
             if source_file.exists():
-                shutil.copy2(source_file, package_temp_dir / filename)
+                if source_file.is_dir():
+                    shutil.copytree(source_file, package_temp_dir / filename)
+                else:
+                    shutil.copy2(source_file, package_temp_dir / filename)
 
         # Create zip archive with contents at root level
         # When extracted, it will create claude-code-package/ with files directly inside

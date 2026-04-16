@@ -264,7 +264,9 @@ def get_token_via_credential_process():
     import platform
 
     if platform.system() == "Windows":
-        credential_process = os.path.expanduser("~/claude-code-with-bedrock/credential-process.exe")
+        credential_process = os.path.expanduser(
+            "~/claude-code-with-bedrock/credential-process-windows/credential-process.exe"
+        )
     else:
         credential_process = os.path.expanduser("~/claude-code-with-bedrock/credential-process")
 

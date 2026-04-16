@@ -587,7 +587,7 @@ class PackageCommand(Command):
             binary_name = "credential-process-linux"
         elif target_platform == "windows":
             platform_variant = "x86_64"
-            # binary_name already set above
+            binary_name = "credential-process.exe"
         else:
             raise ValueError(f"Unsupported target platform: {target_platform}")
 
@@ -663,11 +663,16 @@ class PackageCommand(Command):
         # Add common Nuitka flags
         nuitka_flags = [
             "--standalone",
-            "--onefile",
             "--assume-yes-for-downloads",
             f"--output-filename={binary_name}",
             f"--output-dir={str(output_dir)}",
         ]
+
+        # Windows uses --standalone only (directory mode) to avoid antivirus
+        # false positives caused by --onefile self-extraction behavior.
+        # Other platforms keep --onefile for single-binary distribution.
+        if target_platform != "windows":
+            nuitka_flags.append("--onefile")
 
         # Only add --quiet if not in verbose mode
         verbose = self.option("build-verbose")
@@ -707,6 +712,18 @@ class PackageCommand(Command):
         result = subprocess.run(cmd, capture_output=not verbose, text=True, cwd=source_dir)
         if result.returncode != 0:
             raise RuntimeError(f"Nuitka build failed: {result.stderr}")
+
+        if target_platform == "windows":
+            # --standalone produces a .dist directory; rename to final name
+            dist_dir = output_dir / binary_name.replace(".exe", ".dist")
+            final_dir = output_dir / "credential-process-windows"
+            if dist_dir.exists():
+                import shutil
+
+                if final_dir.exists():
+                    shutil.rmtree(final_dir)
+                dist_dir.rename(final_dir)
+            return final_dir / binary_name
 
         return output_dir / binary_name
 
@@ -1444,12 +1461,11 @@ RUN pyinstaller \
 
     def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build executable for OTEL helper script."""
-        # Windows uses Nuitka via CodeBuild
+        # Windows uses Nuitka via CodeBuild — produces a directory, not a single exe
         if target_platform == "windows":
-            # Check if the Windows binary already exists (built by _build_executable)
-            windows_binary = output_dir / "otel-helper-windows.exe"
-            if windows_binary.exists():
-                return windows_binary
+            windows_dir = output_dir / "otel-helper-windows"
+            if windows_dir.exists() and (windows_dir / "otel-helper.exe").exists():
+                return windows_dir / "otel-helper.exe"
             else:
                 # If not, we need to build via CodeBuild (but this should have been done already)
                 raise RuntimeError("Windows otel-helper should have been built with credential-process")
@@ -2046,19 +2062,25 @@ REM Create directory
 echo Installing authentication tools...
 if not exist "%USERPROFILE%\\claude-code-with-bedrock" mkdir "%USERPROFILE%\\claude-code-with-bedrock"
 
-REM Copy credential process executable with renamed target
+REM Copy credential process directory (standalone build with exe + DLLs)
 echo Copying credential process...
-copy /Y "credential-process-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe" >nul
-if %errorlevel% neq 0 (
-    echo ERROR: Failed to copy credential-process-windows.exe
+if exist "credential-process-windows" (
+    xcopy /E /Y /I "credential-process-windows" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-windows" >nul
+    if %errorlevel% neq 0 (
+        echo ERROR: Failed to copy credential-process-windows directory
+        pause
+        exit /b 1
+    )
+) else (
+    echo ERROR: credential-process-windows directory not found
     pause
     exit /b 1
 )
 
-REM Copy OTEL helper if it exists with renamed target
-if exist "otel-helper-windows.exe" (
+REM Copy OTEL helper directory if it exists
+if exist "otel-helper-windows" (
     echo Copying OTEL helper...
-    copy /Y "otel-helper-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper.exe" >nul
+    xcopy /E /Y /I "otel-helper-windows" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-windows" >nul
 )
 
 REM Copy configuration
@@ -2087,9 +2109,9 @@ if "%SKIP_SETTINGS%"=="true" (
 
 REM Use PowerShell to replace placeholders and write settings
 powershell -Command ^
-"$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
+"$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper-windows\\\\otel-helper.exe' ^
 -replace '\\\\', '/'; ^
-$credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
+$credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process-windows\\\\credential-process.exe' ^
 -replace '\\\\', '/'; ^
 (Get-Content 'claude-settings\\\\settings.json') ^
 -replace '__OTEL_HELPER_PATH__', $otelPath ^
@@ -2103,28 +2125,8 @@ REM Configure AWS profiles
 echo.
 echo Configuring AWS profiles...
 
-REM Read profiles from config.json and configure AWS profiles using PowerShell (idempotent)
-powershell -Command ^
-"$configJson = ConvertFrom-Json -InputObject (Get-Content config.json -Raw); ^
-$awsDir = \"$env:USERPROFILE\\.aws\"; ^
-if (!(Test-Path $awsDir)) {{ New-Item -ItemType Directory -Path $awsDir | Out-Null }}; ^
-$configPath = \"$awsDir\\config\"; ^
-if (Test-Path $configPath) {{ Copy-Item $configPath \"$configPath.bak\" }}; ^
-$content = if (Test-Path $configPath) {{ Get-Content $configPath -Raw }} else {{ '' }}; ^
-foreach ($p in $configJson.PSObject.Properties.Name) {{ ^
-    Write-Host \"Configuring AWS profile: $p\"; ^
-    $region = if ($configJson.$p.aws_region) {{ $configJson.$p.aws_region }} else {{ '{profile.aws_region}' }}; ^
-    $credProc = \"$env:USERPROFILE\\claude-code-with-bedrock\\credential-process.exe --profile $p\"; ^
-    $section = \"[profile $p]\"; ^
-    $newBlock = \"$section`r`ncredential_process = $credProc`r`nregion = $region`r`n\"; ^
-    if ($content -match \"(?ms)\\[profile $p\\].*?(?=\\[|\\z)\") {{ ^
-        $content = $content -replace \"(?ms)\\[profile $p\\].*?(?=\\[|\\z)\", $newBlock; ^
-    }} else {{ ^
-        $content = $content.TrimEnd() + \"`r`n`r`n\" + $newBlock; ^
-    }}; ^
-    Write-Host \"  OK Created AWS profile '$p'\"; ^
-}}; ^
-Set-Content -Path $configPath -Value $content.TrimEnd()"
+REM Configure AWS profiles using external PowerShell script (avoids cmd.exe parsing issues)
+powershell -ExecutionPolicy Bypass -File configure-profiles.ps1
 
 echo.
 echo ======================================
@@ -2154,6 +2156,33 @@ pause
         installer_path = output_dir / "install.bat"
         with open(installer_path, "w", encoding="utf-8") as f:
             f.write(installer_content)
+
+        # Write PowerShell profile configuration script (separate .ps1 file avoids
+        # cmd.exe parsing issues with pipes, regex, and embedded quotes)
+        ps1_content = f"""$configJson = ConvertFrom-Json -InputObject (Get-Content config.json -Raw)
+$awsDir = "$env:USERPROFILE\\.aws"
+if (!(Test-Path $awsDir)) {{ $null = New-Item -ItemType Directory -Path $awsDir }}
+$configPath = "$awsDir\\config"
+if (Test-Path $configPath) {{ Copy-Item $configPath "$configPath.bak" }}
+$content = if (Test-Path $configPath) {{ Get-Content $configPath -Raw }} else {{ '' }}
+foreach ($p in $configJson.PSObject.Properties.Name) {{
+    Write-Host "Configuring AWS profile: $p"
+    $region = if ($configJson.$p.aws_region) {{ $configJson.$p.aws_region }} else {{ '{profile.aws_region}' }}
+    $credProc = "$env:USERPROFILE\\claude-code-with-bedrock\\credential-process-windows\\credential-process.exe --profile $p"
+    $section = "[profile $p]"
+    $newBlock = "$section`r`ncredential_process = $credProc`r`nregion = $region`r`n"
+    if ($content -match "(?ms)\\[profile $p\\].*?(?=\\[|\\z)") {{
+        $content = $content -replace "(?ms)\\[profile $p\\].*?(?=\\[|\\z)", $newBlock
+    }} else {{
+        $content = $content.TrimEnd() + "`r`n`r`n" + $newBlock
+    }}
+    Write-Host "  OK Created AWS profile '$p'"
+}}
+Set-Content -Path $configPath -Value $content.TrimEnd()
+"""
+        ps1_path = output_dir / "configure-profiles.ps1"
+        with open(ps1_path, "w", encoding="utf-8") as f:
+            f.write(ps1_content)
 
         # Note: chmod not needed on Windows batch files
         return installer_path
