@@ -313,34 +313,21 @@ class PackageCommand(Command):
             except Exception as e:
                 console.print(f"[yellow]Warning: Could not build credential process for {platform_name}: {e}[/yellow]")
 
-            # Build OTEL helper if monitoring is enabled
-            if profile.monitoring_enabled:
-                # Skip OTEL helper for Windows if being built in CodeBuild
-                if platform_name == "windows" and executable_path is None:
-                    console.print("[dim]Windows OTEL helper will be built in CodeBuild[/dim]")
-                else:
-                    console.print(f"[cyan]Building OTEL helper for {platform_name}...[/cyan]")
-                    try:
-                        otel_helper_path = self._build_otel_helper(output_dir, platform_name)
-                        # Only add to list if build was successful (not None)
-                        if otel_helper_path is not None:
-                            built_otel_helpers.append((platform_name, otel_helper_path))
-                    except Exception as e:
-                        console.print(f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]")
+            # OTEL helper packaging is currently disabled
+            # if profile.monitoring_enabled:
+            #     if platform_name == "windows" and executable_path is None:
+            #         console.print("[dim]Windows OTEL helper will be built in CodeBuild[/dim]")
+            #     else:
+            #         console.print(f"[cyan]Building OTEL helper for {platform_name}...[/cyan]")
+            #         try:
+            #             otel_helper_path = self._build_otel_helper(output_dir, platform_name)
+            #             if otel_helper_path is not None:
+            #                 built_otel_helpers.append((platform_name, otel_helper_path))
+            #         except Exception as e:
+            #             console.print(f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]")
 
-        # Compute SHA256 hash of built otel-helper binaries for integrity verification
+        # Hash computation for otel-helper is disabled (otel-helper packaging is disabled)
         otel_helper_hashes = {}
-        if built_otel_helpers:
-            import hashlib
-            for platform_name, otel_helper_path in built_otel_helpers:
-                sha256 = hashlib.sha256()
-                with open(otel_helper_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        sha256.update(chunk)
-                # Normalize generic platform names to specific keys that match runtime detection
-                hash_key = self._normalize_otel_platform_key(platform_name)
-                otel_helper_hashes[hash_key] = sha256.hexdigest()
-                console.print(f"  [dim]SHA256 ({hash_key}): {otel_helper_hashes[hash_key]}[/dim]")
 
         # Check if any binaries were built
         if not built_executables:

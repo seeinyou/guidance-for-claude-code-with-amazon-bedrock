@@ -619,53 +619,10 @@ class MultiProviderAuth:
 
         Returns status: 'valid', 'missing', 'hash-mismatch', 'not-configured'.
         Does NOT exit — status is reported to TVM Lambda for server-side enforcement.
+
+        Hash verification is currently disabled — always returns 'not-configured'.
         """
-        # Support per-platform hashes (new) and legacy single hash (old)
-        hashes = self.config.get("otel_helper_hashes")
-        legacy_hash = self.config.get("otel_helper_hash")
-
-        if not hashes and not legacy_hash:
-            print("Warning: otel_helper_hash not configured — integrity check skipped", file=sys.stderr)
-            return "not-configured"
-
-        # Resolve expected hash for current platform
-        if hashes:
-            platform_key = self._get_otel_platform_key()
-            expected_hash = hashes.get(platform_key)
-            if not expected_hash:
-                print(f"Warning: no otel-helper hash for platform '{platform_key}' — integrity check skipped", file=sys.stderr)
-                return "not-configured"
-        else:
-            expected_hash = legacy_hash
-
-        # Determine binary path — hash the actual binary (otel-helper-bin), not the shell wrapper
-        if platform.system() == "Windows":
-            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper.exe"
-        else:
-            # Prefer otel-helper-bin (the PyInstaller binary that was hashed at build time)
-            # The shell wrapper (otel-helper) is a cache layer and not what was hashed
-            helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper-bin"
-            if not helper_path.exists():
-                # Fallback: no shell wrapper installed, binary is otel-helper directly
-                helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
-
-        if not helper_path.exists():
-            print(f"Warning: otel-helper binary not found at {helper_path}", file=sys.stderr)
-            return "missing"
-
-        # Compute SHA256
-        sha256 = hashlib.sha256()
-        with open(helper_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                sha256.update(chunk)
-        actual_hash = sha256.hexdigest()
-
-        if actual_hash != expected_hash:
-            print(f"Warning: otel-helper hash mismatch (expected={expected_hash[:16]}..., actual={actual_hash[:16]}...)", file=sys.stderr)
-            return "hash-mismatch"
-
-        self._debug_print("otel-helper integrity check passed")
-        return "valid"
+        return "not-configured"
 
     @staticmethod
     def _get_otel_platform_key() -> str:
