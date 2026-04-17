@@ -1339,7 +1339,16 @@ RUN pyinstaller \
             progress.update(task, description="Starting CodeBuild project...")
             codebuild = boto3.client("codebuild", region_name=profile.aws_region)
             try:
-                response = codebuild.start_build(projectName=project_name)
+                response = codebuild.start_build(
+                    projectName=project_name,
+                    environmentVariablesOverride=[
+                        {
+                            "name": "BUILD_OTEL_HELPER",
+                            "value": "true" if profile.monitoring_enabled else "false",
+                            "type": "PLAINTEXT",
+                        }
+                    ],
+                )
                 build_id = response["build"]["id"]
             except ClientError as e:
                 console.print(f"[red]Failed to start build: {e}[/red]")
