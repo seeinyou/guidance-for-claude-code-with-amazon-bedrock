@@ -155,20 +155,27 @@ Resources:
               commands:
                 - echo Building Windows executables sequentially...
                 - echo Building credential-process Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
+                - C:\Python312\python.exe -m nuitka --standalone --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process.exe --output-dir=. source/credential_provider/__main__.py
+                - echo Renaming credential-process output directory...
+                - Rename-Item -Path "__main__.dist" -NewName "credential-process-windows"
+                - Remove-Item -Recurse -Force "__main__.build" -ErrorAction SilentlyContinue
                 - echo Building otel-helper Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py
+                - C:\Python312\python.exe -m nuitka --standalone --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper.exe --output-dir=. source/otel_helper/__main__.py
+                - echo Renaming otel-helper output directory...
+                - Rename-Item -Path "__main__.dist" -NewName "otel-helper-windows"
+                - Remove-Item -Recurse -Force "__main__.build" -ErrorAction SilentlyContinue
             post_build:
               commands:
                 - echo Build completed successfully
-                - Get-ChildItem *.exe
-                - echo Checking file sizes...
-                - Get-ChildItem *.exe | ForEach-Object { Write-Host "$($_.Name) - $($_.Length) bytes" }
+                - Get-ChildItem credential-process-windows
+                - Get-ChildItem otel-helper-windows
+                - echo Checking main exe sizes...
+                - Get-ChildItem credential-process-windows\credential-process.exe, otel-helper-windows\otel-helper.exe | ForEach-Object { Write-Host "$($_.FullName) - $($_.Length) bytes" }
 
           artifacts:
             files:
-              - credential-process-windows.exe
-              - otel-helper-windows.exe
+              - credential-process-windows/**/*
+              - otel-helper-windows/**/*
             name: windows-binaries
 
       LogsConfig:

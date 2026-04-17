@@ -42,7 +42,7 @@ if /i not "%OVERWRITE%"=="y" (
 )
 
 REM Use PowerShell to replace placeholders (use semicolons not pipes to avoid cmd.exe pipe parsing)
-powershell -Command "$dest = $env:USERPROFILE + '\.claude\settings.json'; $otelPath = ($env:USERPROFILE + '\claude-code-with-bedrock\otel-helper.exe') -replace '\\', '\\'; $credPath = ($env:USERPROFILE + '\claude-code-with-bedrock\credential-process.exe') -replace '\\', '\\'; $content = (Get-Content 'claude-settings\settings.json' -Raw) -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath; Set-Content -Path $dest -Value $content"
+powershell -Command "$dest = $env:USERPROFILE + '\.claude\settings.json'; $otelPath = ($env:USERPROFILE + '\claude-code-with-bedrock\otel-helper-windows\otel-helper.exe') -replace '\\', '\\'; $credPath = ($env:USERPROFILE + '\claude-code-with-bedrock\credential-process-windows\credential-process.exe') -replace '\\', '\\'; $content = (Get-Content 'claude-settings\settings.json' -Raw) -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath; Set-Content -Path $dest -Value $content"
 echo OK Claude Code settings configured
 
 :skip_settings

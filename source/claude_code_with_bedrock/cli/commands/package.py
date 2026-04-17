@@ -587,7 +587,7 @@ class PackageCommand(Command):
             binary_name = "credential-process-linux"
         elif target_platform == "windows":
             platform_variant = "x86_64"
-            # binary_name already set above
+            binary_name = "credential-process.exe"
         else:
             raise ValueError(f"Unsupported target platform: {target_platform}")
 
@@ -663,11 +663,13 @@ class PackageCommand(Command):
         # Add common Nuitka flags
         nuitka_flags = [
             "--standalone",
-            "--onefile",
             "--assume-yes-for-downloads",
             f"--output-filename={binary_name}",
             f"--output-dir={str(output_dir)}",
         ]
+
+        # All platforms use --standalone (directory mode) to avoid antivirus
+        # false positives and self-extraction startup latency from --onefile.
 
         # Only add --quiet if not in verbose mode
         verbose = self.option("build-verbose")
@@ -693,11 +695,7 @@ class PackageCommand(Command):
                 ]
             )
         elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",  # No icon for Linux
-                ]
-            )
+            pass  # No additional flags needed for Linux standalone mode
 
         # Add the source file
         cmd.append(str(src_file))
@@ -707,6 +705,18 @@ class PackageCommand(Command):
         result = subprocess.run(cmd, capture_output=not verbose, text=True, cwd=source_dir)
         if result.returncode != 0:
             raise RuntimeError(f"Nuitka build failed: {result.stderr}")
+
+        if target_platform == "windows":
+            # --standalone produces a .dist directory; rename to final name
+            dist_dir = output_dir / binary_name.replace(".exe", ".dist")
+            final_dir = output_dir / "credential-process-windows"
+            if dist_dir.exists():
+                import shutil
+
+                if final_dir.exists():
+                    shutil.rmtree(final_dir)
+                dist_dir.rename(final_dir)
+            return final_dir / binary_name
 
         return output_dir / binary_name
 
@@ -754,14 +764,15 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command — use --onedir (directory mode) for faster startup
+        # PyInstaller --onefile extracts to a temp dir on every launch, adding 1-2s latency.
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -782,7 +793,7 @@ class PackageCommand(Command):
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                "--onedir",
                 "--clean",
                 "--noconfirm",
                 f"--target-arch={arch}",
@@ -807,13 +818,15 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
+        # --onedir produces output_dir/binary_name/ directory with binary_name inside
+        dir_path = output_dir / binary_name
+        exe_path = dir_path / binary_name
+        if dir_path.exists() and exe_path.exists():
+            exe_path.chmod(0o755)
             console.print(f"[green]✓ macOS {arch} binary built successfully with PyInstaller[/green]")
-            return binary_path
+            return exe_path
         else:
-            raise RuntimeError(f"Binary not created: {binary_path}")
+            raise RuntimeError(f"Binary directory not created: {dir_path}")
 
     def _build_linux_pyinstaller(self, output_dir: Path) -> Path:
         """Build Linux executable using PyInstaller."""
@@ -839,12 +852,13 @@ class PackageCommand(Command):
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command — use --onedir (directory mode) for faster startup.
+        # --onefile extracts to a temp dir on every launch, adding 1-2s latency.
         cmd = [
             "poetry",
             "run",
             "pyinstaller",
-            "--onefile",
+            "--onedir",
             "--clean",
             "--noconfirm",
             f"--name={binary_name}",
@@ -872,13 +886,15 @@ class PackageCommand(Command):
             console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
+        # --onedir produces output_dir/binary_name/ directory with binary_name inside
+        dir_path = output_dir / binary_name
+        exe_path = dir_path / binary_name
+        if dir_path.exists() and exe_path.exists():
+            exe_path.chmod(0o755)
             console.print("[green]✓ Linux binary built successfully with PyInstaller[/green]")
-            return binary_path
+            return exe_path
         else:
-            raise RuntimeError(f"Binary not created: {binary_path}")
+            raise RuntimeError(f"Binary directory not created: {dir_path}")
 
     def _build_linux_via_docker(self, output_dir: Path, arch: str = "x64") -> Path:
         """Build Linux binaries using Docker with PyInstaller."""
@@ -969,9 +985,9 @@ WORKDIR /build
 # Copy source code
 COPY credential_provider /build/credential_provider
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller (--onedir for faster startup)
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -989,7 +1005,7 @@ RUN pyinstaller \
     --hidden-import dateutil \
     credential_provider/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The output will be in /output/{binary_name}/ directory
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1032,7 +1048,7 @@ RUN pyinstaller \
             if build_result.returncode != 0:
                 raise RuntimeError(f"Docker build failed: {build_result.stderr}")
 
-            # Run container and copy binary out
+            # Run container and copy directory out
             import time
 
             container_name = f"ccwb-extract-{arch}-{int(time.time())}"
@@ -1048,7 +1064,7 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy directory from container (--onedir produces /output/binary_name/ directory)
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1058,16 +1074,17 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
-                if not binary_path.exists():
-                    raise RuntimeError(f"Linux {arch} binary was not created successfully")
+                # Verify the directory and executable were created
+                dir_path = output_dir / binary_name
+                exe_path = dir_path / binary_name
+                if not dir_path.exists() or not exe_path.exists():
+                    raise RuntimeError(f"Linux {arch} binary directory was not created successfully")
 
                 # Make it executable
-                binary_path.chmod(0o755)
+                exe_path.chmod(0o755)
 
                 console.print(f"[green]✓ Linux {arch} binary built successfully via Docker[/green]")
-                return binary_path
+                return exe_path
 
             finally:
                 # Clean up container and image
@@ -1152,9 +1169,9 @@ WORKDIR /build
 # Copy source code
 COPY otel_helper /build/otel_helper
 
-# Build the binary with PyInstaller
+# Build the binary with PyInstaller (--onedir for faster startup)
 RUN pyinstaller \
-    --onefile \
+    --onedir \
     --clean \
     --noconfirm \
     --name {binary_name} \
@@ -1166,7 +1183,7 @@ RUN pyinstaller \
     --hidden-import six.moves \
     otel_helper/__main__.py
 
-# The binary will be in /output/{binary_name}
+# The output will be in /output/{binary_name}/ directory
 """
 
             (temp_path / "Dockerfile").write_text(dockerfile_content)
@@ -1209,7 +1226,7 @@ RUN pyinstaller \
             if build_result.returncode != 0:
                 raise RuntimeError(f"Docker build failed for OTEL helper: {build_result.stderr}")
 
-            # Run container and copy binary out
+            # Run container and copy directory out
             import time
 
             container_name = f"ccwb-otel-extract-{arch}-{int(time.time())}"
@@ -1225,7 +1242,7 @@ RUN pyinstaller \
                 raise RuntimeError(f"Failed to create container: {run_result.stderr}")
 
             try:
-                # Copy binary from container
+                # Copy directory from container (--onedir produces /output/binary_name/ directory)
                 copy_result = subprocess.run(
                     ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
                     capture_output=True,
@@ -1235,16 +1252,17 @@ RUN pyinstaller \
                 if copy_result.returncode != 0:
                     raise RuntimeError(f"Failed to copy OTEL binary from container: {copy_result.stderr}")
 
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
-                if not binary_path.exists():
-                    raise RuntimeError(f"Linux {arch} OTEL helper binary was not created successfully")
+                # Verify the directory and executable were created
+                dir_path = output_dir / binary_name
+                exe_path = dir_path / binary_name
+                if not dir_path.exists() or not exe_path.exists():
+                    raise RuntimeError(f"Linux {arch} OTEL helper directory was not created successfully")
 
                 # Make it executable
-                binary_path.chmod(0o755)
+                exe_path.chmod(0o755)
 
                 console.print(f"[green]✓ Linux {arch} OTEL helper built successfully via Docker[/green]")
-                return binary_path
+                return exe_path
 
             finally:
                 # Clean up container and image
@@ -1444,12 +1462,11 @@ RUN pyinstaller \
 
     def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build executable for OTEL helper script."""
-        # Windows uses Nuitka via CodeBuild
+        # Windows uses Nuitka via CodeBuild — produces a directory, not a single exe
         if target_platform == "windows":
-            # Check if the Windows binary already exists (built by _build_executable)
-            windows_binary = output_dir / "otel-helper-windows.exe"
-            if windows_binary.exists():
-                return windows_binary
+            windows_dir = output_dir / "otel-helper-windows"
+            if windows_dir.exists() and (windows_dir / "otel-helper.exe").exists():
+                return windows_dir / "otel-helper.exe"
             else:
                 # If not, we need to build via CodeBuild (but this should have been done already)
                 raise RuntimeError("Windows otel-helper should have been built with credential-process")
@@ -1533,14 +1550,18 @@ RUN pyinstaller \
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
+        # Build PyInstaller command — use --onedir (directory mode) for faster startup.
+        # --onefile extracts to a temp dir on every launch, adding 1-2s latency.
+        onedir = True
+        mode_flag = "--onedir"
+
         if use_x86_python:
             # Use x86_64 Python environment
             cmd = [
                 "arch",
                 "-x86_64",
                 str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
+                mode_flag,
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1556,7 +1577,7 @@ RUN pyinstaller \
                 "poetry",
                 "run",
                 "pyinstaller",
-                "--onefile",
+                mode_flag,
                 "--clean",
                 "--noconfirm",
                 f"--name={binary_name}",
@@ -1579,13 +1600,24 @@ RUN pyinstaller \
             console.print(f"[red]PyInstaller build failed for OTEL helper: {result.stderr}[/red]")
             raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
 
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
-            console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
-            return binary_path
+        if onedir:
+            # --onedir produces output_dir/binary_name/ directory with binary_name inside
+            dir_path = output_dir / binary_name
+            exe_path = dir_path / binary_name
+            if dir_path.exists() and exe_path.exists():
+                exe_path.chmod(0o755)
+                console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
+                return exe_path
+            else:
+                raise RuntimeError(f"OTEL helper directory not created: {dir_path}")
         else:
-            raise RuntimeError(f"OTEL helper binary not created: {binary_path}")
+            binary_path = output_dir / binary_name
+            if binary_path.exists():
+                binary_path.chmod(0o755)
+                console.print("[green]✓ OTEL helper built successfully with PyInstaller[/green]")
+                return binary_path
+            else:
+                raise RuntimeError(f"OTEL helper binary not created: {binary_path}")
 
     def _build_native_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
         """Build OTEL helper using native Nuitka compiler."""
@@ -1847,11 +1879,20 @@ else
     exit 1
 fi
 
-# Check if binary for platform exists
+# Check if binary for platform exists (directory mode for all platforms, single file as fallback)
 CREDENTIAL_BINARY="credential-process-$BINARY_SUFFIX"
 OTEL_BINARY="otel-helper-$BINARY_SUFFIX"
 
-if [ ! -f "$CREDENTIAL_BINARY" ]; then
+if [ -d "$CREDENTIAL_BINARY" ]; then
+    # Directory mode — exe is inside the directory
+    if [ ! -f "$CREDENTIAL_BINARY/$CREDENTIAL_BINARY" ]; then
+        echo "❌ Binary not found inside directory: $CREDENTIAL_BINARY/$CREDENTIAL_BINARY"
+        exit 1
+    fi
+    BINARY_MODE="dir"
+elif [ -f "$CREDENTIAL_BINARY" ]; then
+    BINARY_MODE="file"
+else
     echo "❌ Binary not found for your platform: $CREDENTIAL_BINARY"
     echo "   Please ensure you have the correct package for your architecture."
     exit 1
@@ -1865,11 +1906,19 @@ echo "Installing authentication tools..."
 mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
-cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+if [ "$BINARY_MODE" = "dir" ]; then
+    # Directory mode — copy entire directory tree
+    rm -rf ~/claude-code-with-bedrock/"$CREDENTIAL_BINARY"
+    cp -r "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/
+    chmod +x ~/claude-code-with-bedrock/"$CREDENTIAL_BINARY"/"$CREDENTIAL_BINARY"
+else
+    # Single file mode
+    cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+    chmod +x ~/claude-code-with-bedrock/credential-process
+fi
 
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
-chmod +x ~/claude-code-with-bedrock/credential-process
 
 # macOS Keychain Notice
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1905,40 +1954,57 @@ if [ -d "claude-settings" ]; then
 
         if [ "$SKIP_SETTINGS" != "true" ]; then
             # Replace placeholders and write settings
-            sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
-                -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
-                "claude-settings/settings.json" > ~/.claude/settings.json
+            # Directory mode: exe is inside a subdirectory named after the binary
+            if [ "$BINARY_MODE" = "dir" ]; then
+                sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/$OTEL_BINARY/$OTEL_BINARY|g" \
+                    -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/$CREDENTIAL_BINARY/$CREDENTIAL_BINARY|g" \
+                    "claude-settings/settings.json" > ~/.claude/settings.json
+            else
+                sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
+                    -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
+                    "claude-settings/settings.json" > ~/.claude/settings.json
+            fi
             echo "✓ Claude Code settings configured"
         fi
     fi
 fi
 
-# Copy OTEL helper executable and shell wrapper if present
-if [ -f "$OTEL_BINARY" ]; then
+# Copy OTEL helper executable
+if [ -d "$OTEL_BINARY" ] && [ -f "$OTEL_BINARY/$OTEL_BINARY" ]; then
+    # Directory mode — copy entire directory
     echo
     echo "Installing OTEL helper..."
-    # Install PyInstaller binary as otel-helper-bin (fallback for cache miss)
+    rm -rf ~/claude-code-with-bedrock/"$OTEL_BINARY"
+    cp -r "$OTEL_BINARY" ~/claude-code-with-bedrock/
+    chmod +x ~/claude-code-with-bedrock/"$OTEL_BINARY"/"$OTEL_BINARY"
+    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/"$OTEL_BINARY"/"$OTEL_BINARY" 2>/dev/null || true
+    echo "✓ OTEL helper installed"
+elif [ -f "$OTEL_BINARY" ]; then
+    # Single file mode (legacy fallback)
+    echo
+    echo "Installing OTEL helper..."
     cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper-bin
     chmod +x ~/claude-code-with-bedrock/otel-helper-bin
-    # Install shell wrapper as otel-helper (fast cache check, avoids PyInstaller startup)
+    # Install shell wrapper as otel-helper (fast cache check, avoids startup latency)
     if [ -f "otel-helper.sh" ]; then
         cp "otel-helper.sh" ~/claude-code-with-bedrock/otel-helper
         chmod +x ~/claude-code-with-bedrock/otel-helper
-        xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
     else
-        # Fallback: if shell wrapper not in package, point directly to binary
         cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
         chmod +x ~/claude-code-with-bedrock/otel-helper
-        xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
     fi
     echo "✓ OTEL helper installed"
 fi
 
 # Add debug info if OTEL helper was installed
-if [ -f ~/claude-code-with-bedrock/otel-helper ]; then
+if [ -d ~/claude-code-with-bedrock/"$OTEL_BINARY" ] || [ -f ~/claude-code-with-bedrock/otel-helper ]; then
     echo "The OTEL helper will extract user attributes from authentication tokens"
     echo "and include them in metrics. To test the helper, run:"
-    echo "  ~/claude-code-with-bedrock/otel-helper-bin --test"
+    if [ "$BINARY_MODE" = "dir" ]; then
+        echo "  ~/claude-code-with-bedrock/$OTEL_BINARY/$OTEL_BINARY --test"
+    else
+        echo "  ~/claude-code-with-bedrock/otel-helper-bin --test"
+    fi
 fi
 
 # Update AWS config
@@ -1965,6 +2031,13 @@ else
     DEFAULT_REGION="{profile.aws_region}"
 fi
 
+# Resolve credential process path based on binary mode
+if [ "$BINARY_MODE" = "dir" ]; then
+    CRED_PROC_PATH="$HOME/claude-code-with-bedrock/$CREDENTIAL_BINARY/$CREDENTIAL_BINARY"
+else
+    CRED_PROC_PATH="$HOME/claude-code-with-bedrock/credential-process"
+fi
+
 # Back up existing config before modifying
 [ -f ~/.aws/config ] && cp ~/.aws/config ~/.aws/config.bak
 
@@ -1985,7 +2058,7 @@ c.read(config_path)
 section = 'profile $PROFILE_NAME'
 if not c.has_section(section):
     c.add_section(section)
-c.set(section, 'credential_process', '$HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME')
+c.set(section, 'credential_process', '$CRED_PROC_PATH --profile $PROFILE_NAME')
 c.set(section, 'region', '$PROFILE_REGION')
 with open(config_path, 'w') as f:
     c.write(f)
@@ -2046,19 +2119,25 @@ REM Create directory
 echo Installing authentication tools...
 if not exist "%USERPROFILE%\\claude-code-with-bedrock" mkdir "%USERPROFILE%\\claude-code-with-bedrock"
 
-REM Copy credential process executable with renamed target
+REM Copy credential process directory (standalone build with exe + DLLs)
 echo Copying credential process...
-copy /Y "credential-process-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe" >nul
-if %errorlevel% neq 0 (
-    echo ERROR: Failed to copy credential-process-windows.exe
+if exist "credential-process-windows" (
+    xcopy /E /Y /I "credential-process-windows" "%USERPROFILE%\\claude-code-with-bedrock\\credential-process-windows" >nul
+    if %errorlevel% neq 0 (
+        echo ERROR: Failed to copy credential-process-windows directory
+        pause
+        exit /b 1
+    )
+) else (
+    echo ERROR: credential-process-windows directory not found
     pause
     exit /b 1
 )
 
-REM Copy OTEL helper if it exists with renamed target
-if exist "otel-helper-windows.exe" (
+REM Copy OTEL helper directory if it exists
+if exist "otel-helper-windows" (
     echo Copying OTEL helper...
-    copy /Y "otel-helper-windows.exe" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper.exe" >nul
+    xcopy /E /Y /I "otel-helper-windows" "%USERPROFILE%\\claude-code-with-bedrock\\otel-helper-windows" >nul
 )
 
 REM Copy configuration
@@ -2087,9 +2166,9 @@ if "%SKIP_SETTINGS%"=="true" (
 
 REM Use PowerShell to replace placeholders and write settings
 powershell -Command ^
-"$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
+"$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper-windows\\\\otel-helper.exe' ^
 -replace '\\\\', '/'; ^
-$credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
+$credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process-windows\\\\credential-process.exe' ^
 -replace '\\\\', '/'; ^
 (Get-Content 'claude-settings\\\\settings.json') ^
 -replace '__OTEL_HELPER_PATH__', $otelPath ^
@@ -2103,28 +2182,8 @@ REM Configure AWS profiles
 echo.
 echo Configuring AWS profiles...
 
-REM Read profiles from config.json and configure AWS profiles using PowerShell (idempotent)
-powershell -Command ^
-"$configJson = ConvertFrom-Json -InputObject (Get-Content config.json -Raw); ^
-$awsDir = \"$env:USERPROFILE\\.aws\"; ^
-if (!(Test-Path $awsDir)) {{ New-Item -ItemType Directory -Path $awsDir | Out-Null }}; ^
-$configPath = \"$awsDir\\config\"; ^
-if (Test-Path $configPath) {{ Copy-Item $configPath \"$configPath.bak\" }}; ^
-$content = if (Test-Path $configPath) {{ Get-Content $configPath -Raw }} else {{ '' }}; ^
-foreach ($p in $configJson.PSObject.Properties.Name) {{ ^
-    Write-Host \"Configuring AWS profile: $p\"; ^
-    $region = if ($configJson.$p.aws_region) {{ $configJson.$p.aws_region }} else {{ '{profile.aws_region}' }}; ^
-    $credProc = \"$env:USERPROFILE\\claude-code-with-bedrock\\credential-process.exe --profile $p\"; ^
-    $section = \"[profile $p]\"; ^
-    $newBlock = \"$section`r`ncredential_process = $credProc`r`nregion = $region`r`n\"; ^
-    if ($content -match \"(?ms)\\[profile $p\\].*?(?=\\[|\\z)\") {{ ^
-        $content = $content -replace \"(?ms)\\[profile $p\\].*?(?=\\[|\\z)\", $newBlock; ^
-    }} else {{ ^
-        $content = $content.TrimEnd() + \"`r`n`r`n\" + $newBlock; ^
-    }}; ^
-    Write-Host \"  OK Created AWS profile '$p'\"; ^
-}}; ^
-Set-Content -Path $configPath -Value $content.TrimEnd()"
+REM Configure AWS profiles using external PowerShell script (avoids cmd.exe parsing issues)
+powershell -ExecutionPolicy Bypass -File configure-profiles.ps1
 
 echo.
 echo ======================================
@@ -2154,6 +2213,33 @@ pause
         installer_path = output_dir / "install.bat"
         with open(installer_path, "w", encoding="utf-8") as f:
             f.write(installer_content)
+
+        # Write PowerShell profile configuration script (separate .ps1 file avoids
+        # cmd.exe parsing issues with pipes, regex, and embedded quotes)
+        ps1_content = f"""$configJson = ConvertFrom-Json -InputObject (Get-Content config.json -Raw)
+$awsDir = "$env:USERPROFILE\\.aws"
+if (!(Test-Path $awsDir)) {{ $null = New-Item -ItemType Directory -Path $awsDir }}
+$configPath = "$awsDir\\config"
+if (Test-Path $configPath) {{ Copy-Item $configPath "$configPath.bak" }}
+$content = if (Test-Path $configPath) {{ Get-Content $configPath -Raw }} else {{ '' }}
+foreach ($p in $configJson.PSObject.Properties.Name) {{
+    Write-Host "Configuring AWS profile: $p"
+    $region = if ($configJson.$p.aws_region) {{ $configJson.$p.aws_region }} else {{ '{profile.aws_region}' }}
+    $credProc = "$env:USERPROFILE\\claude-code-with-bedrock\\credential-process-windows\\credential-process.exe --profile $p"
+    $section = "[profile $p]"
+    $newBlock = "$section`r`ncredential_process = $credProc`r`nregion = $region`r`n"
+    if ($content -match "(?ms)\\[profile $p\\].*?(?=\\[|\\z)") {{
+        $content = $content -replace "(?ms)\\[profile $p\\].*?(?=\\[|\\z)", $newBlock
+    }} else {{
+        $content = $content.TrimEnd() + "`r`n`r`n" + $newBlock
+    }}
+    Write-Host "  OK Created AWS profile '$p'"
+}}
+Set-Content -Path $configPath -Value $content.TrimEnd()
+"""
+        ps1_path = output_dir / "configure-profiles.ps1"
+        with open(ps1_path, "w", encoding="utf-8") as f:
+            f.write(ps1_content)
 
         # Note: chmod not needed on Windows batch files
         return installer_path
