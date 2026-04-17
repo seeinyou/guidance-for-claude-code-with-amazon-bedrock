@@ -1107,7 +1107,7 @@ def api_disable_user(event):
     except json.JSONDecodeError:
         return build_json_response(400, {"error": "Invalid JSON body"})
 
-    email = body.get("email", "").strip()
+    email = body.get("email", "").strip().lower()
     if not email:
         return build_json_response(400, {"error": "email is required."})
 
@@ -1118,16 +1118,20 @@ def api_disable_user(event):
         response = metrics_table.update_item(
             Key={"pk": pk, "sk": sk},
             UpdateExpression="SET #status = :status",
+            ConditionExpression="attribute_exists(pk)",
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={":status": "disabled"},
             ReturnValues="ALL_NEW",
         )
+        updated = response["Attributes"]
         print(f"User disabled: {email}")
         return build_json_response(200, {
             "message": f"User {email} has been disabled.",
             "email": email,
-            "status": "disabled",
+            "status": updated.get("status", "disabled"),
         })
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return build_json_response(404, {"error": f"User profile not found: {email}"})
     except Exception as e:
         print(f"Error disabling user {email}: {e}")
         return build_json_response(500, {"error": f"Failed to disable user: {str(e)}"})
@@ -1140,7 +1144,7 @@ def api_enable_user(event):
     except json.JSONDecodeError:
         return build_json_response(400, {"error": "Invalid JSON body"})
 
-    email = body.get("email", "").strip()
+    email = body.get("email", "").strip().lower()
     if not email:
         return build_json_response(400, {"error": "email is required."})
 
@@ -1151,16 +1155,20 @@ def api_enable_user(event):
         response = metrics_table.update_item(
             Key={"pk": pk, "sk": sk},
             UpdateExpression="SET #status = :status",
+            ConditionExpression="attribute_exists(pk)",
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={":status": "active"},
             ReturnValues="ALL_NEW",
         )
+        updated = response["Attributes"]
         print(f"User enabled: {email}")
         return build_json_response(200, {
             "message": f"User {email} has been enabled.",
             "email": email,
-            "status": "active",
+            "status": updated.get("status", "active"),
         })
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return build_json_response(404, {"error": f"User profile not found: {email}"})
     except Exception as e:
         print(f"Error enabling user {email}: {e}")
         return build_json_response(500, {"error": f"Failed to enable user: {str(e)}"})
