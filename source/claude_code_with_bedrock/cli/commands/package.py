@@ -1433,6 +1433,11 @@ RUN pyinstaller \
             if pyproject_file.exists():
                 zf.write(pyproject_file, "pyproject.toml")
 
+            # Add app.ico for Windows executable icon if present
+            ico_file = source_dir / "app.ico"
+            if ico_file.exists():
+                zf.write(ico_file, "app.ico")
+
         return source_zip
 
     @staticmethod
@@ -1879,6 +1884,7 @@ cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
 chmod +x ~/claude-code-with-bedrock/credential-process
+xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
 
 # macOS Keychain Notice
 if [[ "$OSTYPE" == "darwin"* ]]; then

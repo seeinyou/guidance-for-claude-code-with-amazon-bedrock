@@ -155,11 +155,15 @@ Resources:
               commands:
                 - echo Building Windows executables sequentially...
                 - echo Building credential-process Windows executable...
-                - C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
-                - if ($env:BUILD_OTEL_HELPER -eq "false") { Write-Host "Skipping otel-helper build (monitoring disabled)" } else { Write-Host "Building otel-helper Windows executable..."; C:\Python312\python.exe -m nuitka --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py }
+                - C:\Python312\python.exe -m nuitka --standalone --mingw64 --lto=yes --assume-yes-for-downloads --windows-company-name="Claude Code" --windows-product-name="Claude Code Credential Process" --windows-product-version="1.0.0.0" --windows-file-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --windows-icon-from-ico=app.ico --include-package=keyring.backends --output-filename=credential-process-windows.exe --output-dir=. --remove-output --deployment source/credential_provider/__main__.py
+                - Rename-Item __main__.dist credential-process-windows.dist
+                - if ($env:BUILD_OTEL_HELPER -eq "false") { Write-Host "Skipping otel-helper build (monitoring disabled)" } else { Write-Host "Building otel-helper Windows executable..."; C:\Python312\python.exe -m nuitka --standalone --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py; Rename-Item __main__.dist otel-helper-windows.dist }
             post_build:
               commands:
                 - echo Build completed successfully
+                - echo Copying executables from standalone dist directories to root...
+                - Copy-Item credential-process-windows.dist\credential-process-windows.exe .\credential-process-windows.exe -Force
+                - if ($env:BUILD_OTEL_HELPER -eq "false") { Write-Host "Skipping otel-helper copy (monitoring disabled)" } else { Copy-Item otel-helper-windows.dist\otel-helper-windows.exe .\otel-helper-windows.exe -Force }
                 - Get-ChildItem *.exe
                 - echo Checking file sizes...
                 - Get-ChildItem *.exe | ForEach-Object { Write-Host "$($_.Name) - $($_.Length) bytes" }
@@ -167,7 +171,9 @@ Resources:
           artifacts:
             files:
               - credential-process-windows.exe
+              - credential-process-windows.dist/**/*
               - otel-helper-windows.exe
+              - otel-helper-windows.dist/**/*
             name: windows-binaries
 
       LogsConfig:
