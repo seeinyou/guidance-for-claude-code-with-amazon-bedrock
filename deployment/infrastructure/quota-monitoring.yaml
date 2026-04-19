@@ -627,7 +627,7 @@ Resources:
       SQSQueueArn: !GetAtt BedrockLogQueue.Arn
       # Bump this value whenever the custom-resource reconciliation logic
       # changes so CloudFormation sends a new Update event.
-      ForceUpdate: '2026-04-19-v3'
+      ForceUpdate: '2026-04-19-v4'
 
   # --- Shared Lambda Layer for Bedrock usage utilities ---
   BedrockUsageUtilsLayer:
