@@ -640,9 +640,16 @@ done
 chmod +x "$INSTALL_DIR/credential-process"
 chmod +x "$INSTALL_DIR/python/bin/python3" 2>/dev/null || true
 
-# macOS: strip quarantine attribute so Gatekeeper doesn't prompt on every launch.
+# macOS: strip com.apple.quarantine so Gatekeeper doesn't prompt for ad-hoc
+# signed PBS binaries. Use /usr/bin/xattr explicitly because Python's bundled
+# xattr shadows it on PATH and doesn't support -r. Fall back to a find loop
+# in case /usr/bin/xattr is unavailable (very old macOS).
 if [ "$(uname -s)" = "Darwin" ]; then
-    xattr -dr com.apple.quarantine "$INSTALL_DIR" 2>/dev/null || true
+    if [ -x /usr/bin/xattr ]; then
+        /usr/bin/xattr -dr com.apple.quarantine "$INSTALL_DIR" 2>/dev/null || true
+    else
+        find "$INSTALL_DIR" -print0 | xargs -0 xattr -d com.apple.quarantine 2>/dev/null || true
+    fi
 fi
 
 echo "    Files copied."
@@ -781,7 +788,7 @@ echo "Next: run 'claude' in a new shell to trigger first login."
         #    already stripped upstream. Needs GNU strip since BSD strip doesn't
         #    grok ELF; on macOS we use Homebrew binutils.
         if target_platform.startswith("linux"):
-            self._strip_linux_elves(python_dir)
+            self._strip_linux_elves(python_dir, target_platform)
 
         # 4. Install vendored wheels into the bundle's site-packages.
         site_packages = python_dir / "lib" / f"python{self._PBS_VERSION.rsplit('.', 1)[0]}" / "site-packages"
@@ -842,47 +849,73 @@ echo "Next: run 'claude' in a new shell to trigger first login."
         console.print(f"[green]OK {target_platform} portable package assembled[/green]")
         return wrapper
 
-    def _strip_linux_elves(self, python_dir: Path) -> None:
-        """Strip debug_info from PBS Linux ELFs (libpython, python3.X, *.so).
+    def _strip_linux_elves(self, python_dir: Path, target_platform: str) -> None:
+        """Strip .debug_* sections from PBS Linux ELFs with elfutils' eu-strip.
 
-        Needs GNU strip: BSD strip (/usr/bin/strip on macOS) can't parse ELF.
-        On macOS we look for Homebrew binutils; on Linux the system strip works.
-        If no suitable strip is found, we warn and leave debug symbols in place.
+        GNU binutils strip (both Homebrew 2.46 on macOS and Debian 12's system
+        binutils) corrupts PBS's ELFs: it rewrites the `.gnu.version → .dynsym`
+        Link index incorrectly (warns `allocated section '.dynstr' not in
+        segment`) and the stripped binary crashes at runtime with
+        `undefined symbol: , version`. elfutils' `eu-strip` handles PBS's ELF
+        layout correctly.
+
+        We always run strip inside Docker so the output is deterministic
+        regardless of the builder's host tools. If Docker isn't available we
+        warn and skip — bundle stays ~3x bigger but still functional.
         """
         import shutil as _shutil
 
-        strip_bin = None
-        for candidate in (
-            "/opt/homebrew/opt/binutils/bin/strip",  # macOS arm64 Homebrew
-            "/usr/local/opt/binutils/bin/strip",  # macOS intel Homebrew
-        ):
-            if Path(candidate).exists():
-                strip_bin = candidate
-                break
-        if strip_bin is None:
-            strip_bin = _shutil.which("strip")
-        if strip_bin is None:
-            Console().print(
-                "[yellow]Warning: strip not found; Linux bundle will include debug symbols "
-                "(~3x larger). Install GNU binutils for smaller bundles.[/yellow]"
+        console = Console()
+
+        docker_bin = _shutil.which("docker")
+        if docker_bin is None:
+            console.print(
+                "[yellow]Warning: docker not found; Linux bundle will keep debug "
+                "symbols (~3x larger). Install Docker for smaller bundles.[/yellow]"
             )
             return
 
-        # python-build-standalone ELFs: the interpreter, libpython, and every
-        # C extension under lib-dynload/ and site-packages/. strip is idempotent
-        # so over-including is harmless; under-including leaves bloat behind.
-        targets = [
-            python_dir / "bin" / f"python{self._PBS_VERSION.rsplit('.', 1)[0]}",
-        ]
-        targets.extend(python_dir.rglob("*.so"))
-        targets.extend(python_dir.rglob("*.so.*"))
-        for target in targets:
-            if not target.is_file() or target.is_symlink():
-                continue
-            subprocess.run(
-                [strip_bin, "--strip-unneeded", str(target)],
-                capture_output=True,
-                text=True,
+        # Quick liveness check — docker installed but daemon not running should
+        # not abort the whole build, just degrade gracefully.
+        probe = subprocess.run(
+            [docker_bin, "info"], capture_output=True, text=True, timeout=10
+        )
+        if probe.returncode != 0:
+            console.print(
+                "[yellow]Warning: docker daemon not running; Linux bundle will "
+                "keep debug symbols (~3x larger).[/yellow]"
+            )
+            return
+
+        # Docker platform must match the ELF architecture of the bundle being
+        # stripped — otherwise eu-strip inside the container can't read them.
+        docker_platform = "linux/arm64" if target_platform == "linux-arm64" else "linux/amd64"
+        console.print(
+            f"[dim]Stripping Linux ELFs via Docker (debian:12-slim + eu-strip, "
+            f"{docker_platform})...[/dim]"
+        )
+        script = (
+            "set -e; "
+            "apt-get update -qq >/dev/null; "
+            "apt-get install -y -qq --no-install-recommends elfutils >/dev/null; "
+            'find /work -type f \\( -name "python3.12" -o -name "*.so" -o -name "*.so.*" \\) '
+            '  -not -xtype l -print0 | xargs -0 -r -n 1 eu-strip'
+        )
+        result = subprocess.run(
+            [
+                docker_bin, "run", "--rm",
+                "--platform", docker_platform,
+                "-v", f"{python_dir.resolve()}:/work",
+                "debian:12-slim", "sh", "-c", script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            console.print(
+                f"[yellow]Warning: docker strip failed; bundle keeps debug symbols. "
+                f"stderr: {result.stderr.strip()[:300]}[/yellow]"
             )
 
     # Floor Python version for the slim bundle. Chosen to cover Amazon Linux
