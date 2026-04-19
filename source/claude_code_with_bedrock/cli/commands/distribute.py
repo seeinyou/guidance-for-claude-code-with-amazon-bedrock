@@ -70,31 +70,6 @@ class DistributeCommand(Command):
         option("latest", description="Auto-select latest build without wizard", flag=True),
     ]
 
-    def _refine_windows_installer(self, package_path: Path, console: Console):
-        """Refine Windows install.bat for cmd.exe and PowerShell compatibility."""
-        install_bat = package_path / "install.bat"
-        if not install_bat.exists():
-            return
-
-        from importlib.util import module_from_spec, spec_from_file_location
-
-        spec = spec_from_file_location(
-            "refine_win_install",
-            Path(__file__).parent / "refine-win-install.py",
-        )
-        refiner = module_from_spec(spec)
-        spec.loader.exec_module(refiner)
-
-        content = install_bat.read_text()
-        crlf = "\r\n" in content
-        if crlf:
-            content = content.replace("\r\n", "\n")
-        content = refiner.refine_installer(content)
-        if crlf:
-            content = content.replace("\n", "\r\n")
-        install_bat.write_text(content)
-        console.print("  [green]✓ Windows installer refined[/green]")
-
     def _check_old_flat_structure(self, dist_dir: Path) -> bool:
         """Check if old flat directory structure exists."""
         if not dist_dir.exists():
@@ -158,21 +133,11 @@ class DistributeCommand(Command):
         return builds
 
     def _detect_platforms(self, build_dir: Path) -> list:
-        """Detect which platforms are available in a build."""
+        """Detect which bundle variants are present in a build directory."""
         platforms = []
-
-        platform_files = {
-            "macos-arm64": "credential-process-macos-arm64",
-            "macos-intel": "credential-process-macos-intel",
-            "linux-x64": "credential-process-linux-x64",
-            "linux-arm64": "credential-process-linux-arm64",
-            "windows": "credential-process-windows.exe",
-        }
-
-        for platform, filename in platform_files.items():
-            if (build_dir / filename).exists():
-                platforms.append(platform)
-
+        for bundle_name, s3_key in self._BUNDLE_TO_KEY.items():
+            if (build_dir / bundle_name).is_dir():
+                platforms.append(s3_key)
         return platforms
 
     def _format_size(self, bytes_size: int) -> str:
@@ -314,9 +279,6 @@ class DistributeCommand(Command):
         package_path = selected_build_path
         console.print(f"\n[green]Using build: {package_path.parent.name}/{package_path.name}[/green]")
 
-        # Refine Windows installer for cmd.exe/PowerShell compatibility
-        self._refine_windows_installer(package_path, console)
-
         # Load configuration
         config = Config.load()
 
@@ -448,19 +410,31 @@ class DistributeCommand(Command):
                 console.print(f"[red]Error retrieving URL: {e}[/red]")
             return 1
 
+    # Mapping from bundle directory name to S3 key.
+    # Portable bundles strip the "-portable" suffix (the portable runtime is the
+    # default, so the key stays short); slim bundles keep "-slim" so both
+    # variants can coexist for Linux.
+    _BUNDLE_TO_KEY = {
+        "windows-portable": "windows",
+        "macos-arm64-portable": "macos-arm64",
+        "macos-intel-portable": "macos-intel",
+        "linux-x64-portable": "linux-x64",
+        "linux-arm64-portable": "linux-arm64",
+        "linux-x64-slim": "linux-x64-slim",
+        "linux-arm64-slim": "linux-arm64-slim",
+    }
+
     def _upload_landing_page_packages(self, profile, console: Console, package_path: Path) -> int:
-        """Upload platform-specific packages to S3 for the landing page."""
+        """Upload per-bundle zip archives to S3 for the landing page."""
         import zipfile
 
         import boto3
 
-        # Validate package directory
         if not package_path.exists():
             console.print(f"[red]Package directory not found: {package_path}[/red]")
             console.print("Run 'poetry run ccwb package' first to build packages.")
             return 1
 
-        # Get S3 bucket from distribution stack outputs
         dist_stack_name = profile.stack_names.get("distribution", f"{profile.identity_pool_name}-distribution")
         try:
             stack_outputs = get_stack_outputs(dist_stack_name, profile.aws_region)
@@ -474,205 +448,120 @@ class DistributeCommand(Command):
             console.print("Deploy the distribution stack first: poetry run ccwb deploy distribution")
             return 1
 
-        # Check for Windows binaries and auto-download if needed
-        console.print("\n[bold]Checking for Windows binaries...[/bold]")
-        windows_exe = package_path / "credential-process-windows.exe"
-        if not windows_exe.exists():
-            # Check if Windows build is completed and download it
-            try:
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Get details of recent builds
-                    build_ids = response["ids"][:5]  # Check last 5 builds
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "SUCCEEDED":
-                            # Found a successful build, download it
-                            build_time = build.get("endTime", build.get("startTime"))
-                            console.print(
-                                f"  [cyan]Found completed Windows build from "
-                                f"{build_time.strftime('%Y-%m-%d %H:%M')}[/cyan]"
-                            )
-                            console.print("  [cyan]Downloading Windows artifacts...[/cyan]")
-
-                            if self._download_windows_artifacts(profile, package_path, console):
-                                console.print("  [green]✓ Downloaded Windows artifacts[/green]")
-                            else:
-                                console.print("  [yellow]⚠️  Failed to download Windows artifacts[/yellow]")
-                            break
-                        elif build["buildStatus"] == "IN_PROGRESS":
-                            console.print("  [yellow]⚠️  Windows build in progress[/yellow]")
-                            break
-            except Exception as e:
-                console.print(f"  [dim]Could not check Windows build status: {e}[/dim]")
-        else:
-            console.print("  [green]✓ Windows binaries found[/green]")
-
-        # Map available binaries to platforms
         console.print("\n[bold]Scanning package directory...[/bold]")
 
-        # Platform file mappings
-        platform_files = {
-            "windows": [
-                ("credential-process-windows.exe", "credential-process-windows.exe"),
-                ("otel-helper-windows.exe", "otel-helper-windows.exe"),
-                ("install.bat", "install.bat"),
-                ("config.json", "config.json"),
-                ("README.md", "README.md"),
-            ],
-            "linux": [
-                ("credential-process-linux-x64", "credential-process-linux-x64"),
-                ("credential-process-linux-arm64", "credential-process-linux-arm64"),
-                ("otel-helper-linux-x64", "otel-helper-linux-x64"),
-                ("otel-helper-linux-arm64", "otel-helper-linux-arm64"),
-                ("install.sh", "install.sh"),
-                ("config.json", "config.json"),
-                ("README.md", "README.md"),
-            ],
-            "mac": [
-                ("credential-process-macos-arm64", "credential-process-macos-arm64"),
-                ("credential-process-macos-intel", "credential-process-macos-intel"),
-                ("otel-helper-macos-arm64", "otel-helper-macos-arm64"),
-                ("otel-helper-macos-intel", "otel-helper-macos-intel"),
-                ("install.sh", "install.sh"),
-                ("config.json", "config.json"),
-                ("README.md", "README.md"),
-            ],
-        }
+        # Discover which bundle directories the packager produced.
+        discovered: list[tuple[str, str, Path]] = []  # (bundle_dir_name, s3_key, path)
+        for bundle_name, s3_key in self._BUNDLE_TO_KEY.items():
+            bundle_path = package_path / bundle_name
+            if bundle_path.is_dir():
+                discovered.append((bundle_name, s3_key, bundle_path))
+                console.print(f"  ✓ {bundle_name}/ → packages/{s3_key}/latest.zip")
 
-        # Determine which platforms are available
-        available_platforms = {}
-        for platform, files in platform_files.items():
-            # Check if at least one executable exists for this platform
-            has_platform = False
-            for source_file, _ in files:
-                # Check if this is an executable (contains these strings, not just ends with them)
-                if source_file.endswith(".exe") or "credential-process" in source_file or "otel-helper" in source_file:
-                    if (package_path / source_file).exists():
-                        has_platform = True
-                        break
-
-            if has_platform:
-                available_platforms[platform] = files
-                console.print(f"  ✓ {platform.capitalize()} platform detected")
-
-        if not available_platforms:
-            console.print("[red]No platform packages found![/red]")
-            console.print("Run: [cyan]poetry run ccwb package[/cyan] first")
+        if not discovered:
+            console.print("[red]No bundle directories found under the package path.[/red]")
+            console.print(
+                f"Expected one or more of: {', '.join(self._BUNDLE_TO_KEY.keys())}"
+            )
+            console.print("Run: [cyan]poetry run ccwb package[/cyan] first.")
             return 1
 
-        # Create all-platforms package (includes everything)
-        all_files = []
-        for files in platform_files.values():
-            all_files.extend(files)
-        # Deduplicate
-        all_files = list(set(all_files))
-        available_platforms["all-platforms"] = all_files
+        # Extract profile name and build timestamp from package_path.
+        # Expected format: dist/<profile>/<YYYY-MM-DD-HHMMSS>/. Dir names that
+        # don't match (e.g. manual consolidations like "2026-04-19-final") fall
+        # back to the directory's mtime so the landing page never renders
+        # garbage like "2026-04-19 fi:na:l".
+        import re
+        from datetime import datetime as _dt
 
-        # Create temp directory for package ZIPs
-        temp_dir = Path(tempfile.mkdtemp())
-
-        # Extract profile name and timestamp from package_path
-        # Path format: dist/3p-claude-code/2025-11-11-144312
         profile_name = package_path.parent.name
         build_timestamp = package_path.name
-
-        # Format release date for display (convert timestamp to readable format)
-        # From: 2025-11-11-144312 To: 2025-11-11 14:43:12
-        release_date = build_timestamp[:10]  # YYYY-MM-DD
-        release_time = (
-            f"{build_timestamp[11:13]}:{build_timestamp[13:15]}:{build_timestamp[15:17]}"
-            if len(build_timestamp) > 10
-            else "00:00:00"
-        )
+        m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})(\d{2})", build_timestamp)
+        if m:
+            release_date = m.group(1)
+            release_time = f"{m.group(2)}:{m.group(3)}:{m.group(4)}"
+        else:
+            mtime = _dt.fromtimestamp(package_path.stat().st_mtime)
+            release_date = mtime.strftime("%Y-%m-%d")
+            release_time = mtime.strftime("%H:%M:%S")
         release_datetime = f"{release_date} {release_time}"
 
-        # Clean up old packages in S3 to prevent stale platform packages from appearing
         s3 = boto3.client("s3", region_name=profile.aws_region)
+
+        # Purge every stale object under packages/ so renamed keys (e.g. legacy
+        # "linux"/"mac"/"all-platforms") don't keep showing up on the landing page.
         console.print("\n[dim]Cleaning up old packages from S3...[/dim]")
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            to_delete = []
+            for page in paginator.paginate(Bucket=bucket_name, Prefix="packages/"):
+                for obj in page.get("Contents", []) or []:
+                    to_delete.append({"Key": obj["Key"]})
+            # delete_objects takes up to 1000 keys per call; batch to be safe.
+            for i in range(0, len(to_delete), 1000):
+                batch = to_delete[i : i + 1000]
+                if batch:
+                    s3.delete_objects(Bucket=bucket_name, Delete={"Objects": batch})
+            if to_delete:
+                console.print(f"[dim]    Removed {len(to_delete)} stale object(s).[/dim]")
+        except ClientError as e:
+            console.print(f"[yellow]Warning: could not clean up old packages: {e}[/yellow]")
 
-        # Delete all existing packages/*/latest.zip files
-        platforms_to_clean = ["windows", "linux", "mac", "all-platforms"]
-        for platform in platforms_to_clean:
-            s3_key = f"packages/{platform}/latest.zip"
-            try:
-                s3.delete_object(Bucket=bucket_name, Key=s3_key)
-            except ClientError:
-                # Ignore errors if file doesn't exist
-                pass
-
-        # Create and upload each platform package
+        temp_dir = Path(tempfile.mkdtemp())
         uploaded_count = 0
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            console=console,
-        ) as progress:
-            task = progress.add_task("Uploading packages to S3...", total=len(available_platforms))
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.1f}%",
+                console=console,
+            ) as progress:
+                task = progress.add_task("Uploading packages to S3...", total=len(discovered))
 
-            for platform, files in available_platforms.items():
-                # Create platform-specific ZIP
-                zip_path = temp_dir / f"{platform}.zip"
+                for bundle_name, s3_key, bundle_path in discovered:
+                    zip_path = temp_dir / f"{s3_key}.zip"
+                    # Each zip contains exactly the bundle directory at the top
+                    # level so `unzip foo.zip` produces a single named folder.
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                        for entry in bundle_path.rglob("*"):
+                            if entry.is_file():
+                                rel = entry.relative_to(bundle_path)
+                                zipf.write(entry, f"{bundle_name}/{rel}")
 
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    # Create claude-code-package directory in the ZIP
-                    for source_file, archive_name in files:
-                        source_path = package_path / source_file
-                        if source_path.exists():
-                            zipf.write(source_path, f"claude-code-package/{archive_name}")
+                    s3_object_key = f"packages/{s3_key}/latest.zip"
+                    try:
+                        s3.upload_file(
+                            str(zip_path),
+                            bucket_name,
+                            s3_object_key,
+                            ExtraArgs={
+                                "Metadata": {
+                                    "profile": profile_name,
+                                    "timestamp": build_timestamp,
+                                    "release_date": release_date,
+                                    "release_datetime": release_datetime,
+                                }
+                            },
+                        )
+                        uploaded_count += 1
+                        progress.update(task, advance=1, description=f"Uploaded {s3_key}")
+                    except ClientError as e:
+                        console.print(f"[red]Failed to upload {s3_key} package: {e}[/red]")
+                        continue
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-                    # Include claude-settings if it exists
-                    settings_dir = package_path / "claude-settings"
-                    if settings_dir.exists() and settings_dir.is_dir():
-                        for file in settings_dir.rglob("*"):
-                            if file.is_file():
-                                rel_path = file.relative_to(package_path)
-                                zipf.write(file, f"claude-code-package/{rel_path}")
-
-                # Upload to S3 at packages/{platform}/latest.zip
-                s3_key = f"packages/{platform}/latest.zip"
-                try:
-                    s3.upload_file(
-                        str(zip_path),
-                        bucket_name,
-                        s3_key,
-                        ExtraArgs={
-                            "Metadata": {
-                                "profile": profile_name,
-                                "timestamp": build_timestamp,
-                                "release_date": release_date,
-                                "release_datetime": release_datetime,
-                            }
-                        },
-                    )
-                    uploaded_count += 1
-                    progress.update(task, advance=1, description=f"Uploaded {platform} package")
-                except ClientError as e:
-                    console.print(f"[red]Failed to upload {platform} package: {e}[/red]")
-                    continue
-
-        # Clean up temp directory
-        shutil.rmtree(temp_dir)
-
-        # Show success message
         if uploaded_count > 0:
-            console.print(f"\n[bold green]✓ Successfully uploaded {uploaded_count} platform packages![/bold green]")
+            console.print(f"\n[bold green]✓ Successfully uploaded {uploaded_count} package(s)![/bold green]")
             console.print(f"\n[bold]Landing Page URL:[/bold] [cyan]{landing_url}[/cyan]")
             console.print(f"[dim]Profile: {profile_name}[/dim]")
             console.print(f"[dim]Build Timestamp: {build_timestamp}[/dim]")
             console.print(f"[dim]Release Date: {release_datetime}[/dim]")
-            console.print("\n[bold]Uploaded platforms:[/bold]")
-            for platform in available_platforms.keys():
-                console.print(f"  • {platform}")
+            console.print("\n[bold]Uploaded:[/bold]")
+            for _, s3_key, _ in discovered:
+                console.print(f"  • {s3_key}")
             return 0
         else:
             console.print("[red]Failed to upload any packages.[/red]")
@@ -706,124 +595,14 @@ class DistributeCommand(Command):
             console.print(f"  ✓ macOS Intel executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
             found_platforms.append("macos-intel")
 
-        # Check for Windows executables
-        windows_exe = package_path / "credential-process-windows.exe"
-        windows_exe_time = None
-        if windows_exe.exists():
-            from datetime import timezone
-
-            windows_exe_time = datetime.fromtimestamp(windows_exe.stat().st_mtime, tz=timezone.utc)
-            console.print(f"  ✓ Windows executable (built: {windows_exe_time.strftime('%Y-%m-%d %H:%M')})")
+        # Check for Windows portable package
+        windows_portable = package_path / "windows-portable"
+        if windows_portable.exists():
+            mod_time = datetime.fromtimestamp(windows_portable.stat().st_mtime)
+            console.print(f"  ✓ Windows portable package (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
             found_platforms.append("windows")
-
-            # Check if there are newer Windows builds available and download them
-            try:
-                # Get CodeBuild project name from profile
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Get details of recent successful builds
-                    build_ids = response["ids"][:3]  # Check last 3 builds
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "SUCCEEDED":
-                            build_time = build.get("endTime", build.get("startTime"))
-                            if build_time and build_time > windows_exe_time:
-                                console.print(
-                                    f"    [yellow]⚠️  Newer Windows build available "
-                                    f"(completed {build_time.strftime('%Y-%m-%d %H:%M')})[/yellow]"
-                                )
-
-                                # Automatically download the newer build
-                                console.print("    [cyan]Downloading newer Windows artifacts...[/cyan]")
-                                if self._download_windows_artifacts(profile, package_path, console):
-                                    console.print("    [green]✓ Downloaded newer Windows artifacts[/green]")
-                                    # Update the timestamp
-                                    windows_exe_time = datetime.fromtimestamp(
-                                        windows_exe.stat().st_mtime, tz=timezone.utc
-                                    )
-                                else:
-                                    console.print(
-                                        "    [yellow]Failed to download newer artifacts, using existing[/yellow]"
-                                    )
-                            break
-            except Exception:
-                pass  # Silently ignore if we can't check
         else:
-            # Check if Windows build is completed and download it
-            windows_downloaded = False
-
-            # First check for any completed builds
-            try:
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Get details of recent builds
-                    build_ids = response["ids"][:5]  # Check last 5 builds
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "SUCCEEDED":
-                            # Found a successful build, download it
-                            build_time = build.get("endTime", build.get("startTime"))
-                            console.print(
-                                f"  ⚠️  Windows executable [yellow](found completed build from "
-                                f"{build_time.strftime('%Y-%m-%d %H:%M')})[/yellow]"
-                            )
-                            console.print("    [cyan]Downloading Windows artifacts...[/cyan]")
-
-                            if self._download_windows_artifacts(profile, package_path, console):
-                                console.print("    [green]✓ Downloaded Windows artifacts[/green]")
-                                found_platforms.append("windows")
-                                windows_downloaded = True
-                            else:
-                                console.print("    [yellow]Failed to download Windows artifacts[/yellow]")
-                            break
-                        elif build["buildStatus"] == "IN_PROGRESS":
-                            console.print("  ⚠️  Windows executable [yellow](build in progress)[/yellow]")
-                            break
-            except Exception:
-                pass  # Continue to check for build info file
-
-            # If we didn't download, check build info file
-            if not windows_downloaded:
-                build_info_file = Path.home() / ".claude-code" / "latest-build.json"
-                if build_info_file.exists():
-                    with open(build_info_file) as f:
-                        build_info = json.load(f)
-
-                    # Check build status
-                    try:
-                        codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-                        response = codebuild.batch_get_builds(ids=[build_info["build_id"]])
-                        if response.get("builds"):
-                            build = response["builds"][0]
-                            if build["buildStatus"] == "IN_PROGRESS":
-                                console.print("  ⚠️  Windows executable [yellow](build in progress)[/yellow]")
-                            elif build["buildStatus"] == "SUCCEEDED":
-                                console.print("  ⚠️  Windows executable [yellow](build completed)[/yellow]")
-                                console.print("    [cyan]Downloading Windows artifacts...[/cyan]")
-
-                                if self._download_windows_artifacts(profile, package_path, console):
-                                    console.print("    [green]✓ Downloaded Windows artifacts[/green]")
-                                    found_platforms.append("windows")
-                                else:
-                                    console.print("    [yellow]Failed to download Windows artifacts[/yellow]")
-                            else:
-                                console.print("  ✗ Windows executable [red](build failed)[/red]")
-                    except Exception:
-                        console.print("  ✗ Windows executable [red](not found)[/red]")
-                elif not windows_downloaded:
-                    console.print("  ✗ Windows executable [red](not built)[/red]")
+            console.print("  ✗ Windows portable package [red](not built)[/red]")
 
         # Check for Linux executables
         linux_x64 = package_path / "credential-process-linux-x64"
@@ -1237,57 +1016,3 @@ class DistributeCommand(Command):
             size_bytes /= 1024.0
         return f"{size_bytes:.1f} TB"
 
-    def _download_windows_artifacts(self, profile, package_path: Path, console: Console) -> bool:
-        """Download Windows build artifacts from S3."""
-        import zipfile
-
-        from botocore.exceptions import ClientError
-
-        from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
-
-        try:
-            # Windows artifacts are always in the CodeBuild bucket
-            if not profile.enable_codebuild:
-                console.print("[red]CodeBuild is not enabled for this profile[/red]")
-                return False
-
-            codebuild_stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
-            codebuild_outputs = get_stack_outputs(codebuild_stack_name, profile.aws_region)
-
-            if not codebuild_outputs:
-                console.print("[red]CodeBuild stack not found[/red]")
-                return False
-
-            bucket_name = codebuild_outputs.get("BuildBucket")
-            project_name = codebuild_outputs.get("ProjectName")
-
-            if not bucket_name or not project_name:
-                console.print("[red]Could not get CodeBuild bucket or project name from stack outputs[/red]")
-                return False
-
-            # Download from S3
-            s3 = boto3.client("s3", region_name=profile.aws_region)
-            zip_path = package_path / "windows-binaries.zip"
-
-            # CodeBuild stores artifacts at root of bucket
-            artifact_key = "windows-binaries.zip"
-
-            try:
-                s3.download_file(bucket_name, artifact_key, str(zip_path))
-
-                # Extract binaries
-                with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                    zip_ref.extractall(package_path)
-
-                # Clean up
-                zip_path.unlink()
-                return True
-
-            except ClientError as e:
-                console.print(f"[red]Failed to download artifacts: {e}[/red]")
-                console.print(f"[dim]Tried: s3://{bucket_name}/{artifact_key}[/dim]")
-                return False
-
-        except Exception as e:
-            console.print(f"[red]Error downloading Windows artifacts: {e}[/red]")
-            return False
