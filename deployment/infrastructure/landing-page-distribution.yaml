@@ -642,16 +642,6 @@ Resources:
               mac_icon   = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>'
               linux_icon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.686 2 6 5.02 6 8.5c0 1.8.6 3.4 1.6 4.6-.4.7-.6 1.4-.6 2.1 0 1.4.7 2.7 1.8 3.5-.3.4-.5.9-.5 1.4 0 1.3 1 2.4 2.4 2.4h2.6c1.4 0 2.4-1.1 2.4-2.4 0-.5-.2-1-.5-1.4 1.1-.8 1.8-2.1 1.8-3.5 0-.7-.2-1.4-.6-2.1C17.4 11.9 18 10.3 18 8.5 18 5.02 15.314 2 12 2z"/></svg>'
 
-              platform_meta = {
-                  'windows':           {'label': 'Windows',                'desc': 'Windows 10 / 11 (x64) — portable Python',           'icon': win_icon,   'variant_tag': 'Portable', 'os_group': 'windows'},
-                  'macos-arm64':       {'label': 'macOS ARM64',            'desc': 'Apple Silicon — macOS 11+ — portable Python',       'icon': mac_icon,   'variant_tag': 'Portable', 'os_group': 'mac'},
-                  'macos-intel':       {'label': 'macOS Intel',            'desc': 'Intel — macOS 10.12+ — portable Python',            'icon': mac_icon,   'variant_tag': 'Portable', 'os_group': 'mac'},
-                  'linux-x64':         {'label': 'Linux x64',              'desc': 'Self-contained — no system Python required',        'icon': linux_icon, 'variant_tag': 'Portable', 'os_group': 'linux'},
-                  'linux-arm64':       {'label': 'Linux ARM64',            'desc': 'Self-contained — no system Python required',        'icon': linux_icon, 'variant_tag': 'Portable', 'os_group': 'linux'},
-                  'linux-x64-slim':    {'label': 'Linux x64',              'desc': 'Small download — needs system Python 3.9+',         'icon': linux_icon, 'variant_tag': 'Slim',     'os_group': 'linux'},
-                  'linux-arm64-slim':  {'label': 'Linux ARM64',            'desc': 'Small download — needs system Python 3.9+',         'icon': linux_icon, 'variant_tag': 'Slim',     'os_group': 'linux'},
-              }
-
               # Pick one card to tag as "Recommended" based on the detected OS.
               # Arch isn't reliably in the User-Agent; for Linux we prefer slim
               # (smaller download — anyone with a modern distro will have
@@ -670,39 +660,99 @@ Resources:
                           recommended_key = k
                           break
 
-              platform_cards = []
-              for platform_key in PLATFORM_KEYS:
-                  if platform_key in download_urls:
-                      meta = platform_meta.get(platform_key, {})
-                      size_str = format_size(packages.get(platform_key, {}).get('size', 0))
-                      is_recommended = (platform_key == recommended_key)
-                      rec_badge = '<span class="rec-badge"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Recommended</span>' if is_recommended else ''
-                      variant_tag = meta.get('variant_tag', '')
-                      # Slim tag gets an accent color; portable is neutral.
-                      variant_class = 'variant-pill variant-slim' if variant_tag == 'Slim' else 'variant-pill'
-                      variant_html = f'<span class="{variant_class}">{variant_tag}</span>' if variant_tag else ''
-                      card_class = 'pkg-card recommended' if is_recommended else 'pkg-card'
-                      icon_html = meta.get('icon', '')
-                      label     = meta.get('label', platform_key)
-                      desc      = meta.get('desc', '')
-                      dl_url    = download_urls[platform_key]
-                      dl_icon   = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
-                      sz_icon   = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
-                      platform_cards.append(
-                          f'<div class="{card_class}">'
-                          f'<div class="pkg-card-header">'
-                          f'<div class="pkg-icon">{icon_html}</div>'
-                          f'<div class="pkg-info">'
-                          f'<div class="pkg-name">{label} {variant_html} {rec_badge}</div>'
-                          f'<div class="pkg-desc">{desc}</div>'
-                          f'</div></div>'
-                          f'<div class="pkg-meta">{sz_icon} {size_str}</div>'
-                          f'<a href="{dl_url}" class="download-btn">{dl_icon} Download</a>'
-                          f'</div>'
+              dl_icon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
+              sz_icon = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
+              rec_badge_html = '<span class="rec-badge"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Recommended</span>'
+
+              def render_simple_card(key, icon, label, desc):
+                  size_str = format_size(packages.get(key, {}).get('size', 0))
+                  is_rec = (key == recommended_key)
+                  rec = rec_badge_html if is_rec else ''
+                  cls = 'pkg-card recommended' if is_rec else 'pkg-card'
+                  url = download_urls[key]
+                  return (
+                      f'<div class="{cls}">'
+                      f'<div class="pkg-card-header">'
+                      f'<div class="pkg-icon">{icon}</div>'
+                      f'<div class="pkg-info">'
+                      f'<div class="pkg-name">{label} {rec}</div>'
+                      f'<div class="pkg-desc">{desc}</div>'
+                      f'</div></div>'
+                      f'<div class="pkg-meta">{sz_icon} {size_str}</div>'
+                      f'<a href="{url}" class="download-btn">{dl_icon} Download</a>'
+                      f'</div>'
+                  )
+
+              def render_linux_card(label, portable_key, slim_key):
+                  is_rec = (portable_key == recommended_key or slim_key == recommended_key)
+                  rec = rec_badge_html if is_rec else ''
+                  cls = 'pkg-card recommended' if is_rec else 'pkg-card'
+                  buttons = []
+                  if portable_key and portable_key in download_urls:
+                      size = format_size(packages.get(portable_key, {}).get('size', 0))
+                      url = download_urls[portable_key]
+                      buttons.append(
+                          f'<a href="{url}" class="variant-btn variant-btn-portable">'
+                          f'<span class="variant-btn-title">Portable</span>'
+                          f'<span class="variant-btn-sub">Self-contained · {size}</span>'
+                          f'</a>'
+                      )
+                  if slim_key and slim_key in download_urls:
+                      size = format_size(packages.get(slim_key, {}).get('size', 0))
+                      url = download_urls[slim_key]
+                      buttons.append(
+                          f'<a href="{url}" class="variant-btn variant-btn-slim">'
+                          f'<span class="variant-btn-title">Slim</span>'
+                          f'<span class="variant-btn-sub">Needs Python 3.9+ · {size}</span>'
+                          f'</a>'
+                      )
+                  return (
+                      f'<div class="{cls}">'
+                      f'<div class="pkg-card-header">'
+                      f'<div class="pkg-icon">{linux_icon}</div>'
+                      f'<div class="pkg-info">'
+                      f'<div class="pkg-name">{label} {rec}</div>'
+                      f'<div class="pkg-desc">Choose a variant based on your system Python.</div>'
+                      f'</div></div>'
+                      f'<div class="variant-btn-row">{"".join(buttons)}</div>'
+                      f'</div>'
+                  )
+
+              # Group cards by OS. Groups with no available packages are omitted.
+              windows_cards = []
+              if 'windows' in download_urls:
+                  windows_cards.append(render_simple_card('windows', win_icon, 'Windows', 'Windows 10 / 11 (x64) — portable Python'))
+
+              mac_cards = []
+              if 'macos-arm64' in download_urls:
+                  mac_cards.append(render_simple_card('macos-arm64', mac_icon, 'macOS — Apple Silicon', 'macOS 11+ — portable Python'))
+              if 'macos-intel' in download_urls:
+                  mac_cards.append(render_simple_card('macos-intel', mac_icon, 'macOS — Intel', 'macOS 10.12+ — portable Python'))
+
+              linux_cards = []
+              for portable_key, slim_key, arch_label in (
+                  ('linux-x64',   'linux-x64-slim',   'Linux x64'),
+                  ('linux-arm64', 'linux-arm64-slim', 'Linux ARM64'),
+              ):
+                  if portable_key in download_urls or slim_key in download_urls:
+                      linux_cards.append(render_linux_card(arch_label, portable_key, slim_key))
+
+              os_sections = []
+              for group_title, group_cards in (
+                  ('Windows', windows_cards),
+                  ('macOS',   mac_cards),
+                  ('Linux',   linux_cards),
+              ):
+                  if group_cards:
+                      os_sections.append(
+                          f'<section class="os-section">'
+                          f'<h2 class="os-heading">{group_title}</h2>'
+                          f'<div class="download-grid">{"".join(group_cards)}</div>'
+                          f'</section>'
                       )
 
-              if not platform_cards:
-                  platform_cards.append('<div class="no-pkg"><strong>No packages available.</strong> No packages have been published yet. Please contact your IT administrator.</div>')
+              if not os_sections:
+                  os_sections.append('<div class="no-pkg"><strong>No packages available.</strong> No packages have been published yet. Please contact your IT administrator.</div>')
 
               return f'''<!DOCTYPE html>
               <html lang="en">
@@ -791,10 +841,44 @@ Resources:
                 text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px;
               }}
 
+              .os-section {{ margin-bottom: 28px; }}
+              .os-section + .os-section {{ margin-top: 4px; }}
+              .os-heading {{
+                font-size: 12px; font-weight: 700; color: var(--text-secondary);
+                text-transform: uppercase; letter-spacing: .08em;
+                margin-bottom: 10px;
+                display: flex; align-items: center; gap: 8px;
+              }}
+              .os-heading::after {{
+                content: ''; flex: 1; height: 1px; background: var(--border);
+              }}
               .download-grid {{
                 display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-                gap: 12px; margin-bottom: 32px;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 12px;
+              }}
+              .variant-btn-row {{
+                display: flex; gap: 8px; margin-top: 4px;
+              }}
+              .variant-btn {{
+                flex: 1; display: flex; flex-direction: column; gap: 2px;
+                padding: 10px 12px; border-radius: var(--radius);
+                text-decoration: none; border: 1px solid transparent;
+                transition: background .15s, border-color .15s, box-shadow .15s;
+              }}
+              .variant-btn-title {{ font-size: 13px; font-weight: 600; }}
+              .variant-btn-sub {{ font-size: 11.5px; opacity: .85; }}
+              .variant-btn-portable {{
+                background: var(--accent); color: var(--white);
+                box-shadow: 0 1px 3px rgba(0,120,212,.3);
+              }}
+              .variant-btn-portable:hover {{ background: var(--accent-hover); }}
+              .variant-btn-slim {{
+                background: var(--white); color: var(--brand);
+                border-color: var(--brand-light);
+              }}
+              .variant-btn-slim:hover {{
+                background: rgba(26,63,130,.05); border-color: var(--brand);
               }}
               .pkg-card {{
                 background: var(--white); border: 1px solid var(--border);
@@ -925,9 +1009,7 @@ Resources:
               </div>
 
               <div class="section-heading">Available Packages</div>
-              <div class="download-grid">
-                {"".join(platform_cards)}
-              </div>
+              {"".join(os_sections)}
 
               <div class="instructions-card">
                 <h3>Installation Guide</h3>
