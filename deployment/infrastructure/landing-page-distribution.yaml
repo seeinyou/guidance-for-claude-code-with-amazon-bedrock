@@ -319,6 +319,16 @@ Resources:
           BUCKET_NAME = os.environ['S3_BUCKET_NAME']
           PRESIGNED_URL_EXPIRY = 3600  # 1 hour
 
+          # Per-bundle S3 keys. One key per platform + variant. Portable bundles
+          # are self-contained (~35-130 MB); slim bundles (~29 MB) reuse the
+          # user's system Python 3.9+ and only exist for Linux.
+          PLATFORM_KEYS = [
+              'windows',
+              'macos-arm64', 'macos-intel',
+              'linux-x64-slim', 'linux-arm64-slim',
+              'linux-x64', 'linux-arm64',
+          ]
+
           def lambda_handler(event, context):
               """Handle authenticated requests from ALB and generate landing page"""
               import uuid
@@ -368,14 +378,21 @@ Resources:
 
                   # Generate presigned URLs for each package
                   download_urls = {}
-                  for platform in ['windows', 'linux', 'mac', 'all-platforms']:
+                  for platform in PLATFORM_KEYS:
                       if platform in packages:
                           download_urls[platform] = generate_presigned_url(
                               f"packages/{platform}/latest.zip"
                           )
 
-                  # Get metadata from first available package (prefer windows)
-                  metadata_source = packages.get('windows') or packages.get('mac') or packages.get('linux') or packages.get('all-platforms', {})
+                  # Get metadata from the first available package. Preference
+                  # order matches what most users land on (windows > mac > linux).
+                  metadata_source = (
+                      packages.get('windows')
+                      or packages.get('macos-arm64') or packages.get('macos-intel')
+                      or packages.get('linux-x64-slim') or packages.get('linux-arm64-slim')
+                      or packages.get('linux-x64') or packages.get('linux-arm64')
+                      or {}
+                  )
                   profile = metadata_source.get('profile', 'Unknown')
                   timestamp = metadata_source.get('timestamp', 'Unknown')
                   release_datetime = metadata_source.get('release_datetime', 'Unknown')
@@ -485,7 +502,7 @@ Resources:
               """List available packages in S3 with metadata"""
               packages = {}
 
-              for platform in ['windows', 'linux', 'mac', 'all-platforms']:
+              for platform in PLATFORM_KEYS:
                   try:
                       response = s3_client.head_object(
                           Bucket=BUCKET_NAME,
@@ -617,39 +634,53 @@ Resources:
                       # If parsing fails, use as-is
                       pass
 
-              # Generate platform cards
-              platform_cards = []
+              # Platform metadata. One entry per S3 key in PLATFORM_KEYS.
+              # Icons: shared Windows / macOS / Linux SVGs. Slim vs portable
+              # variants disambiguate via the `variant_tag` pill in the card
+              # header (no new icon needed).
+              win_icon   = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.6L10.5 4.5V11.5H3V5.6ZM11.5 4.35L21 3V11.5H11.5V4.35ZM3 12.5H10.5V19.5L3 18.4V12.5ZM11.5 12.5H21V21L11.5 19.65V12.5Z"/></svg>'
+              mac_icon   = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>'
+              linux_icon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.686 2 6 5.02 6 8.5c0 1.8.6 3.4 1.6 4.6-.4.7-.6 1.4-.6 2.1 0 1.4.7 2.7 1.8 3.5-.3.4-.5.9-.5 1.4 0 1.3 1 2.4 2.4 2.4h2.6c1.4 0 2.4-1.1 2.4-2.4 0-.5-.2-1-.5-1.4 1.1-.8 1.8-2.1 1.8-3.5 0-.7-.2-1.4-.6-2.1C17.4 11.9 18 10.3 18 8.5 18 5.02 15.314 2 12 2z"/></svg>'
 
               platform_meta = {
-                  'windows': {
-                      'label': 'Windows',
-                      'desc': 'For Windows 10 / 11 (x64)',
-                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.6L10.5 4.5V11.5H3V5.6ZM11.5 4.35L21 3V11.5H11.5V4.35ZM3 12.5H10.5V19.5L3 18.4V12.5ZM11.5 12.5H21V21L11.5 19.65V12.5Z"/></svg>',
-                  },
-                  'linux': {
-                      'label': 'Linux',
-                      'desc': 'For Ubuntu 20.04+ / RHEL 8+ (x64)',
-                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.686 2 6 5.02 6 8.5c0 1.8.6 3.4 1.6 4.6-.4.7-.6 1.4-.6 2.1 0 1.4.7 2.7 1.8 3.5-.3.4-.5.9-.5 1.4 0 1.3 1 2.4 2.4 2.4h2.6c1.4 0 2.4-1.1 2.4-2.4 0-.5-.2-1-.5-1.4 1.1-.8 1.8-2.1 1.8-3.5 0-.7-.2-1.4-.6-2.1C17.4 11.9 18 10.3 18 8.5 18 5.02 15.314 2 12 2z"/></svg>',
-                  },
-                  'mac': {
-                      'label': 'macOS',
-                      'desc': 'For macOS 12+ (Apple Silicon & Intel)',
-                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>',
-                  },
-                  'all-platforms': {
-                      'label': 'All Platforms',
-                      'desc': 'Complete bundle — Windows, Linux, macOS',
-                      'icon': '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
-                  },
+                  'windows':           {'label': 'Windows',                'desc': 'Windows 10 / 11 (x64) — portable Python',           'icon': win_icon,   'variant_tag': 'Portable', 'os_group': 'windows'},
+                  'macos-arm64':       {'label': 'macOS ARM64',            'desc': 'Apple Silicon — macOS 11+ — portable Python',       'icon': mac_icon,   'variant_tag': 'Portable', 'os_group': 'mac'},
+                  'macos-intel':       {'label': 'macOS Intel',            'desc': 'Intel — macOS 10.12+ — portable Python',            'icon': mac_icon,   'variant_tag': 'Portable', 'os_group': 'mac'},
+                  'linux-x64':         {'label': 'Linux x64',              'desc': 'Self-contained — no system Python required',        'icon': linux_icon, 'variant_tag': 'Portable', 'os_group': 'linux'},
+                  'linux-arm64':       {'label': 'Linux ARM64',            'desc': 'Self-contained — no system Python required',        'icon': linux_icon, 'variant_tag': 'Portable', 'os_group': 'linux'},
+                  'linux-x64-slim':    {'label': 'Linux x64',              'desc': 'Small download — needs system Python 3.9+',         'icon': linux_icon, 'variant_tag': 'Slim',     'os_group': 'linux'},
+                  'linux-arm64-slim':  {'label': 'Linux ARM64',            'desc': 'Small download — needs system Python 3.9+',         'icon': linux_icon, 'variant_tag': 'Slim',     'os_group': 'linux'},
               }
 
+              # Pick one card to tag as "Recommended" based on the detected OS.
+              # Arch isn't reliably in the User-Agent; for Linux we prefer slim
+              # (smaller download — anyone with a modern distro will have
+              # python3 >= 3.9), and default to x64 since ARM desktops are rare.
+              recommended_key = None
+              if detected_os == 'windows' and 'windows' in download_urls:
+                  recommended_key = 'windows'
+              elif detected_os == 'mac':
+                  for k in ('macos-arm64', 'macos-intel'):
+                      if k in download_urls:
+                          recommended_key = k
+                          break
+              elif detected_os == 'linux':
+                  for k in ('linux-x64-slim', 'linux-arm64-slim', 'linux-x64', 'linux-arm64'):
+                      if k in download_urls:
+                          recommended_key = k
+                          break
+
               platform_cards = []
-              for platform_key in ['windows', 'linux', 'mac', 'all-platforms']:
+              for platform_key in PLATFORM_KEYS:
                   if platform_key in download_urls:
                       meta = platform_meta.get(platform_key, {})
                       size_str = format_size(packages.get(platform_key, {}).get('size', 0))
-                      is_recommended = detected_os == platform_key
+                      is_recommended = (platform_key == recommended_key)
                       rec_badge = '<span class="rec-badge"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Recommended</span>' if is_recommended else ''
+                      variant_tag = meta.get('variant_tag', '')
+                      # Slim tag gets an accent color; portable is neutral.
+                      variant_class = 'variant-pill variant-slim' if variant_tag == 'Slim' else 'variant-pill'
+                      variant_html = f'<span class="{variant_class}">{variant_tag}</span>' if variant_tag else ''
                       card_class = 'pkg-card recommended' if is_recommended else 'pkg-card'
                       icon_html = meta.get('icon', '')
                       label     = meta.get('label', platform_key)
@@ -662,7 +693,7 @@ Resources:
                           f'<div class="pkg-card-header">'
                           f'<div class="pkg-icon">{icon_html}</div>'
                           f'<div class="pkg-info">'
-                          f'<div class="pkg-name">{label} {rec_badge}</div>'
+                          f'<div class="pkg-name">{label} {variant_html} {rec_badge}</div>'
                           f'<div class="pkg-desc">{desc}</div>'
                           f'</div></div>'
                           f'<div class="pkg-meta">{sz_icon} {size_str}</div>'
@@ -781,13 +812,23 @@ Resources:
                 flex-shrink: 0; background: #EEF3FC; color: var(--brand-light);
               }}
               .pkg-info {{ flex: 1; min-width: 0; }}
-              .pkg-name {{ font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }}
+              .pkg-name {{ font-size: 14px; font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }}
               .pkg-desc {{ font-size: 12.5px; color: var(--text-secondary); margin-top: 2px; }}
               .pkg-meta {{ display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-muted); }}
               .rec-badge {{
                 display: inline-flex; align-items: center; gap: 4px;
                 padding: 2px 7px; background: var(--ok-bg); color: var(--ok);
                 border-radius: 3px; font-size: 11px; font-weight: 600;
+              }}
+              .variant-pill {{
+                display: inline-flex; align-items: center;
+                padding: 1px 6px; border-radius: 3px;
+                font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+                text-transform: uppercase;
+                background: rgba(26,63,130,.08); color: var(--brand);
+              }}
+              .variant-pill.variant-slim {{
+                background: rgba(0,120,212,.1); color: var(--accent);
               }}
               .download-btn {{
                 display: inline-flex; align-items: center; justify-content: center;
@@ -891,8 +932,8 @@ Resources:
               <div class="instructions-card">
                 <h3>Installation Guide</h3>
                 <ol class="step-list">
-                  <li><span class="step-num">1</span><span>Download the package for your operating system using the button above.</span></li>
-                  <li><span class="step-num">2</span><span><strong>Windows:</strong> Extract the ZIP archive and run <code>install.bat</code> as Administrator.</span></li>
+                  <li><span class="step-num">1</span><span>Download the package for your operating system using the button above. The <strong>Slim</strong> Linux variants require system Python 3.9+; the <strong>Portable</strong> variants bundle their own Python.</span></li>
+                  <li><span class="step-num">2</span><span><strong>Windows:</strong> Extract the ZIP archive, then double-click <code>install.bat</code>. No administrator rights needed — install target is your user profile.</span></li>
                   <li><span class="step-num">3</span><span><strong>Linux / macOS:</strong> Extract the archive and run <code>./install.sh</code> in your terminal.</span></li>
                   <li><span class="step-num">4</span><span>After installation, verify the setup by running <code>claude --version</code> in a new terminal session.</span></li>
                 </ol>
@@ -902,7 +943,7 @@ Resources:
                 <h3>Session &amp; Login Troubleshooting</h3>
                 <ol class="step-list">
                   <li><span class="step-num">1</span><span><strong>Clear login cache (Linux / macOS):</strong> Run <code>~/claude-code-with-bedrock/credential-process --profile {aws_profile} --clear-cache</code> then restart Claude Code to re-authenticate.</span></li>
-                  <li><span class="step-num">2</span><span><strong>Clear login cache (Windows):</strong> Run <code>%USERPROFILE%\claude-code-with-bedrock\credential-process.exe --profile {aws_profile} --clear-cache</code> then restart Claude Code.</span></li>
+                  <li><span class="step-num">2</span><span><strong>Clear login cache (Windows):</strong> Run <code>%USERPROFILE%\claude-code-with-bedrock\credential-process.cmd --profile {aws_profile} --clear-cache</code> then restart Claude Code.</span></li>
                   <li><span class="step-num">3</span><span><strong>Portal session:</strong> Use the <strong>Sign Out</strong> button above to clear your browser session for this portal.</span></li>
                 </ol>
               </div>
