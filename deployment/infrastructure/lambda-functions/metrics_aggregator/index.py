@@ -21,16 +21,12 @@ dynamodb = boto3.resource("dynamodb")
 NAMESPACE = "ClaudeCode"
 LOG_GROUP = os.environ.get("METRICS_LOG_GROUP", "/aws/lambda/bedrock-claude-logs")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "ClaudeCodeMetrics")
-QUOTA_TABLE = os.environ.get("QUOTA_TABLE")  # Optional - only set if quota monitoring is enabled
-POLICIES_TABLE = os.environ.get("POLICIES_TABLE")  # Optional - for fine-grained quotas
 PRICING_TABLE = os.environ.get("PRICING_TABLE")  # Optional - for cost-based quotas
 ENABLE_FINEGRAINED_QUOTAS = os.environ.get("ENABLE_FINEGRAINED_QUOTAS", "false").lower() == "true"
 AGGREGATION_WINDOW = int(os.environ.get("AGGREGATION_WINDOW", "15"))  # minutes
 
 # DynamoDB tables
 table = dynamodb.Table(METRICS_TABLE)
-quota_table = dynamodb.Table(QUOTA_TABLE) if QUOTA_TABLE else None
-policies_table = dynamodb.Table(POLICIES_TABLE) if POLICIES_TABLE else None
 pricing_table = dynamodb.Table(PRICING_TABLE) if PRICING_TABLE else None
 
 # In-memory pricing cache (refreshed each invocation)
@@ -172,12 +168,6 @@ def lambda_handler(event, context):
             line_events,
             model_rate_metrics,
         )
-
-        # Update quota tracking (only if quota monitoring is enabled)
-        if quota_table:
-            update_quota_table(end_time, user_details)
-        else:
-            print("Quota monitoring not enabled - skipping quota table updates")
 
         # Always publish lines metrics to CloudWatch (even if 0)
         metrics_to_publish.append(
@@ -910,176 +900,3 @@ def write_to_dynamodb(
         print(f"Error writing to DynamoDB: {str(e)}")
 
 
-def update_quota_table(timestamp, user_details):
-    """
-    Update monthly user quota tracking table with enhanced fields.
-    Schema: PK=USER#{email}, SK=MONTH#{YYYY-MM}
-    Maintains running totals for each user per month including:
-    - Monthly and daily token totals
-    - Token type breakdown (input, output, cache)
-    - Group membership from JWT claims
-    """
-    if not user_details:
-        return
-
-    try:
-        # Use UTC+8 for daily/monthly quota boundaries
-        effective_now = timestamp.astimezone(EFFECTIVE_TZ)
-        current_month = effective_now.strftime("%Y-%m")
-        current_date = effective_now.strftime("%Y-%m-%d")
-        ttl = int(
-            (effective_now.replace(day=28) + timedelta(days=32)).replace(day=1).timestamp()
-        )  # End of next month
-
-        for user in user_details:
-            user_email = user["email"]
-            tokens_to_add = float(user.get("tokens", 0))
-            input_tokens = float(user.get("input_tokens", 0))
-            output_tokens = float(user.get("output_tokens", 0))
-            cache_tokens = float(user.get("cache_tokens", 0))
-            groups = user.get("groups", [])
-
-            if tokens_to_add <= 0:
-                continue
-
-            # Calculate cost for this window's tokens
-            model_id = user.get("model")
-            window_cost = calculate_cost(input_tokens, output_tokens, cache_tokens, model_id)
-
-            pk = f"USER#{user_email}"
-            sk = f"MONTH#{current_month}"
-
-            # First, get the current record to check daily_date
-            try:
-                response = quota_table.get_item(Key={"pk": pk, "sk": sk})
-                existing = response.get("Item", {})
-                existing_daily_date = existing.get("daily_date")
-
-                # Determine if we need to reset daily tokens
-                if existing_daily_date != current_date:
-                    # New day - reset daily tokens and daily cost
-                    daily_reset = True
-                else:
-                    # Same day - add to existing
-                    daily_reset = False
-
-                # Build update expression with all enhanced fields
-                update_expr = """
-                    ADD total_tokens :tokens,
-                        input_tokens :input_tokens,
-                        output_tokens :output_tokens,
-                        cache_tokens :cache_tokens,
-                        estimated_cost :cost
-                    SET last_updated = :updated,
-                        #ttl = :ttl,
-                        email = :email,
-                        daily_date = :daily_date,
-                        first_seen = if_not_exists(first_seen, :updated)
-                """
-
-                expr_attr_values = {
-                    ":tokens": Decimal(str(tokens_to_add)),
-                    ":input_tokens": Decimal(str(input_tokens)),
-                    ":output_tokens": Decimal(str(output_tokens)),
-                    ":cache_tokens": Decimal(str(cache_tokens)),
-                    ":cost": window_cost,
-                    ":updated": timestamp.isoformat().replace("+00:00", "Z"),
-                    ":ttl": ttl,
-                    ":email": user_email,
-                    ":daily_date": current_date,
-                }
-
-                expr_attr_names = {"#ttl": "ttl"}
-
-                # Handle daily tokens and cost based on date change
-                if daily_reset:
-                    update_expr += ", daily_tokens = :tokens, daily_cost = :cost, daily_cost_date = :daily_date"
-                else:
-                    update_expr = update_expr.replace(
-                        "ADD total_tokens :tokens",
-                        "ADD total_tokens :tokens, daily_tokens :tokens, daily_cost :cost"
-                    )
-
-                # Add groups if available (for fine-grained quotas)
-                if groups and ENABLE_FINEGRAINED_QUOTAS:
-                    update_expr += ", #groups = :groups"
-                    expr_attr_values[":groups"] = groups
-                    expr_attr_names["#groups"] = "groups"
-
-                quota_table.update_item(
-                    Key={"pk": pk, "sk": sk},
-                    UpdateExpression=update_expr,
-                    ExpressionAttributeNames=expr_attr_names,
-                    ExpressionAttributeValues=expr_attr_values,
-                )
-
-                daily_note = " (daily reset)" if daily_reset else ""
-                cost_note = f", +${window_cost}" if window_cost > 0 else ""
-                print(
-                    f"Updated quota for {user_email}: +{tokens_to_add:,.0f} tokens{cost_note} for {current_month}{daily_note}"
-                )
-
-            except Exception as e:
-                print(f"Error updating quota for {user_email}: {str(e)}")
-
-        # Update org-wide aggregate after processing all users
-        update_org_aggregate(current_month, ttl, timestamp)
-
-    except Exception as e:
-        print(f"Error in update_quota_table: {str(e)}")
-
-
-def update_org_aggregate(current_month, ttl, timestamp):
-    """
-    Sum all per-user usage for the current month into a single ORG#global record.
-    This powers organization-wide quota limits.
-    """
-    try:
-        sk = f"MONTH#{current_month}"
-        total_tokens = Decimal("0")
-        total_input = Decimal("0")
-        total_output = Decimal("0")
-        total_cache = Decimal("0")
-        total_cost = Decimal("0")
-        user_count = 0
-
-        # Scan for all USER# records for this month
-        scan_kwargs = {
-            "FilterExpression": "sk = :sk AND begins_with(pk, :prefix)",
-            "ExpressionAttributeValues": {":sk": sk, ":prefix": "USER#"},
-        }
-        while True:
-            response = quota_table.scan(**scan_kwargs)
-            for item in response.get("Items", []):
-                total_tokens += Decimal(str(item.get("total_tokens", 0)))
-                total_input += Decimal(str(item.get("input_tokens", 0)))
-                total_output += Decimal(str(item.get("output_tokens", 0)))
-                total_cache += Decimal(str(item.get("cache_tokens", 0)))
-                total_cost += Decimal(str(item.get("estimated_cost", "0")))
-                user_count += 1
-
-            if "LastEvaluatedKey" in response:
-                scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
-            else:
-                break
-
-        # Write the org aggregate record
-        quota_table.put_item(
-            Item={
-                "pk": "ORG#global",
-                "sk": sk,
-                "total_tokens": total_tokens,
-                "input_tokens": total_input,
-                "output_tokens": total_output,
-                "cache_tokens": total_cache,
-                "estimated_cost": total_cost,
-                "user_count": user_count,
-                "last_updated": timestamp.isoformat().replace("+00:00", "Z"),
-                "ttl": ttl,
-            }
-        )
-        cost_note = f", ${total_cost}" if total_cost > 0 else ""
-        print(f"Updated org aggregate: {total_tokens:,.0f} tokens{cost_note} across {user_count} users for {current_month}")
-
-    except Exception as e:
-        print(f"Error updating org aggregate: {str(e)}")

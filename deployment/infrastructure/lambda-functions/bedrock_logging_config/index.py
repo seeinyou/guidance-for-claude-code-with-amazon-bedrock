@@ -48,12 +48,19 @@ def handler(event, context):
         )
 
 
+DEFAULT_LOG_PREFIX = "bedrock-raw/"
+
+
 def handle_create_update(event):
     """
     Check if Bedrock invocation logging is already enabled. If not, set it up
     with an S3 bucket and bucket policy, then enable logging.
 
-    Returns response data dict with the bucket name used.
+    If logging is already enabled, respect the existing bucket and keyPrefix
+    — the S3 -> SQS notification and reconciler MUST use the same prefix that
+    Bedrock actually writes to, otherwise log events never trigger processing.
+
+    Returns response data dict with the bucket name and log prefix used.
     """
     # 1. Check current logging configuration
     print("Checking current Bedrock model invocation logging configuration...")
@@ -65,13 +72,22 @@ def handle_create_update(event):
 
     existing_bucket = s3_config.get("bucketName")
     if existing_bucket:
-        print(f"Logging already enabled with bucket: {existing_bucket}")
-        # Still configure S3 event notification (idempotent)
+        # Respect whatever prefix Bedrock is already writing to.  Normalize so
+        # empty string becomes ""/no prefix, and non-empty always ends with "/".
+        raw_prefix = s3_config.get("keyPrefix", "") or ""
+        log_prefix = (raw_prefix.rstrip("/") + "/") if raw_prefix else ""
+        print(
+            f"Logging already enabled with bucket: {existing_bucket}, "
+            f"keyPrefix: {log_prefix!r}"
+        )
+        # Still configure S3 event notification (idempotent) — use the
+        # EXISTING prefix, not the default.
         sqs_queue_arn = properties.get("SQSQueueArn")
         if sqs_queue_arn:
-            _configure_s3_event_notification(existing_bucket, sqs_queue_arn)
+            _configure_s3_event_notification(existing_bucket, sqs_queue_arn, log_prefix)
         return {
             "BucketName": existing_bucket,
+            "LogPrefix": log_prefix,
             "Message": "Logging already enabled",
         }
 
@@ -89,7 +105,7 @@ def handle_create_update(event):
     ensure_bucket_exists(bucket_name)
 
     # 4. Apply bucket policy for Bedrock service access
-    put_bedrock_bucket_policy(bucket_name)
+    put_bedrock_bucket_policy(bucket_name, DEFAULT_LOG_PREFIX)
 
     # 5. Enable Bedrock model invocation logging
     print("Enabling Bedrock model invocation logging...")
@@ -97,22 +113,23 @@ def handle_create_update(event):
         loggingConfig={
             "s3Config": {
                 "bucketName": bucket_name,
-                "keyPrefix": "bedrock-raw/",
+                "keyPrefix": DEFAULT_LOG_PREFIX,
             },
             "textDataDeliveryEnabled": True,
             "imageDataDeliveryEnabled": False,
             "embeddingDataDeliveryEnabled": False,
         }
     )
-    print(f"Successfully enabled Bedrock logging to s3://{bucket_name}/bedrock-raw/")
+    print(f"Successfully enabled Bedrock logging to s3://{bucket_name}/{DEFAULT_LOG_PREFIX}")
 
     # 6. Configure S3 event notification to SQS (for usage stream Lambda)
     sqs_queue_arn = properties.get("SQSQueueArn")
     if sqs_queue_arn:
-        _configure_s3_event_notification(bucket_name, sqs_queue_arn)
+        _configure_s3_event_notification(bucket_name, sqs_queue_arn, DEFAULT_LOG_PREFIX)
 
     return {
         "BucketName": bucket_name,
+        "LogPrefix": DEFAULT_LOG_PREFIX,
         "Message": "Logging enabled successfully",
     }
 
@@ -157,11 +174,14 @@ def ensure_bucket_exists(bucket_name):
         )
 
 
-def put_bedrock_bucket_policy(bucket_name):
+def put_bedrock_bucket_policy(bucket_name, log_prefix):
     """
-    Apply a bucket policy that allows the Bedrock service to write invocation logs.
+    Apply a bucket policy that allows the Bedrock service to write invocation
+    logs under ``log_prefix``.  The prefix must match the keyPrefix configured
+    on Bedrock model invocation logging, otherwise PutObject will be denied.
     """
     account_id = sts_client.get_caller_identity()["Account"]
+    resource_prefix = log_prefix.rstrip("/") + "/" if log_prefix else ""
 
     bucket_policy = {
         "Version": "2012-10-17",
@@ -175,7 +195,7 @@ def put_bedrock_bucket_policy(bucket_name):
                 "Action": [
                     "s3:PutObject",
                 ],
-                "Resource": f"arn:aws:s3:::{bucket_name}/bedrock-raw/*",
+                "Resource": f"arn:aws:s3:::{bucket_name}/{resource_prefix}*",
                 "Condition": {
                     "StringEquals": {
                         "aws:SourceAccount": account_id,
@@ -193,15 +213,22 @@ def put_bedrock_bucket_policy(bucket_name):
     print("Bucket policy applied successfully")
 
 
-def _configure_s3_event_notification(bucket_name, sqs_queue_arn):
+def _configure_s3_event_notification(bucket_name, sqs_queue_arn, log_prefix_base):
     """
     Configure S3 event notification on the Bedrock log bucket to send
     ObjectCreated events to the SQS queue for the usage stream Lambda.
 
-    Merges with existing notifications to avoid overwriting them.
+    ``log_prefix_base`` is the Bedrock S3 keyPrefix (e.g. "bedrock-raw/" or
+    "bedrock-logs/") — MUST match what Bedrock actually writes to, otherwise
+    events never fire.
+
+    Replaces any existing queue configuration for the same SQS queue so the
+    prefix stays in sync if it changes (e.g. when Bedrock logging was already
+    configured with a different prefix before this stack was deployed).
+    Merges with other unrelated notifications to avoid overwriting them.
     """
     account_id = sts_client.get_caller_identity()["Account"]
-    log_prefix = f"bedrock-raw/AWSLogs/{account_id}/BedrockModelInvocationLogs/"
+    log_prefix = f"{log_prefix_base}AWSLogs/{account_id}/BedrockModelInvocationLogs/"
 
     print(f"Configuring S3 event notification: s3://{bucket_name}/{log_prefix}* -> {sqs_queue_arn}")
 
@@ -211,14 +238,15 @@ def _configure_s3_event_notification(bucket_name, sqs_queue_arn):
         # Remove ResponseMetadata which isn't part of the config
         existing.pop("ResponseMetadata", None)
 
-        # Check if our notification already exists
-        queue_configs = existing.get("QueueConfigurations", [])
-        for qc in queue_configs:
-            if qc.get("QueueArn") == sqs_queue_arn:
-                print("S3 event notification to SQS already configured, skipping")
-                return
+        # Drop any previous configuration pointing at OUR SQS queue so we can
+        # replace it with the (possibly updated) prefix.  Leave configurations
+        # for other queues/topics/Lambdas untouched.
+        queue_configs = [
+            qc for qc in existing.get("QueueConfigurations", [])
+            if qc.get("QueueArn") != sqs_queue_arn
+        ]
 
-        # Add our notification
+        # Add our notification with the current prefix
         queue_configs.append({
             "QueueArn": sqs_queue_arn,
             "Events": ["s3:ObjectCreated:*"],
