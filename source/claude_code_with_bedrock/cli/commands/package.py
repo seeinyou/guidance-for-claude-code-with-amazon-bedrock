@@ -1433,6 +1433,11 @@ RUN pyinstaller \
             if pyproject_file.exists():
                 zf.write(pyproject_file, "pyproject.toml")
 
+            # Add app.ico for Windows executable icon
+            app_ico = source_dir / "app.ico"
+            if app_ico.exists():
+                zf.write(app_ico, "app.ico")
+
         return source_zip
 
     @staticmethod
