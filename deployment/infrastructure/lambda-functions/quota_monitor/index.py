@@ -541,8 +541,27 @@ def get_sent_alerts(month_name):
     """
     Get list of alerts already sent this month to avoid duplicates.
     Returns set of alert key strings.
+
+    Reads email/alert_type/alert_level from item attributes rather than
+    splitting the SK, because some "emails" legitimately contain `#`
+    (e.g. ORG#global, SYSTEM#reconciler) which would break positional
+    parsing and defeat dedup — causing alerts to re-fire every run.
     """
     sent_alerts = set()
+
+    def _collect(items):
+        for item in items:
+            email = item.get("email")
+            alert_type = item.get("alert_type")
+            alert_level = item.get("alert_level")
+            if not email or not alert_type or not alert_level:
+                continue
+            if alert_type in ("daily", "daily_cost", "reconciler_heartbeat"):
+                # Date is appended to the SK: ...#{alert_level}#{date}
+                date = item.get("sk", "").rsplit("#", 1)[-1]
+                sent_alerts.add(f"{email}#{alert_type}#{date}#{alert_level}")
+            else:
+                sent_alerts.add(f"{email}#{alert_type}#{alert_level}")
 
     try:
         month_prefix = datetime.now(EFFECTIVE_TZ).strftime("%Y-%m")
@@ -551,40 +570,15 @@ def get_sent_alerts(month_name):
             KeyConditionExpression=Key("pk").eq("ALERTS")
             & Key("sk").begins_with(f"{month_prefix}#ALERT#")
         )
+        _collect(response.get("Items", []))
 
-        for item in response.get("Items", []):
-            # Parse SK to get email, type, and level
-            sk_parts = item["sk"].split("#")
-            if len(sk_parts) >= 5:
-                email = sk_parts[2]
-                alert_type = sk_parts[3]
-                alert_level = sk_parts[4]
-                # For daily alerts, include date
-                if alert_type in ("daily", "daily_cost", "reconciler_heartbeat") and len(sk_parts) >= 6:
-                    date = sk_parts[5]
-                    sent_alerts.add(f"{email}#{alert_type}#{date}#{alert_level}")
-                else:
-                    sent_alerts.add(f"{email}#{alert_type}#{alert_level}")
-
-        # Handle pagination
         while "LastEvaluatedKey" in response:
             response = quota_table.query(
                 KeyConditionExpression=Key("pk").eq("ALERTS")
                 & Key("sk").begins_with(f"{month_prefix}#ALERT#"),
                 ExclusiveStartKey=response["LastEvaluatedKey"],
             )
-
-            for item in response.get("Items", []):
-                sk_parts = item["sk"].split("#")
-                if len(sk_parts) >= 5:
-                    email = sk_parts[2]
-                    alert_type = sk_parts[3]
-                    alert_level = sk_parts[4]
-                    if alert_type == "daily" and len(sk_parts) >= 6:
-                        date = sk_parts[5]
-                        sent_alerts.add(f"{email}#{alert_type}#{date}#{alert_level}")
-                    else:
-                        sent_alerts.add(f"{email}#{alert_type}#{alert_level}")
+            _collect(response.get("Items", []))
 
         if sent_alerts:
             print(f"Found {len(sent_alerts)} alerts already sent this month")

@@ -420,22 +420,8 @@ def _get_policy(policy_type: str, identifier: str) -> dict | None:
 
 
 # ===================================================================
-#  ORG-WIDE LIMITS  (cached for 60 s across warm invocations)
+#  ORG-WIDE LIMITS
 # ===================================================================
-
-_org_policy_cache = None
-_org_policy_cache_time = 0
-_ORG_CACHE_TTL = 60  # seconds
-
-
-def _get_org_policy() -> dict | None:
-    global _org_policy_cache, _org_policy_cache_time
-    now = time.time()
-    if _org_policy_cache is not None and (now - _org_policy_cache_time) < _ORG_CACHE_TTL:
-        return _org_policy_cache
-    _org_policy_cache = _get_policy("org", "global")
-    _org_policy_cache_time = now
-    return _org_policy_cache
 
 
 def _get_org_usage() -> dict:
@@ -459,7 +445,7 @@ def check_org_limits() -> dict | None:
     """
     Return a block dict if org-wide limits are exceeded, otherwise None.
     """
-    org_policy = _get_org_policy()
+    org_policy = _get_policy("org", "global")
     if not org_policy or not org_policy.get("enabled", True):
         return None
     if org_policy.get("enforcement_mode", "alert") != "block":

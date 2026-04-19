@@ -407,62 +407,54 @@ def get_unblock_status(email: str) -> dict:
 
 
 def get_user_usage(email: str) -> dict:
-    """Get current usage for a user in the current month (UTC+8 boundaries)."""
+    """Get current usage for a user in the current month (UTC+8 boundaries).
+
+    Reads two independent records from the Bedrock usage pipeline:
+      - MONTH#YYYY-MM#BEDROCK -- monthly aggregate
+      - DAY#YYYY-MM-DD#BEDROCK -- today's daily aggregate
+    """
     now = datetime.now(EFFECTIVE_TZ)
     month_prefix = now.strftime("%Y-%m")
     current_date = now.strftime("%Y-%m-%d")
 
     pk = f"USER#{email}"
-    sk = f"MONTH#{month_prefix}"
+    month_sk = f"MONTH#{month_prefix}#BEDROCK"
+    day_sk = f"DAY#{current_date}#BEDROCK"
+
+    zero = {
+        "total_tokens": 0,
+        "daily_tokens": 0,
+        "daily_date": current_date,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_tokens": 0,
+        "estimated_cost": 0.0,
+        "daily_cost": 0.0,
+    }
 
     try:
-        response = quota_table.get_item(Key={"pk": pk, "sk": sk})
-        item = response.get("Item")
+        month_item = quota_table.get_item(Key={"pk": pk, "sk": month_sk}).get("Item") or {}
+        day_item = quota_table.get_item(Key={"pk": pk, "sk": day_sk}).get("Item") or {}
 
-        if not item:
-            return {
-                "total_tokens": 0,
-                "daily_tokens": 0,
-                "daily_date": current_date,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_tokens": 0,
-                "estimated_cost": 0.0,
-                "daily_cost": 0.0,
-            }
+        if not month_item and not day_item:
+            return zero
 
-        # Check if daily tokens need to be reset (different day)
-        daily_date = item.get("daily_date")
-        daily_tokens = float(item.get("daily_tokens", 0))
-        daily_cost = float(item.get("daily_cost", 0))
-
-        if daily_date != current_date:
-            # Day has changed, daily tokens and cost should be 0 for the new day
-            daily_tokens = 0
-            daily_cost = 0.0
+        cache_read = float(month_item.get("cache_read_tokens", 0))
+        cache_write = float(month_item.get("cache_write_tokens", 0))
 
         return {
-            "total_tokens": float(item.get("total_tokens", 0)),
-            "daily_tokens": daily_tokens,
-            "daily_date": daily_date,
-            "input_tokens": float(item.get("input_tokens", 0)),
-            "output_tokens": float(item.get("output_tokens", 0)),
-            "cache_tokens": float(item.get("cache_tokens", 0)),
-            "estimated_cost": float(item.get("estimated_cost", 0)),
-            "daily_cost": daily_cost,
+            "total_tokens": float(month_item.get("total_tokens", 0)),
+            "daily_tokens": float(day_item.get("total_tokens", 0)),
+            "daily_date": current_date,
+            "input_tokens": float(month_item.get("input_tokens", 0)),
+            "output_tokens": float(month_item.get("output_tokens", 0)),
+            "cache_tokens": cache_read + cache_write,
+            "estimated_cost": float(month_item.get("estimated_cost", 0)),
+            "daily_cost": float(day_item.get("estimated_cost", 0)),
         }
     except Exception as e:
         print(f"Error getting usage for {email}: {e}")
-        return {
-            "total_tokens": 0,
-            "daily_tokens": 0,
-            "daily_date": current_date,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_tokens": 0,
-            "estimated_cost": 0.0,
-            "daily_cost": 0.0,
-        }
+        return zero
 
 
 def build_usage_summary(usage: dict, policy: dict) -> dict:
@@ -530,9 +522,12 @@ def get_org_policy() -> dict | None:
 
 
 def get_org_usage() -> dict:
-    """Get org aggregate usage for current month (UTC+8 boundaries)."""
+    """Get org aggregate usage for current month (UTC+8 boundaries).
+
+    Reads the Bedrock pipeline aggregate written by bedrock_usage_utils.update_org_aggregate.
+    """
     now = datetime.now(EFFECTIVE_TZ)
-    sk = f"MONTH#{now.strftime('%Y-%m')}"
+    sk = f"MONTH#{now.strftime('%Y-%m')}#BEDROCK"
     try:
         response = quota_table.get_item(Key={"pk": "ORG#global", "sk": sk})
         item = response.get("Item")
@@ -541,7 +536,6 @@ def get_org_usage() -> dict:
         return {
             "total_tokens": float(item.get("total_tokens", 0)),
             "estimated_cost": float(item.get("estimated_cost", 0)),
-            "user_count": int(item.get("user_count", 0)),
         }
     except Exception as e:
         print(f"Error getting org usage: {e}")
