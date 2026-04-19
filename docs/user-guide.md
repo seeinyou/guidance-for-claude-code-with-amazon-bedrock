@@ -6,14 +6,22 @@ CCWB 让开发者通过组织的身份提供商 (Cognito/OIDC) 使用 Amazon Bed
 
 ## 安装与配置
 
-管理员会分发一个安装包，其中包含 `config.json` 配置文件（含 profile 名称、身份提供商域名、client_id、区域等信息）。
+管理员通过 Portal 分发一个安装包（按操作系统分组的下载卡片，Linux 同时提供 Portable 和 Slim 两个变体），其中包含 `config.json` 配置文件（含 profile 名称、TVM 端点、身份提供商域名、client_id、区域等信息）。
+
+**安装包类型：**
+
+| 变体 | 内置 Python | 下载大小 | 说明 |
+|------|------------|---------|------|
+| Windows / macOS / Linux **Portable** | ✅ | 35 – 130 MB | 解压即用，无需系统 Python |
+| Linux **Slim** | ❌ | ~30 MB | 使用系统 Python 3.9+，Ubuntu 22.04 / Debian 11 / AL2023 已验证 |
 
 **安装步骤：**
 
-1. 解压安装包
+1. 解压安装包（Windows 用 File Explorer 直接解压即可；`install.bat` 会自动处理依赖）
 2. 运行安装脚本：
    ```bash
    ./install.sh    # Linux / macOS
+   install.bat     # Windows（双击或命令行都行）
    ```
 3. 安装脚本会自动完成：
    - 在 `~/.aws/config` 中配置 credential-process
@@ -24,8 +32,10 @@ CCWB 让开发者通过组织的身份提供商 (Cognito/OIDC) 使用 Amazon Bed
 | 字段 | 说明 |
 |------|------|
 | `selected_model` | 默认模型，例如 `global.anthropic.claude-opus-4-6-v1` |
-| `quota_api_endpoint` | 如设置，则启用配额限制 |
+| `tvm_endpoint` | Token Vending Machine 端点，凭据签发走这里 |
+| `tvm_request_timeout` | TVM 请求超时（秒），默认 10 |
 | `quota_check_interval` | 配额检查间隔（分钟）。默认 30。`0` = 每次请求都检查（仅用于测试，会增加延迟） |
+| `otel_helper_hash` | otel-helper 完整性校验（SHA256），打包时自动写入 |
 
 ---
 
@@ -143,14 +153,25 @@ CCWB lets developers use Claude Code backed by Amazon Bedrock through your organ
 
 ## Installation & Setup
 
-Your administrator distributes an installation package containing a `config.json` file (with profile name, identity provider domain, client_id, region, etc.).
+Your administrator publishes packages through a Portal with per-OS
+download cards. Linux has two variants (Portable, Slim) side-by-side on
+the same card. Each package contains a `config.json` file (profile name,
+TVM endpoint, identity provider domain, client_id, region, etc.).
+
+**Package variants:**
+
+| Variant | Bundled Python | Download | Notes |
+|---------|----------------|----------|-------|
+| Windows / macOS / Linux **Portable** | ✅ | 35 – 130 MB | Self-contained, no system Python required |
+| Linux **Slim** | ❌ | ~30 MB | Uses system Python 3.9+; verified on Ubuntu 22.04, Debian 11, AL2023 |
 
 **Installation steps:**
 
-1. Extract the package
+1. Extract the package (Windows File Explorer's built-in "Extract All" works)
 2. Run the installer:
    ```bash
    ./install.sh    # Linux / macOS
+   install.bat     # Windows (double-click or from the terminal)
    ```
 3. The installer automatically:
    - Configures credential-process in `~/.aws/config`
@@ -161,8 +182,10 @@ Your administrator distributes an installation package containing a `config.json
 | Field | Description |
 |-------|-------------|
 | `selected_model` | Default model, e.g. `global.anthropic.claude-opus-4-6-v1` |
-| `quota_api_endpoint` | If set, quota enforcement is enabled |
+| `tvm_endpoint` | Token Vending Machine endpoint; credentials are issued here |
+| `tvm_request_timeout` | TVM request timeout in seconds (default 10) |
 | `quota_check_interval` | Quota check interval in minutes. Default 30. `0` = check every request (testing only, adds latency) |
+| `otel_helper_hash` | SHA256 of the packaged otel-helper (written at package time) |
 
 ---
 

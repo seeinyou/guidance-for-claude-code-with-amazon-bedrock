@@ -13,7 +13,6 @@ This document provides a complete reference for all `ccwb` (Claude Code with Bed
     - [`deploy` - Deploy Infrastructure](#deploy---deploy-infrastructure)
     - [`test` - Test Package](#test---test-package)
     - [`package` - Create Distribution](#package---create-distribution)
-    - [`builds` - List and Manage CodeBuild Builds](#builds---list-and-manage-codebuild-builds)
     - [`distribute` - Create Distribution URLs](#distribute---create-distribution-urls)
     - [`status` - Check Deployment Status](#status---check-deployment-status)
     - [`cleanup` - Remove Installed Components](#cleanup---remove-installed-components)
@@ -92,8 +91,7 @@ poetry run ccwb init [options]
   - Daily token limit with burst buffer (auto-calculated from monthly)
   - Enforcement modes (alert vs block) for daily and monthly limits
   - Quota re-check interval (how often to verify quota with cached credentials)
-- Prompts for Windows build support via AWS CodeBuild (optional)
-- Saves configuration to `.ccwb-config/config.json` in the project directory
+- Saves configuration to `~/.ccwb/profiles/<name>.json`
 
 **Note:** This command only creates configuration. Use `deploy` to create AWS resources.
 
@@ -125,12 +123,13 @@ poetry run ccwb deploy [stack] [options]
 **Stacks deployed:**
 
 1. **auth** - Authentication infrastructure and IAM roles (always required)
-2. **networking** - VPC and networking resources for monitoring (optional)
-3. **monitoring** - OpenTelemetry collector on ECS Fargate (optional)
-4. **dashboard** - CloudWatch dashboard for usage metrics (optional)
-5. **analytics** - Kinesis Firehose and Athena for analytics (optional)
-6. **quota** - Per-user token quota monitoring and alerts (optional, requires dashboard)
-7. **codebuild** - AWS CodeBuild for Windows binary builds (optional, only if enabled during init)
+2. **s3bucket** - S3 bucket used by distribution and Bedrock logging
+3. **networking** - VPC and networking resources for monitoring (optional)
+4. **monitoring** - OpenTelemetry collector on ECS Fargate (optional)
+5. **dashboard** - CloudWatch dashboard and metrics aggregator (optional)
+6. **analytics** - Kinesis Firehose and Athena for analytics (optional)
+7. **quota** - TVM Lambda, Bedrock usage stream + reconciler, logging config, quota enforcement
+8. **distribution** - Landing page + admin panel (ALB + Lambda)
 
 **Examples:**
 
@@ -232,176 +231,45 @@ poetry run ccwb package [options]
 
 **Options:**
 
-- `--target-platform <platform>` - Target platform for binary (default: "all")
-  - `macos` - Build for current macOS architecture
-  - `macos-arm64` - Build for Apple Silicon Macs
-  - `macos-intel` - Build for Intel Macs (uses Rosetta on ARM Macs)
-  - `linux` - Build for Linux (native, current architecture)
-  - `linux-x64` - Build for Linux x64 using Docker
-  - `linux-arm64` - Build for Linux ARM64 using Docker
-  - `windows` - Build for Windows (uses CodeBuild - requires enabling during init)
-  - `all` - Build for all available platforms
-- `--distribute` - Upload package and generate distribution URL
-- `--expires-hours <hours>` - Distribution URL expiration in hours (with --distribute) [default: "48"]
-- `--profile <name>` - Configuration profile to use [default: "default"]
+- `--target-platform <platform>` - Target platform for the bundle (default: prompt)
+  - `macos-arm64` - Apple Silicon portable bundle
+  - `macos-intel` - Intel macOS portable bundle
+  - `linux-x64` - Linux x64 portable bundle (uses Docker for ELF strip)
+  - `linux-arm64` - Linux ARM64 portable bundle (uses Docker for ELF strip)
+  - `windows` - Windows x64 portable bundle (cross-extracted from PBS)
+- `--slim` - Linux only: build a ~30 MB bundle that reuses system Python 3.9+ instead of shipping PBS
+- `--profile <name>` - Configuration profile to use (defaults to active profile)
+- `--build-verbose` - Enable verbose logging for build processes
 
 **What it does:**
 
-- Builds Nuitka executable from authentication code
-- Creates configuration file with:
-  - OIDC provider settings
-  - Identity Pool ID from deployed stack
-  - Credential storage method (keyring or session)
-  - Selected Claude model and cross-region profile
-  - Source region for model inference
-- Generates installer script (install.sh for Unix, install.bat for Windows)
-- Creates user documentation
-- Optionally uploads to S3 and generates presigned URL (with --distribute)
+- Downloads the matching [python-build-standalone](https://github.com/astral-sh/python-build-standalone) tarball
+- Extracts the interpreter, copies in project sources, and installs pinned wheels
+- On Linux, runs `eu-strip` inside `debian:12-slim` via Docker to shrink the interpreter safely
+- Writes `config.json` (OIDC provider, TVM endpoint, model selection, `otel_helper_hash`, …) and `claude-settings/settings.json`
+- Emits `install.sh` or `install.bat` + `install.ps1` alongside the bundle
 
-**Platform Support (Hybrid Build System):**
+**Platform notes:**
 
-- **macOS**: Uses PyInstaller with architecture-specific builds
-  - ARM64: Native build on Apple Silicon Macs (works on all Macs)
-  - Intel: **Optional** - requires x86_64 Python environment on ARM Macs
-  - Universal: Requires both architectures' Python libraries (not currently automated)
-- **Linux**: Uses PyInstaller in Docker containers
-  - x64: Uses linux/amd64 Docker platform
-  - ARM64: Uses linux/arm64 Docker platform
-  - Docker Desktop handles architecture emulation automatically
-- **Windows**: Uses Nuitka via AWS CodeBuild (if enabled during init)
-  - Automated builds take 12-15 minutes
-  - Requires CodeBuild to be enabled during `init`
-  - Will be skipped if CodeBuild is not enabled
-
-**Intel Mac Build Setup (Optional):**
-
-To enable Intel builds on Apple Silicon Macs (optional):
-
-```bash
-# Step 1: Install x86_64 Homebrew (if not already installed)
-arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Step 2: Install x86_64 Python
-arch -x86_64 /usr/local/bin/brew install python@3.12
-
-# Step 3: Create x86_64 virtual environment
-arch -x86_64 /usr/local/bin/python3.12 -m venv ~/venv-x86
-
-# Step 4: Install required packages
-arch -x86_64 ~/venv-x86/bin/pip install pyinstaller boto3 keyring
-```
-
-**Behavior when Intel environment is not set up:**
-
-- For `--target-platform=all`: Skips Intel builds with a note, builds all other platforms
-- For `--target-platform=macos-intel`: Shows instructions for optional setup, skips the build
-- The package process continues successfully without Intel binaries
-- ARM64 binaries can be distributed to all Mac users (Intel and Apple Silicon)
-
-**Graceful Fallback Behavior:**
-
-The package command is designed to handle missing optional components gracefully:
-
-- **Intel Mac builds**: Skipped if x86_64 Python environment is not available on ARM Macs
-- **Windows builds**: Skipped if CodeBuild was not enabled during `init`
-- **Linux builds**: Skipped if Docker is not available
-- **At least one platform must build successfully** for the package command to succeed
-
-This ensures that packaging always works, even if some optional platforms are not available.
-
-**Output files:**
-
-- `credential-process-<platform>` - Authentication executable
-  - `credential-process-macos-arm64` - macOS Apple Silicon
-  - `credential-process-macos-intel` - macOS Intel
-  - `credential-process-linux-x64` - Linux x64
-  - `credential-process-linux-arm64` - Linux ARM64
-  - `credential-process-windows.exe` - Windows x64
-- `otel-helper-<platform>` - OTEL helper (if monitoring enabled)
-- `config.json` - Configuration
-- `install.sh` - Unix installer script (auto-detects architecture)
-- `install.bat` - Windows installer script
-- `README.md` - Installation instructions
-- Includes Claude Code telemetry settings (if monitoring enabled)
-- Configures environment variables for model selection (ANTHROPIC_MODEL, ANTHROPIC_SMALL_FAST_MODEL)
+- **macOS**: no special requirement; builds on both Apple Silicon and Intel hosts.
+- **Linux portable**: requires Docker on the host (for the strip step). Container platform is auto-selected (`linux/amd64` or `linux/arm64`).
+- **Linux slim**: no Docker required at package time; target machine must have Python ≥ 3.9. Verified on Ubuntu 22.04, Debian 11, Amazon Linux 2023.
+- **Windows**: produced by cross-extracting the Windows PBS tarball on any host — no Windows CI needed.
 
 **Output structure:**
 
 ```
-dist/
-├── credential-process-macos-arm64     # macOS ARM64 executable
-├── credential-process-macos-intel     # macOS Intel executable
-├── credential-process-linux-x64       # Linux x64 executable
-├── credential-process-linux-arm64     # Linux ARM64 executable
-├── credential-process-windows.exe     # Windows x64 executable
-├── otel-helper-macos-arm64           # macOS ARM64 OTEL helper
-├── otel-helper-macos-intel           # macOS Intel OTEL helper
-├── otel-helper-linux-x64             # Linux x64 OTEL helper
-├── otel-helper-linux-arm64           # Linux ARM64 OTEL helper
-├── otel-helper-windows.exe           # Windows OTEL helper
-├── config.json                       # Configuration
-├── install.sh                        # Unix installer (auto-detects architecture)
-├── install.bat                       # Windows installer
-├── README.md                         # User instructions
-└── .claude/
-    └── settings.json                 # Telemetry settings (optional)
+dist/<profile>/<YYYY-MM-DD-HHMMSS>/
+├── windows-portable/
+├── macos-arm64-portable/
+├── macos-intel-portable/
+├── linux-x64-portable/     # portable variants produced when target = linux-*
+├── linux-arm64-portable/
+├── linux-x64-slim/         # only when --slim
+└── linux-arm64-slim/
 ```
 
-### `builds` - List and Manage CodeBuild Builds
-
-Shows recent Windows binary builds and their status.
-
-```bash
-poetry run ccwb builds [options]
-```
-
-**Options:**
-
-- `--profile <name>` - Configuration profile to use (defaults to active profile)
-- `--limit <n>` - Number of builds to show (default: "10")
-- `--project <name>` - CodeBuild project name (default: auto-detect)
-- `--status <id>` - Check status of a specific build by ID
-- `--download` - Download completed Windows artifacts to dist folder
-
-**What it does:**
-
-- Lists recent CodeBuild builds for Windows binaries
-- Shows build status, duration, and completion time
-- Provides console links to view full build logs
-- Monitors in-progress builds
-- Uses active profile or specified profile for CodeBuild project detection
-
-**Note:** This command requires CodeBuild to be enabled during the `init` process. If CodeBuild was not enabled, you'll need to re-run `init` and enable Windows build support.
-
-**Examples:**
-
-```bash
-# List builds for active profile
-poetry run ccwb builds
-
-# List builds for specific profile
-poetry run ccwb builds --profile production
-
-# Check status of specific build
-poetry run ccwb builds --status abc12345
-
-# Check latest build status and download artifacts
-poetry run ccwb builds --status latest --download
-
-# List last 20 builds
-poetry run ccwb builds --limit 20
-```
-
-**Example output:**
-
-```
-Recent Windows Builds
-
-| Build ID | Status | Started | Duration |
-|----------|--------|---------|----------|
-| project:abc123 | SUCCEEDED | 2024-08-26 10:15 | 12m 34s |
-| project:def456 | IN_PROGRESS | 2024-08-26 10:30 | - |
-```
+Each bundle directory contains the interpreter (or a shim for slim), `credential_provider/`, optional `otel_helper/`, `config.json`, `claude-settings/`, and the installer script(s).
 
 ### `distribute` - Share Packages via Distribution
 

@@ -107,20 +107,28 @@ This creates:
 
 ### Step 3: Build Packages
 
-Build packages for all platforms:
+Build packages for all platforms (interactive prompt picks targets, or pass `--target-platform=` per run):
 
 ```bash
-poetry run ccwb package --target-platform all
+poetry run ccwb package
+# or, per platform:
+poetry run ccwb package --target-platform=windows
+poetry run ccwb package --target-platform=macos-arm64
+poetry run ccwb package --target-platform=macos-intel
+poetry run ccwb package --target-platform=linux-x64
+poetry run ccwb package --target-platform=linux-arm64
+poetry run ccwb package --target-platform=linux-x64 --slim
+poetry run ccwb package --target-platform=linux-arm64 --slim
 ```
 
-This creates executables in `dist/` directory:
+This creates one portable (or slim) bundle directory per platform under `dist/<profile>/<timestamp>/`:
 
-- `credential-process-macos-arm64`
-- `credential-process-macos-intel`
-- `credential-process-linux-x64`
-- `credential-process-linux-arm64`
-- `credential-process-windows.exe`
-- Installation scripts and configuration
+- `windows-portable/`
+- `macos-arm64-portable/` / `macos-intel-portable/`
+- `linux-x64-portable/` / `linux-arm64-portable/`
+- `linux-x64-slim/` / `linux-arm64-slim/` (optional, require system Python ≥ 3.9)
+
+Each bundle ships `install.sh` / `install.bat`, `config.json`, `claude-settings/`, and the embedded Python runtime (for portable variants).
 
 ### Step 4: Distribute Packages
 

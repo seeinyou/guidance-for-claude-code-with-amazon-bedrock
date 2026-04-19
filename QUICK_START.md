@@ -22,10 +22,11 @@ Complete deployment walkthrough for IT administrators deploying Claude Code with
   - CloudFormation stacks
   - IAM OIDC Providers or Cognito Identity Pools
   - IAM roles and policies
+  - API Gateway, Lambda, SQS, DynamoDB, S3 (cost management stack)
   - (Optional) Amazon Elastic Container Service (Amazon ECS) tasks and Amazon CloudWatch dashboards
   - (Optional) Amazon Athena, AWS Glue, AWS Lambda, and Amazon Data Firehose resources
-  - (Optional) AWS CodeBuild
 - Amazon Bedrock activated in target regions
+- Bedrock Model Invocation Logging is enabled by the `quota` stack via a custom resource (creates an S3 bucket if one is not already configured)
 
 ### OIDC Provider Requirements
 
@@ -39,9 +40,9 @@ The guidance can be deployed in any AWS region that supports:
 
 - IAM OIDC Providers or Amazon Cognito Identity Pools
 - Amazon Bedrock
+- API Gateway + Lambda + SQS + DynamoDB + S3 (cost management stack)
 - (Optional) Amazon Elastic Container Service (Amazon ECS) tasks and Amazon CloudWatch dashboards
 - (Optional) Amazon Athena, AWS Glue, AWS Lambda, and Amazon Data Firehose resources
-- (Optional) AWS CodeBuild
 
 ### Cross-Region Inference
 
@@ -135,47 +136,66 @@ This creates the following AWS resources:
 
 ### Step 4: Create Distribution Package
 
-Build the package for end users:
+Build the package for end users. Each bundle is a portable Python install
+(no end-user compiler, no Python dependency) produced from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone).
+Linux additionally has a **slim** variant that uses the user's system
+Python 3.9+ for a ~30 MB download.
 
 ```bash
-# Build all platforms (starts Windows build in background)
-poetry run ccwb package --target-platform all
+# Interactive: pick platform(s) from a checkbox prompt
+poetry run ccwb package
 
-# Check Windows build status (optional)
-poetry run ccwb builds
+# Or build a specific platform non-interactively
+poetry run ccwb package --target-platform=windows
+poetry run ccwb package --target-platform=macos-arm64
+poetry run ccwb package --target-platform=macos-intel
+poetry run ccwb package --target-platform=linux-x64
+poetry run ccwb package --target-platform=linux-arm64
 
-# When ready, create distribution URL (optional)
+# Linux slim variants (require system Python >= 3.9 on target machines)
+poetry run ccwb package --target-platform=linux-x64 --slim
+poetry run ccwb package --target-platform=linux-arm64 --slim
+
+# Upload to landing page / presigned S3 (whichever was selected in init)
 poetry run ccwb distribute
 ```
 
-**Package Workflow:**
+**Build requirements on the host:**
 
-1. **Local builds**: macOS/Linux executables are built locally using PyInstaller
-2. **Windows builds**: Trigger AWS CodeBuild for Windows executables (20+ minutes) - requires enabling CodeBuild during `init`
-3. **Check status**: Monitor build progress with `poetry run ccwb builds`
-4. **Create distribution**: Use `distribute` to upload and generate presigned URLs
+- Any macOS or Linux dev machine can cross-build Windows, macOS, and
+  Linux bundles — no CodeBuild, no Nuitka, no PyInstaller.
+- Linux builds require **Docker** for the ELF strip step. The build runs
+  `eu-strip` from elfutils in a `debian:12-slim` container; the host
+  architecture does not matter (the container targets `linux/amd64` or
+  `linux/arm64` as needed).
+- macOS builds have no special requirement.
 
-> **Note**: Windows builds are optional and require CodeBuild to be enabled during the `init` process. If not enabled, the package command will skip Windows builds and continue with other platforms.
+The `dist/<profile>/<timestamp>/` folder contains one subdirectory per
+bundle:
 
-The `dist/` folder will contain:
+- `windows-portable/`
+- `macos-arm64-portable/`
+- `macos-intel-portable/`
+- `linux-x64-portable/` / `linux-arm64-portable/`
+- `linux-x64-slim/` / `linux-arm64-slim/`
 
-- `credential-process-macos-arm64` - Authentication executable for macOS ARM64
-- `credential-process-macos-intel` - Authentication executable for macOS Intel (if built)
-- `credential-process-windows.exe` - Authentication executable for Windows
-- `credential-process-linux` - Authentication executable for Linux (if built on Linux)
-- `config.json` - Embedded configuration
-- `install.sh` - Installation script for Unix systems
-- `install.bat` - Installation script for Windows
-- `README.md` - User instructions
-- `.claude/settings.json` - Claude Code telemetry settings (if monitoring enabled)
-- `otel-helper-*` - OTEL helper executables for each platform (if monitoring enabled)
+Each bundle contains:
 
-The package builder:
+- Embedded Python interpreter (portable variants) or an installer that
+  reuses the user's Python (slim variants)
+- `credential_provider/` and (optional) `otel_helper/` source modules
+- `config.json` — OIDC provider, TVM endpoint, model selection, quota
+  interval, OTEL helper SHA256, etc.
+- `claude-settings/settings.json` — merged into the user's
+  `~/.claude/settings.json` at install time
+- `install.sh` (Unix) or `install.bat` + `install.ps1` (Windows)
 
-- Automatically builds binaries for both macOS and Linux by default
-- Uses Docker for cross-platform Linux builds when running on macOS
-- Includes the OTEL helper for extracting user attributes from JWT tokens
-- Creates a unified installer that auto-detects the user's platform
+`ccwb distribute` uploads each bundle as its own S3 object under
+`packages/<key>/latest.zip` (keys: `windows`, `macos-arm64`, `macos-intel`,
+`linux-x64`, `linux-arm64`, `linux-x64-slim`, `linux-arm64-slim`). Zips
+include explicit directory entries so Windows File Explorer's built-in
+"Extract All" reconstructs the layout correctly.
 
 ### Step 5: Test the Setup
 
@@ -254,20 +274,21 @@ See [Distribution Comparison](assets/docs/distribution/comparison.md) for detail
 
 ### Build Requirements
 
-- **Windows**: AWS CodeBuild with Nuitka (automated)
-- **macOS**: PyInstaller with architecture-specific builds
-  - ARM64: Native build on Apple Silicon Macs
-  - Intel: Optional - requires x86_64 Python environment on ARM Macs
-  - Universal: Requires both architectures' Python libraries
-- **Linux**: Docker with PyInstaller (for building on non-Linux hosts)
+All platforms share the same build path: download a python-build-standalone
+tarball for the target, assemble a bundle directory, drop in the project
+sources + wheels, and write `install.sh` / `install.bat`.
 
-### Optional: Intel Mac Builds
-
-Intel Mac builds require an x86_64 Python environment on Apple Silicon Macs.
-
-See [CLI Reference - Intel Mac Build Setup](assets/docs/CLI_REFERENCE.md#intel-mac-build-setup-optional) for setup instructions.
-
-If not configured, the package command will skip Intel builds and continue with other platforms.
+- **Windows**: PBS `install_only` build for `x86_64-pc-windows-msvc` —
+  cross-extracts on macOS/Linux, no Windows build host needed.
+- **macOS**: PBS `aarch64-apple-darwin` or `x86_64-apple-darwin` — builds
+  locally on either Apple Silicon or Intel hosts.
+- **Linux (portable)**: PBS `x86_64-unknown-linux-gnu` or
+  `aarch64-unknown-linux-gnu`. ELF strip runs in Docker using `eu-strip`
+  from elfutils — GNU `strip` corrupts PBS binaries.
+- **Linux (slim)**: A minimal bundle that relies on the user's system
+  Python ≥ 3.9. The installer bootstraps a user-local virtualenv with the
+  vendored wheels. Verified on Ubuntu 22.04, Debian 11, Amazon Linux 2023;
+  Ubuntu 20.04 fails cleanly with a version check error.
 
 ---
 
@@ -293,11 +314,14 @@ Force re-authentication:
 
 ### Build Failures
 
-Check Windows build status:
-
-```bash
-poetry run ccwb builds
-```
+- `docker not found` / daemon not running — start Docker Desktop (Linux
+  host strip step requires it).
+- `allocated section '.dynstr' not in segment` — you're using GNU `strip`
+  instead of `eu-strip`; the Docker-based strip avoids this. See
+  [Cost Management](docs/cost-management.md) if you hit related ELF
+  issues on first run.
+- Slim bundle failing on target — user's Python is < 3.9; use the portable
+  bundle instead.
 
 ### Stack Deployment Issues
 
@@ -314,6 +338,8 @@ For detailed troubleshooting, see [Deployment Guide](assets/docs/DEPLOYMENT.md).
 ## Next Steps
 
 - [Architecture Deep Dive](assets/docs/ARCHITECTURE.md) - Technical architecture details
+- [Cost Management](docs/cost-management.md) - TVM, Bedrock usage pipeline, PROFILE records
+- [Admin Guide](docs/admin-guide.md) - Quota policy reference and admin panel walkthrough
 - [Enable Monitoring](assets/docs/MONITORING.md) - Setup OpenTelemetry monitoring
 - [Setup Analytics](assets/docs/ANALYTICS.md) - Configure S3 data lake and Athena queries
 - [CLI Reference](assets/docs/CLI_REFERENCE.md) - Complete command reference

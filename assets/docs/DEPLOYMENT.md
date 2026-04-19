@@ -57,74 +57,36 @@ With infrastructure deployed, you're ready to create the package that end users 
 Claude Code supports building for all major platforms:
 
 ```bash
-# Build for all platforms (recommended)
-poetry run ccwb package --target-platform=all
+# Interactive: pick platform(s) from the checkbox prompt
+poetry run ccwb package
 
 # Build for specific platforms
-poetry run ccwb package --target-platform=windows    # Windows via CodeBuild
-poetry run ccwb package --target-platform=macos      # Current macOS architecture
-poetry run ccwb package --target-platform=linux      # Linux via Docker
+poetry run ccwb package --target-platform=windows
+poetry run ccwb package --target-platform=macos-arm64
+poetry run ccwb package --target-platform=macos-intel
+poetry run ccwb package --target-platform=linux-x64
+poetry run ccwb package --target-platform=linux-arm64
+
+# Linux slim variants (require Python >= 3.9 on the target machine)
+poetry run ccwb package --target-platform=linux-x64 --slim
+poetry run ccwb package --target-platform=linux-arm64 --slim
 ```
 
-**Platform Build Methods (Hybrid System):**
+**Build method:** all variants use [python-build-standalone](https://github.com/astral-sh/python-build-standalone).
 
-- **Windows**: Uses Nuitka via AWS CodeBuild
-  - Optimized for performance and minimal antivirus false positives
-- **macOS**: Uses PyInstaller with architecture-specific builds
-  - ARM64: Native build on Apple Silicon Macs (works on all Macs via Rosetta)
-  - Intel: **Optional** - requires x86_64 Python environment on ARM Macs
-  - Universal: Requires both architectures' Python libraries
-- **Linux x64/ARM64**: Uses PyInstaller in Docker containers
-  - Automatically builds both architectures when Docker is available
-  - Docker Desktop handles architecture emulation via Rosetta
+- **Windows / macOS / Linux portable**: the PBS tarball for the target is downloaded, the interpreter and project sources are placed into `<platform>-portable/`, and pinned wheels are installed into the bundle's `site-packages`.
+- **Linux strip step**: `eu-strip` runs inside `debian:12-slim` via Docker (host may be macOS or Linux; container platform is auto-selected). GNU `strip` corrupts PBS binaries and must not be used.
+- **Linux slim**: no interpreter is shipped. The installer creates a user-local virtualenv from system Python ≥ 3.9 and installs the vendored wheels. Verified on Ubuntu 22.04, Debian 11, Amazon Linux 2023.
 
-**Optional: Intel Mac Setup**
+The resulting `dist/<profile>/<timestamp>/` folder contains one bundle directory per platform. Each bundle has:
 
-To build Intel binaries on Apple Silicon Macs, you'll need an x86_64 Python environment.
-See [CLI Reference](CLI_REFERENCE.md#intel-mac-build-setup-optional) for setup instructions.
+- The embedded Python interpreter (portable) or a bootstrap script (slim)
+- `credential_provider/` and optional `otel_helper/` sources
+- `config.json` with OIDC provider, TVM endpoint, model selection, OTEL helper hash, etc.
+- `claude-settings/settings.json` (merged into `~/.claude/settings.json` at install time)
+- `install.sh` (Unix) or `install.bat` + `install.ps1` (Windows)
 
-The package command will continue successfully even without this setup.
-
-This command performs several operations. First, it retrieves the Cognito Identity Pool ID from your deployed CloudFormation stack. Then it compiles the Python authentication code into standalone executables using PyInstaller for macOS/Linux and Nuitka for Windows. Your organization's configuration - provider domain, client ID, and infrastructure details - gets written to a config.json file that the executables read at runtime.
-
-The resulting `dist/` folder contains everything users need:
-
-- Platform-specific executables (`credential-process-<platform>`) handle the OAuth2 authentication flow
-- The configuration file includes all necessary settings
-- Intelligent installer scripts (`install.sh` for Unix, `install.bat` for Windows) detect the user's architecture and set up their AWS profile automatically
-- If you enabled monitoring, OTEL helper executables and Claude Code telemetry settings that point to your OpenTelemetry collector
-
-### Windows Build System (Optional)
-
-Windows binary builds use AWS CodeBuild with Nuitka for optimal performance. Windows support is optional and configured during the `init` process:
-
-1. **Enable during init**: When running `poetry run ccwb init`, you'll be prompted:
-
-   ```
-   Enable Windows build support via AWS CodeBuild? (y/N)
-   ```
-
-   If you answer "yes", the CodeBuild stack will be deployed automatically when you run `deploy`.
-
-2. **If enabled**, Windows builds will automatically trigger when you run:
-
-   ```bash
-   poetry run ccwb package --target-platform=all
-   # or specifically for Windows:
-   poetry run ccwb package --target-platform=windows
-   ```
-
-3. **Monitor build progress**:
-   ```bash
-   poetry run ccwb builds
-   ```
-
-**Important Notes:**
-
-- Windows builds are completely optional - the package will work without them
-- If CodeBuild is not enabled, Windows builds will be silently skipped
-- Windows builds take 20+ minutes
-- To enable Windows builds after initial setup, re-run `poetry run ccwb init`
+> No CodeBuild, no Nuitka, no PyInstaller — all packaging runs on a macOS or Linux workstation with Docker available.
 
 ## Phase 4: Testing Your Deployment
 

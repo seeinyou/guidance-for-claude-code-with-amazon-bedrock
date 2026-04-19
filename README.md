@@ -9,10 +9,11 @@ This guidance provides enterprise deployment patterns for Claude Code with Amazo
 - **Enterprise IdP Integration**: Leverage existing OIDC identity providers (Okta, Azure AD, Auth0, etc.)
 - **Centralized Access Control**: Manage Claude Code access through your identity provider
 - **No API Key Management**: Eliminate the need to distribute or rotate long-lived credentials
-- **Usage Monitoring**: Optional CloudWatch dashboards for tracking usage and costs
+- **Server-Side Cost Controls**: Token Vending Machine issues short-lived Bedrock credentials with synchronous, fail-closed quota enforcement (see [Cost Management](docs/cost-management.md))
+- **Usage Monitoring**: CloudWatch dashboards plus a Bedrock invocation-log pipeline that feeds per-user usage and cost into the admin panel
 - **Multi-Region Support**: Configure which AWS regions users can access Bedrock in
 - **Multi-Partition Support**: Deploy to AWS Commercial or AWS GovCloud (US) regions
-- **Multi-Platform Support**: Windows, macOS (ARM & Intel), and Linux distributions
+- **Multi-Platform Support**: Windows, macOS (ARM & Intel), and Linux (x64 & ARM64) distributions
 
 ### For End Users
 
@@ -53,7 +54,9 @@ The deployment creates:
 
 - IAM OIDC Provider or Cognito Identity Pool for federation
 - IAM roles with scoped Bedrock access policies
-- Platform-specific installation packages (Windows, macOS, Linux)
+- Token Vending Machine (TVM) Lambda + Bedrock usage pipeline for server-side quota enforcement and per-user cost tracking
+- Self-service landing page + admin panel (ALB + Lambda)
+- Platform-specific installation packages (Windows, macOS, Linux portable + Linux slim)
 - Optional: OpenTelemetry monitoring infrastructure
 
 **Deployment time:** 2-3 hours for initial setup including IdP configuration.
@@ -96,8 +99,8 @@ This guidance uses Direct IAM OIDC federation as the recommended authentication 
   - IAM roles and policies
   - (Optional) Amazon Elastic Container Service (Amazon ECS) tasks and Amazon CloudWatch dashboards
   - (Optional) Amazon Athena, AWS Glue, AWS Lambda, and Amazon Data Firehose resources
-  - (Optional) AWS CodeBuild
 - Amazon Bedrock activated in target regions
+- Bedrock Model Invocation Logging is enabled automatically by the `quota` stack when cost management is used
 
 **OIDC Provider Requirements:**
 
@@ -125,7 +128,6 @@ The guidance can be deployed in any AWS region that supports:
 - Amazon Bedrock
 - (Optional) Amazon Elastic Container Service (Amazon ECS) tasks and Amazon CloudWatch dashboards
 - (Optional) Amazon Athena, AWS Glue, AWS Lambda, and Amazon Data Firehose resources
-- (Optional) AWS CodeBuild
 
 Both AWS Commercial and AWS GovCloud (US) partitions are supported. See [AWS Partition Support](#aws-partition-support) for details.
 
@@ -141,22 +143,25 @@ This automatically routes requests across multiple AWS regions to ensure the bes
 
 ### Platform Support
 
-The authentication tools support all major platforms:
+Packages ship as portable Python bundles built from [python-build-standalone](https://github.com/astral-sh/python-build-standalone). The user gets a top-level directory with an embedded interpreter and wheels — no system Python, compiler, or SDK required. For Linux there is also a **slim** variant that reuses the user's existing Python 3.9+ for a ~30 MB download.
 
-| Platform | Architecture          | Build Method                | Installation |
-| -------- | --------------------- | --------------------------- | ------------ |
-| Windows  | x64                   | AWS CodeBuild (Nuitka)      | install.bat  |
-| macOS    | ARM64 (Apple Silicon) | Native (PyInstaller)        | install.sh   |
-| macOS    | Intel (x86_64)        | Cross-compile (PyInstaller) | install.sh   |
-| macOS    | Universal (both)      | Universal2 (PyInstaller)    | install.sh   |
-| Linux    | x86_64                | Docker (PyInstaller)        | install.sh   |
-| Linux    | ARM64                 | Docker (PyInstaller)        | install.sh   |
+| Platform | Architecture          | Variant                 | Installer    | Approx. size |
+| -------- | --------------------- | ----------------------- | ------------ | ------------ |
+| Windows  | x64                   | Portable                | install.bat  | ~35 MB       |
+| macOS    | ARM64 (Apple Silicon) | Portable                | install.sh   | ~90 MB       |
+| macOS    | Intel (x86_64)        | Portable                | install.sh   | ~85 MB       |
+| Linux    | x64                   | Portable                | install.sh   | ~130 MB      |
+| Linux    | x64                   | Slim (system Python)    | install.sh   | ~29 MB       |
+| Linux    | ARM64                 | Portable                | install.sh   | ~112 MB      |
+| Linux    | ARM64                 | Slim (system Python)    | install.sh   | ~30 MB       |
 
-**Build System:**
+**Build requirements:**
 
-The package builder automatically creates executables for all platforms using PyInstaller (macOS/Linux) and AWS CodeBuild with Nuitka (Windows). All builds create standalone executables - no Python installation required for end users.
+- macOS/Linux portable bundles build on the host directly (no Docker needed on Linux).
+- Linux ELF strip uses Docker with `eu-strip` (elfutils) — required to safely shrink PBS binaries without breaking the dynamic-symbol section.
+- Windows portable bundles are produced by cross-extracting PBS on macOS/Linux; no Windows CI or CodeBuild is used.
 
-See [QUICK_START.md](QUICK_START.md#platform-builds) for detailed build configuration.
+See [QUICK_START.md](QUICK_START.md#platform-builds) for build commands and caveats.
 
 ## AWS Partition Support
 
@@ -239,11 +244,21 @@ The `ccwb deploy` command creates:
   - Bedrock model invocation in configured regions
   - CloudWatch metric publishing (if monitoring enabled)
 
+**Cost Management Infrastructure (`quota` stack):**
+
+- TVM Lambda (`POST /tvm`) that validates JWT, checks quotas fail-closed, and returns short-lived Bedrock credentials
+- `BedrockUserRole` — Bedrock-scoped role assumed by the TVM on behalf of users
+- Bedrock Model Invocation Logging custom resource + S3 → SQS → Lambda pipeline (`bedrock_usage_stream` + `bedrock_usage_reconciler`)
+- CloudWatch alarms on stream errors, DLQ depth, and DynamoDB throttling
+
+See [Cost Management](docs/cost-management.md) for the full architecture.
+
 **User Distribution Packages:**
 
-- Platform-specific executables (Windows, macOS ARM64/Intel, Linux x64/ARM64)
-- Installation scripts that configure AWS CLI credential process
-- Pre-configured settings (OIDC provider, model selection, monitoring endpoints)
+- Portable Python bundles (Windows, macOS ARM64/Intel, Linux x64/ARM64)
+- Linux slim bundles that reuse system Python 3.9+
+- Install scripts that configure the AWS CLI `credential_process` and Claude Code settings
+- Pre-configured settings (OIDC provider, TVM endpoint, model selection, monitoring endpoints)
 
 ### Distribution Options (Optional)
 
@@ -259,7 +274,7 @@ After building packages, you can share them with users in three ways:
 
 **Presigned URLs:** Generate time-limited S3 URLs for direct downloads. Automated but requires S3 bucket setup.
 
-**Landing Page:** Self-service portal with IdP authentication, platform detection, and custom domain support. Full automation with compliance features.
+**Landing Page:** Self-service portal with IdP authentication, OS detection, and per-OS grouped cards. Linux shows a single card per architecture with side-by-side Portable/Slim download buttons. Groups with no available packages are omitted automatically.
 
 See [Distribution Comparison](assets/docs/distribution/comparison.md) for detailed setup guides.
 
@@ -330,12 +345,15 @@ See [Analytics Guide](assets/docs/ANALYTICS.md) for SQL queries on historical da
 ### Architecture & Deployment
 
 - [Architecture Guide](assets/docs/ARCHITECTURE.md) - System architecture and design decisions
+- [Cost Management](docs/cost-management.md) - TVM, Bedrock usage pipeline, and PROFILE records
 - [Deployment Guide](assets/docs/DEPLOYMENT.md) - Advanced deployment options
 - [Distribution Comparison](assets/docs/distribution/comparison.md) - Presigned URLs vs Landing Page
 - [Local Testing Guide](assets/docs/LOCAL_TESTING.md) - Testing before deployment
 
-### Monitoring & Analytics
+### Operations
 
+- [Admin Guide](docs/admin-guide.md) - Quota policies, pricing, admin panel, troubleshooting
+- [User Guide](docs/user-guide.md) - End-user install, quota UX, Docker environment
 - [Monitoring Guide](assets/docs/MONITORING.md) - OpenTelemetry setup and dashboards
 - [Analytics Guide](assets/docs/ANALYTICS.md) - S3 data lake and Athena SQL queries
 
