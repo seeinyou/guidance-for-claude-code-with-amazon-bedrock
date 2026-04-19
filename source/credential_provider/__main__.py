@@ -6,6 +6,8 @@ AWS Credential Provider for OIDC + Cognito Identity Pool
 Supports multiple OIDC providers for Bedrock access
 """
 
+from __future__ import annotations
+
 import base64
 import errno
 import hashlib

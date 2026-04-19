@@ -797,21 +797,6 @@ class InitCommand(Command):
             # Save monitoring progress
             progress.save_step("monitoring_complete", config)
 
-        # Additional optional features
-        console.print("\n[bold]Windows Build Support[/bold]")
-        console.print("Build Windows binaries using AWS CodeBuild")
-        enable_codebuild = questionary.confirm(
-            "Enable Windows builds?", default=config.get("codebuild", {}).get("enabled", False)
-        ).ask()
-
-        # Preserve existing codebuild settings, only update enabled flag
-        if "codebuild" not in config:
-            config["codebuild"] = {}
-        config["codebuild"]["enabled"] = enable_codebuild
-
-        if enable_codebuild:
-            console.print("[green]✓[/green] CodeBuild for Windows builds will be deployed")
-
         # Package distribution support
         console.print("\n[bold]Package Distribution[/bold]")
         console.print("Choose how to distribute Claude Code packages to end users:")
@@ -1364,9 +1349,6 @@ class InitCommand(Command):
                 console.print("• DynamoDB tables for quota tracking")
                 console.print("• Lambda function for quota checking")
                 console.print("• API Gateway for real-time quota API")
-        if config.get("codebuild", {}).get("enabled", False):
-            console.print("• CodeBuild project for Windows binary builds")
-            console.print("• S3 bucket for build artifacts")
         if config.get("distribution", {}).get("enabled", False):
             dist_type = config.get("distribution", {}).get("type")
             if dist_type == "landing-page":
@@ -1527,7 +1509,6 @@ class InitCommand(Command):
             cognito_user_pool_id=config_data.get("cognito_user_pool_id"),
             federation_type=config_data.get("federation_type", "cognito"),
             max_session_duration=config_data.get("max_session_duration", 28800),
-            enable_codebuild=config_data.get("codebuild", {}).get("enabled", False),
             enable_distribution=config_data.get("distribution", {}).get("enabled", False),
             distribution_type=config_data.get("distribution", {}).get("type"),
             distribution_idp_provider=config_data.get("distribution", {}).get("idp_provider"),
@@ -1836,10 +1817,6 @@ class InitCommand(Command):
             # Add cross-region profile if present
             if hasattr(profile, "cross_region_profile") and profile.cross_region_profile:
                 existing_config["aws"]["cross_region_profile"] = profile.cross_region_profile
-
-            # Add CodeBuild configuration if present
-            if hasattr(profile, "enable_codebuild"):
-                existing_config["codebuild"] = {"enabled": profile.enable_codebuild}
 
             # Add distribution configuration if present
             if hasattr(profile, "enable_distribution"):

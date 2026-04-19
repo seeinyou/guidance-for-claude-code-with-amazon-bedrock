@@ -214,7 +214,6 @@ class ContextShowCommand(Command):
             console.print(
                 f"  Quota Monitoring:     {'✓ enabled' if profile.quota_monitoring_enabled else '✗ disabled'}"
             )
-            console.print(f"  CodeBuild:            {'✓ enabled' if profile.enable_codebuild else '✗ disabled'}")
 
             # Distribution
             if profile.distribution_type:

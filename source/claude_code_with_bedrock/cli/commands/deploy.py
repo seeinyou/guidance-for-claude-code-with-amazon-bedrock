@@ -139,16 +139,10 @@ class DeployCommand(Command):
                     console.print("[yellow]Distribution features not enabled in profile.[/yellow]")
                     console.print("Run 'poetry run ccwb init' and enable distribution features.")
                     return 1
-            elif stack_arg == "codebuild":
-                if profile.enable_codebuild:
-                    stacks_to_deploy.append(("codebuild", "CodeBuild for Windows binary builds"))
-                else:
-                    console.print("[yellow]CodeBuild is not enabled in your configuration.[/yellow]")
-                    return 1
             else:
                 console.print(f"[red]Unknown stack: {stack_arg}[/red]")
                 console.print(
-                    "Valid stacks: auth, distribution, networking, monitoring, dashboard, analytics, quota, codebuild\n"
+                    "Valid stacks: auth, distribution, networking, monitoring, dashboard, analytics, quota\n"
                 )
                 console.print("[dim]Tip: Use 'ccwb deploy' without arguments to deploy all enabled stacks.[/dim]")
                 console.print("[dim]Use 'ccwb deploy quota' for quota-specific updates or late enablement.[/dim]")
@@ -175,9 +169,6 @@ class DeployCommand(Command):
                 # Check if quota monitoring is enabled
                 if getattr(profile, "quota_monitoring_enabled", False):
                     stacks_to_deploy.append(("quota", "Quota Monitoring (Per-User Token Limits)"))
-            # Check if CodeBuild is enabled
-            if getattr(profile, "enable_codebuild", False):
-                stacks_to_deploy.append(("codebuild", "CodeBuild for Windows binary builds"))
 
         # Initialize CloudFormation manager
         cf_manager = CloudFormationManager(region=profile.aws_region)
@@ -1011,14 +1002,6 @@ class DeployCommand(Command):
                         except Exception:
                             pass
 
-            elif stack_type == "codebuild":
-                template = project_root / "deployment" / "infrastructure" / "codebuild-windows.yaml"
-                stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
-                params = [f"ProjectNamePrefix={profile.identity_pool_name}"]
-                return deploy_with_cf(
-                    template, stack_name, params, task_description="Deploying CodeBuild for Windows builds..."
-                )
-
             else:
                 console.print(f"[red]Unknown stack type: {stack_type}[/red]")
                 return 1
@@ -1189,7 +1172,6 @@ class DeployCommand(Command):
             "dashboard": "CloudWatch Dashboard",
             "analytics": "Analytics Pipeline",
             "quota": "Quota Monitoring",
-            "codebuild": "CodeBuild",
         }
 
         # Stack types that are being deployed

@@ -5,7 +5,6 @@
 
 from cleo.application import Application
 
-from .commands.builds import BuildsCommand
 from .commands.cleanup import CleanupCommand
 from .commands.context import (
     ConfigExportCommand,
@@ -51,7 +50,6 @@ def create_application() -> Application:
     application.add(StatusCommand())
     application.add(TestCommand())
     application.add(PackageCommand())
-    application.add(BuildsCommand())
     application.add(DistributeCommand())
     application.add(DestroyCommand())
     application.add(CleanupCommand())
