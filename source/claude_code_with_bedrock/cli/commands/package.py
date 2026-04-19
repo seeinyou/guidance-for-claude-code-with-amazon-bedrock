@@ -1879,6 +1879,7 @@ cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
 chmod +x ~/claude-code-with-bedrock/credential-process
+xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
 
 # macOS Keychain Notice
 if [[ "$OSTYPE" == "darwin"* ]]; then
