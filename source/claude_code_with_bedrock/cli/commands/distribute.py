@@ -524,10 +524,23 @@ class DistributeCommand(Command):
                     zip_path = temp_dir / f"{s3_key}.zip"
                     # Each zip contains exactly the bundle directory at the top
                     # level so `unzip foo.zip` produces a single named folder.
+                    # Write explicit directory entries (trailing slash, zero
+                    # bytes) for every dir: Windows File Explorer's built-in
+                    # "Extract All" sometimes turns implicit directories (dirs
+                    # that appear only as path prefixes of file entries) into
+                    # zero-byte *files*, which breaks Python namespace packages
+                    # like jaraco/. Listing them explicitly forces Explorer to
+                    # create real directories.
                     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                        for entry in bundle_path.rglob("*"):
-                            if entry.is_file():
-                                rel = entry.relative_to(bundle_path)
+                        dirs_written: set[str] = set()
+                        for entry in sorted(bundle_path.rglob("*")):
+                            rel = entry.relative_to(bundle_path)
+                            if entry.is_dir():
+                                arc_dir = f"{bundle_name}/{rel}/".replace("\\", "/")
+                                if arc_dir not in dirs_written:
+                                    zipf.writestr(arc_dir, b"")
+                                    dirs_written.add(arc_dir)
+                            elif entry.is_file():
                                 zipf.write(entry, f"{bundle_name}/{rel}")
 
                     s3_object_key = f"packages/{s3_key}/latest.zip"
