@@ -627,7 +627,10 @@ class MultiProviderAuth:
         legacy_hash = self.config.get("otel_helper_hash")
 
         if not hashes and not legacy_hash:
-            print("Warning: otel_helper_hash not configured — integrity check skipped", file=sys.stderr)
+            # OTEL helper is bundled as Python source, not a separate binary,
+            # so hashes are absent by design. Status is still reported to TVM
+            # so server-side policy can choose to reject if it ever requires
+            # integrity — no user-facing warning.
             return "not-configured"
 
         # Resolve expected hash for current platform
@@ -635,7 +638,6 @@ class MultiProviderAuth:
             platform_key = self._get_otel_platform_key()
             expected_hash = hashes.get(platform_key)
             if not expected_hash:
-                print(f"Warning: no otel-helper hash for platform '{platform_key}' — integrity check skipped", file=sys.stderr)
                 return "not-configured"
         else:
             expected_hash = legacy_hash

@@ -625,7 +625,9 @@ Resources:
     Properties:
       ServiceToken: !GetAtt BedrockLoggingConfigFunction.Arn
       SQSQueueArn: !GetAtt BedrockLogQueue.Arn
-      ForceUpdate: '2026-04-14-v2'
+      # Bump this value whenever the custom-resource reconciliation logic
+      # changes so CloudFormation sends a new Update event.
+      ForceUpdate: '2026-04-19-v4'
 
   # --- Shared Lambda Layer for Bedrock usage utilities ---
   BedrockUsageUtilsLayer:
@@ -784,7 +786,10 @@ Resources:
           PRICING_TABLE: !Ref BedrockPricing
           DLQ_URL: !Ref BedrockLogDLQ
           BEDROCK_LOG_BUCKET: !GetAtt BedrockLoggingConfig.BucketName
-          BEDROCK_LOG_PREFIX: 'bedrock-raw/'
+          # Prefix comes from the custom resource so it matches whatever
+          # prefix Bedrock is actually writing to (may not be "bedrock-raw/"
+          # if the account had logging pre-configured before this stack).
+          BEDROCK_LOG_PREFIX: !GetAtt BedrockLoggingConfig.LogPrefix
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
       Layers:
         - !Ref BedrockUsageUtilsLayer
@@ -868,7 +873,7 @@ Resources:
   # End Cost Management Hardening
   # ============================================
 
-  # Grant MetricsAggregator permissions to write to quota table and read policies
+  # Grant MetricsAggregator read access to the Bedrock pricing table for cost calculation
   MetricsAggregatorQuotaPolicy:
     Type: AWS::IAM::Policy
     Properties:
@@ -876,20 +881,6 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Action:
-              - dynamodb:PutItem
-              - dynamodb:UpdateItem
-              - dynamodb:GetItem
-            Resource:
-              - !GetAtt UserQuotaMetrics.Arn
-          - Effect: Allow
-            Action:
-              - dynamodb:Query
-              - dynamodb:GetItem
-            Resource:
-              - !GetAtt QuotaPolicies.Arn
-              - !Sub '${QuotaPolicies.Arn}/index/*'
           - Effect: Allow
             Action:
               - dynamodb:GetItem
