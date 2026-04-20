@@ -23,7 +23,9 @@ def get_model_display_name(model_id):
     # Detect model family and version
     model_lower = model_display.lower()
     
-    if "opus-4-6" in model_lower or "opus-4.6" in model_lower:
+    if "opus-4-7" in model_lower or "opus-4.7" in model_lower:
+        return "Opus 4.7"
+    elif "opus-4-6" in model_lower or "opus-4.6" in model_lower:
         return "Opus 4.6"
     elif "opus-4-1" in model_lower or "opus-4.1" in model_lower:
         return "Opus 4.1"

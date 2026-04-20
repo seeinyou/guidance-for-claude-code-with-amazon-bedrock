@@ -1466,11 +1466,16 @@ class QuotaImportCommand(Command):
 
 # Default pricing for Claude models on Bedrock (per 1M tokens in USD)
 # Source: https://docs.anthropic.com/en/docs/about-claude/pricing
-# Note: 4.6 models use shorter IDs without :0 suffix (e.g. anthropic.claude-opus-4-6-v1)
+# Note: 4.6+ models use shorter IDs without :0 suffix (e.g. anthropic.claude-opus-4-7-v1)
 # Note: cache_write_per_1m is 5-minute ephemeral cache (1.25x input).
 # cache_write_1h_per_1m is 1-hour ephemeral cache (2x input).
 # The response body provides cache_creation.ephemeral_5m/1h breakdown.
 DEFAULT_BEDROCK_PRICING = {
+    # Claude 4.7 (no :0 suffix)
+    "anthropic.claude-opus-4-7-v1": {
+        "input_per_1m": "5.00", "output_per_1m": "25.00",
+        "cache_read_per_1m": "0.50", "cache_write_per_1m": "6.25", "cache_write_1h_per_1m": "10.00",
+    },
     # Claude 4.6 (no :0 suffix)
     "anthropic.claude-opus-4-6-v1": {
         "input_per_1m": "5.00", "output_per_1m": "25.00",
