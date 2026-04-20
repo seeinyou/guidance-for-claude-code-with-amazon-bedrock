@@ -157,6 +157,10 @@ poetry run ccwb package --target-platform=linux-arm64
 poetry run ccwb package --target-platform=linux-x64 --slim
 poetry run ccwb package --target-platform=linux-arm64 --slim
 
+# Drop the otel_helper/ payload to shrink the bundle (OTLP still works, but
+# CloudWatch metrics lose per-user attributes like email / team / cost_center)
+poetry run ccwb package --target-platform=macos-arm64 --no-otel-helper
+
 # Upload to landing page / presigned S3 (whichever was selected in init)
 poetry run ccwb distribute
 ```

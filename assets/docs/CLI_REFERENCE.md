@@ -238,6 +238,7 @@ poetry run ccwb package [options]
   - `linux-arm64` - Linux ARM64 portable bundle (uses Docker for ELF strip)
   - `windows` - Windows x64 portable bundle (cross-extracted from PBS)
 - `--slim` - Linux only: build a ~30 MB bundle that reuses system Python 3.9+ instead of shipping PBS
+- `--no-otel-helper` - Skip bundling `otel_helper/`. OTLP still works, but CloudWatch metrics won't carry per-user attributes (email, team, cost_center). Produces a smaller package.
 - `--profile <name>` - Configuration profile to use (defaults to active profile)
 - `--build-verbose` - Enable verbose logging for build processes
 

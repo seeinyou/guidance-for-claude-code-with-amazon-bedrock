@@ -119,6 +119,12 @@ poetry run ccwb package --target-platform=linux-x64
 poetry run ccwb package --target-platform=linux-arm64
 poetry run ccwb package --target-platform=linux-x64 --slim
 poetry run ccwb package --target-platform=linux-arm64 --slim
+
+# Skip otel_helper/ to shrink the bundle. OTLP metrics still ship, but they
+# arrive without per-user attributes (email / team / cost_center), so the
+# dashboard can't split usage by user. Useful when those dimensions aren't
+# needed downstream.
+poetry run ccwb package --target-platform=macos-arm64 --no-otel-helper
 ```
 
 This creates one portable (or slim) bundle directory per platform under `dist/<profile>/<timestamp>/`:

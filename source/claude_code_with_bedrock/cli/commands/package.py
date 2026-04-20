@@ -4,18 +4,16 @@
 """Package command - Build distribution packages."""
 
 import json
-import os
-import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import questionary
 from cleo.commands.command import Command
 from cleo.helpers import option
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
 from claude_code_with_bedrock.cli.utils.display import display_configuration_info
@@ -78,6 +76,13 @@ foreach ($item in $payload) {
 }
 Write-Ok "Files copied."
 
+# 2b. If this bundle opted out of shipping otel_helper, remove any leftover
+#     helper files from a previous install so settings won't point at them.
+if (-not (Test-Path (Join-Path $ScriptDir 'otel_helper'))) {
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $InstallPath 'otel-helper.cmd')
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $InstallPath 'otel_helper')
+}
+
 # 3. Substitute placeholder in settings template.
 $credCmd = Join-Path $InstallPath 'credential-process.cmd'
 $templateText = Get-Content -Raw $templatePath
@@ -95,6 +100,7 @@ if ($templateObj.PSObject.Properties.Name -contains 'otelHeadersHelper' -and
 
 # 4. Merge into ~\.claude\settings.json. Template values win for the keys we
 #    set (awsAuthRefresh and env.*); user's other keys are preserved.
+Write-Step "Merging Claude Code settings"
 $claudeDir = Join-Path $env:USERPROFILE '.claude'
 $settingsPath = Join-Path $claudeDir 'settings.json'
 New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
@@ -124,13 +130,80 @@ foreach ($p in $templateObj.PSObject.Properties) {
     }
 }
 
+# Clear stale helper path from an earlier install if this bundle opted out.
+if (-not ($templateObj.PSObject.Properties.Name -contains 'otelHeadersHelper') -and $merged.Contains('otelHeadersHelper')) {
+    $merged.Remove('otelHeadersHelper')
+}
+
 $json = [PSCustomObject]$merged | ConvertTo-Json -Depth 20
 [System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Updated $settingsPath"
 
+# 5. Register AWS profiles in %USERPROFILE%\.aws\config. Lets `aws` CLI and
+#    boto3 use the same credential_process shim that Claude Code calls via
+#    awsAuthRefresh, so the whole AWS toolchain inherits OIDC-backed creds.
+Write-Step "Configuring AWS profiles"
+$awsDir = Join-Path $env:USERPROFILE '.aws'
+New-Item -ItemType Directory -Force -Path $awsDir | Out-Null
+$awsCfg = Join-Path $awsDir 'config'
+if (Test-Path $awsCfg) {
+    Copy-Item $awsCfg "$awsCfg.bak" -Force
+}
+
+$configJsonPath = Join-Path $InstallPath 'config.json'
+$profilesObj = Get-Content -Raw $configJsonPath | ConvertFrom-Json
+$profileNames = @($profilesObj.PSObject.Properties.Name)
+
+# Read existing config, drop any [profile <name>] sections we're about to
+# rewrite, then append fresh ones. Non-CCWB sections are preserved verbatim.
+$existingLines = if (Test-Path $awsCfg) { Get-Content $awsCfg } else { @() }
+$kept = New-Object System.Collections.Generic.List[string]
+$skipSection = $false
+foreach ($line in $existingLines) {
+    if ($line -match '^\s*\[(.+?)\]\s*$') {
+        $sectionName = $matches[1].Trim()
+        $skipSection = $false
+        foreach ($name in $profileNames) {
+            if ($sectionName -eq "profile $name") { $skipSection = $true; break }
+        }
+    }
+    if (-not $skipSection) { $kept.Add($line) }
+}
+# Trim trailing blanks so our appended sections aren't double-spaced.
+while ($kept.Count -gt 0 -and [string]::IsNullOrWhiteSpace($kept[$kept.Count - 1])) {
+    $kept.RemoveAt($kept.Count - 1)
+}
+
+$credCmdIni = $credCmd -replace '\\', '\\'
+$out = New-Object System.Collections.Generic.List[string]
+foreach ($line in $kept) { $out.Add($line) }
+if ($out.Count -gt 0) { $out.Add("") }
+foreach ($name in $profileNames) {
+    $region = $profilesObj.$name.aws_region
+    if (-not $region) { $region = "" }
+    $out.Add("[profile $name]")
+    $out.Add("credential_process = $credCmdIni --profile $name")
+    $out.Add("region = $region")
+    $out.Add("")
+}
+[System.IO.File]::WriteAllLines($awsCfg, $out, (New-Object System.Text.UTF8Encoding $false))
+Write-Ok ("Registered profiles: " + ($profileNames -join ", "))
+
+# 6. Telemetry reminder: OTEL SDK defaults to :4318 when the endpoint has no
+#    port, but our ALB listeners are typically :80 -- silent metric loss otherwise.
+$otlpEndpoint = $null
+if ($templateObj.PSObject.Properties.Name -contains 'env' -and
+    $templateObj.env.PSObject.Properties.Name -contains 'OTEL_EXPORTER_OTLP_ENDPOINT') {
+    $otlpEndpoint = $templateObj.env.OTEL_EXPORTER_OTLP_ENDPOINT
+}
+if ($otlpEndpoint) {
+    Write-Step "Telemetry"
+    Write-Ok "OTLP endpoint: $otlpEndpoint"
+}
+
 Write-Host ""
 Write-Step "Done."
-Write-Host "   Install path: $InstallPath"
+Write-Host "    Install path: $InstallPath"
 Write-Host ""
 Write-Host "Next: run 'claude' in a new shell to trigger first login."
 """
@@ -174,13 +247,15 @@ class PackageCommand(Command):
             description="Linux only: build a ~25MB bundle using system Python 3.9+ instead of shipping PBS",
             flag=True,
         ),
+        option(
+            "no-otel-helper",
+            description="Skip bundling otel_helper/ (smaller package; OTLP still works but user attributes won't tag CloudWatch metrics)",
+            flag=True,
+        ),
     ]
 
     def handle(self) -> int:
         """Execute the package command."""
-        import platform
-        import subprocess
-
         console = Console()
 
         # Load configuration first
@@ -355,6 +430,8 @@ class PackageCommand(Command):
 
         console.print("\n[cyan]Creating configuration...[/cyan]")
         federation_identifier = federated_role_arn if federation_type == "direct" else identity_pool_id
+        # Both branches above return 1 when their identifier is missing, so this is always str.
+        assert federation_identifier is not None
         self._create_config(
             output_dir,
             profile,
@@ -372,12 +449,13 @@ class PackageCommand(Command):
 
         # Copy config.json + claude-settings/ into each bundle so the bundled
         # installer (install.ps1 / install.sh) finds them via its own directory.
+        include_otel_helper = profile.monitoring_enabled and not bool(self.option("no-otel-helper"))
         if any(p == "windows" for p, _ in built_executables):
             self._finalize_windows_portable(output_dir)
         for platform_name, _ in built_executables:
             if platform_name in self.POSIX_PYTHON_URLS:
                 self._finalize_posix_portable(
-                    output_dir, platform_name, profile.monitoring_enabled, slim=slim
+                    output_dir, platform_name, include_otel_helper, slim=slim
                 )
 
         # Summary
@@ -654,6 +732,14 @@ fi
 
 echo "    Files copied."
 
+# 2b. If this bundle opted out of shipping otel_helper, remove any leftover
+#     helper wrapper/source from a previous install so the merge below sees
+#     an honest "no helper available" state.
+if [ ! -f "$SCRIPT_DIR/otel_helper/__main__.py" ]; then
+    rm -f "$INSTALL_DIR/otel-helper"
+    rm -rf "$INSTALL_DIR/otel_helper"
+fi
+
 # 3. Merge Claude Code settings template
 TEMPLATE="$SCRIPT_DIR/claude-settings/settings.json"
 if [ -f "$TEMPLATE" ]; then
@@ -689,6 +775,9 @@ for key, value in tpl.items():
         merged["env"] = {**existing["env"], **value}
     else:
         merged[key] = value
+# Clear stale helper path from an earlier install if this bundle opted out.
+if "otelHeadersHelper" not in tpl:
+    merged.pop("otelHeadersHelper", None)
 with open(out_path, "w") as f:
     json.dump(merged, f, indent=2)
 PY
@@ -729,6 +818,25 @@ with open(aws_cfg, "w") as f:
     c.write(f)
 print("    Registered profiles:", ", ".join(profiles))
 PY
+
+# 6. Telemetry reminder: read merged settings and call out OTLP endpoint.
+# OTEL SDK defaults to port 4318 when the endpoint has no port, but our ALB
+# listeners are typically :80 -- silent metric loss if users miss this.
+if [ -f "$HOME/.claude/settings.json" ]; then
+    "$INSTALL_DIR/python/bin/python3" - "$HOME/.claude/settings.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        s = json.load(f)
+except Exception:
+    sys.exit(0)
+endpoint = (s.get("env") or {}).get("OTEL_EXPORTER_OTLP_ENDPOINT")
+if not endpoint:
+    sys.exit(0)
+print("==> Telemetry")
+print(f"    OTLP endpoint: {endpoint}")
+PY
+fi
 
 echo ""
 echo "==> Done."
@@ -1003,6 +1111,14 @@ EOF
 chmod +x "$INSTALL_DIR/credential-process"
 echo "    Files copied."
 
+# 3b. If this bundle opted out of shipping otel_helper, remove any leftover
+#     helper wrapper/source from a previous install so the merge sees the
+#     honest "no helper available" state.
+if [ ! -f "$SCRIPT_DIR/otel_helper/__main__.py" ]; then
+    rm -f "$INSTALL_DIR/otel-helper"
+    rm -rf "$INSTALL_DIR/otel_helper"
+fi
+
 # 4. Merge Claude Code settings template
 TEMPLATE="$SCRIPT_DIR/claude-settings/settings.json"
 if [ -f "$TEMPLATE" ]; then
@@ -1037,6 +1153,9 @@ for key, value in tpl.items():
         merged["env"] = {**existing["env"], **value}
     else:
         merged[key] = value
+# Clear stale helper path from an earlier install if this bundle opted out.
+if "otelHeadersHelper" not in tpl:
+    merged.pop("otelHeadersHelper", None)
 with open(out_path, "w") as f:
     json.dump(merged, f, indent=2)
 PY
@@ -1078,6 +1197,24 @@ with open(aws_cfg, "w") as f:
     c.write(f)
 print("    Registered profiles:", ", ".join(profiles))
 PY
+
+# 7. Telemetry reminder: OTEL SDK defaults to :4318 when the endpoint has no
+# port, but our ALB listeners are typically :80 -- silent metric loss otherwise.
+if [ -f "$HOME/.claude/settings.json" ]; then
+    "$PYTHON_BIN" - "$HOME/.claude/settings.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        s = json.load(f)
+except Exception:
+    sys.exit(0)
+endpoint = (s.get("env") or {}).get("OTEL_EXPORTER_OTLP_ENDPOINT")
+if not endpoint:
+    sys.exit(0)
+print("==> Telemetry")
+print(f"    OTLP endpoint: {endpoint}")
+PY
+fi
 
 echo ""
 echo "==> Done."
@@ -1516,7 +1653,7 @@ Available metrics include:
             claude_dir.mkdir(exist_ok=True)
 
             # Start with basic settings required for Bedrock
-            settings = {
+            settings: dict[str, Any] = {
                 "env": {
                     # Set AWS_REGION based on cross-region profile for correct Bedrock endpoint
                     "AWS_REGION": self._get_bedrock_region_for_profile(profile),
