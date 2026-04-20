@@ -65,20 +65,128 @@ See [QUICK_START.md](QUICK_START.md) for complete step-by-step deployment instru
 
 ## Architecture Overview
 
-This guidance uses Direct IAM OIDC federation as the recommended authentication pattern. This provides temporary AWS credentials with complete user attribution for audit trails and usage monitoring.
+This guidance authenticates users through their OIDC provider and issues short-lived, Bedrock-scoped AWS credentials via a server-side **Token Vending Machine (TVM) Lambda** that enforces quotas fail-closed. Actual usage and cost come from **Bedrock Model Invocation Logging** — not from client-reported OTEL metrics — so quotas cannot be bypassed by tampering with the client.
 
-**Alternative:** Cognito Identity Pool is also supported for legacy IdP integrations. See [Deployment Guide](assets/docs/DEPLOYMENT.md) for comparison.
+Supported federation modes behind the TVM:
+- **Cognito Identity Pool** (default) — recommended when you already rely on Cognito or need custom token mapping.
+- **Direct IAM OIDC Provider** — leaner path for organizations happy to trust IdP tokens directly.
 
-### Authentication Flow (Direct IAM Federation)
+See [Deployment Guide](assets/docs/DEPLOYMENT.md) for comparison.
 
-![Architecture Diagram](assets/images/credential-flow-direct-diagram.png)
+### End-to-End Architecture
 
-1. **User initiates authentication**: User requests access to Amazon Bedrock through Claude Code
-2. **OIDC authentication**: User authenticates with their OIDC provider and receives an ID token
-3. **Token submission to IAM**: Application sends the OIDC ID token to Amazon Cognito
-4. **IAM returns credentials**: AWS IAM validates and returns temporary AWS credentials
-5. **Access Amazon Bedrock**: Application uses the temporary credentials to call Amazon Bedrock
-6. **Bedrock response**: Amazon Bedrock processes the request and returns the response
+```mermaid
+flowchart TB
+    %% ───────── Client ─────────
+    subgraph CLIENT["👤 User Workstation"]
+        direction TB
+        CLI["Claude Code CLI"]
+        CP["credential_provider<br/><i>PBS portable bundle</i>"]
+        Cache[("Session / Keyring<br/>credential cache")]
+    end
+
+    IdP["🪪 OIDC Provider<br/><i>Okta · Azure AD · Auth0 · Cognito</i>"]
+
+    %% ───────── AWS ─────────
+    subgraph AWS["☁️ AWS Account"]
+        subgraph AUTH["🔐 Auth &amp; Authorization"]
+            TVM["TVM Lambda<br/><b>POST /tvm</b>"]
+            STS["AWS STS"]
+        end
+
+        Bedrock["🧠 Amazon Bedrock"]
+
+        subgraph USAGE["📥 Usage Pipeline <i>(authoritative)</i>"]
+            BRLog["Model Invocation<br/>Logging"]
+            S3[("S3 logs")]
+            SQS["SQS"]
+            Stream["bedrock_usage_stream<br/>+ reconciler"]
+        end
+
+        DDB[("🗄️ DynamoDB<br/><i>policies · usage ·<br/>pricing · PROFILE</i>")]
+
+        ALB["🌐 ALB + Lambda<br/><i>Landing &amp; Admin</i>"]
+        CW["📊 CloudWatch<br/><i>Dashboards · Alarms</i>"]
+    end
+
+    %% ===== Structural edges =====
+    CLI --> CP
+    CP --> Cache
+    Cache -.->|"creds"| CLI
+    BRLog --> S3
+    S3 --> SQS
+    SQS --> Stream
+
+    %% ===== Auth flow (blue) =====
+    CP -->|"① browser login"| IdP
+    IdP -->|"② ID token"| CP
+    CP -->|"③ POST /tvm + JWT"| TVM
+    TVM -->|"AssumeRole"| STS
+    STS -->|"creds"| TVM
+    TVM -->|"④ temp creds"| CP
+    TVM -->|"read policy"| DDB
+    TVM -->|"reserve usage"| DDB
+
+    %% ===== Invocation flow (green) =====
+    CLI ==>|"⑤ InvokeModel"| Bedrock
+
+    %% ===== Usage feedback loop (purple) =====
+    Bedrock -->|"⑥ log event"| BRLog
+    Stream -->|"upsert<br/>usage &amp; cost"| DDB
+    Stream -->|"alarms · metrics"| CW
+
+    %% ===== Admin control (red) =====
+    ALB <-->|"policies · pricing ·<br/>unblock · enable/disable"| DDB
+
+    %% ===== Styling =====
+    classDef client fill:#e6f2ff,stroke:#1f5fa8,stroke-width:1.5px,color:#0b2a4a;
+    classDef idp fill:#f5e6ff,stroke:#6b1fa8,stroke-width:1.5px,color:#3a0a5a;
+    classDef auth fill:#fff5e6,stroke:#c06820,stroke-width:1.5px,color:#4a2a0a;
+    classDef data fill:#e8f7e8,stroke:#2a8a2a,stroke-width:1.8px,color:#0a3a0a;
+    classDef usage fill:#f0e6ff,stroke:#5a2ca8,stroke-width:1.5px,color:#2a0a4a;
+    classDef admin fill:#ffe6ec,stroke:#a82050,stroke-width:1.5px,color:#4a0a1a;
+    classDef store fill:#fafafa,stroke:#555,stroke-width:1.2px,color:#222;
+    classDef ops fill:#f5f5f5,stroke:#777,stroke-width:1px,color:#333;
+
+    class CLI,CP,Cache client;
+    class IdP idp;
+    class TVM,STS auth;
+    class Bedrock data;
+    class BRLog,S3,SQS,Stream usage;
+    class ALB admin;
+    class DDB store;
+    class CW ops;
+
+    %% ===== Edge colors =====
+    %% structural: 0..5
+    linkStyle 0,1 stroke:#888,stroke-width:1.5px;
+    linkStyle 2 stroke:#2a8a2a,stroke-width:1.8px,stroke-dasharray:4 3;
+    linkStyle 3,4,5 stroke:#5a2ca8,stroke-width:2px;
+    %% auth flow: 6..13
+    linkStyle 6,7,8,9,10,11,12,13 stroke:#1f5fa8,stroke-width:2.2px;
+    %% invocation: 14
+    linkStyle 14 stroke:#2a8a2a,stroke-width:2.4px;
+    %% usage loop: 15,16,17
+    linkStyle 15,16,17 stroke:#5a2ca8,stroke-width:2.2px;
+    %% admin: 18
+    linkStyle 18 stroke:#a82050,stroke-width:2.2px;
+```
+
+**Legend**
+
+| Color | Flow | Description |
+|-------|------|-------------|
+| 🔵 Blue | Auth & credential issuance | ① – ④ browser OIDC login → TVM fail-closed quota check → short-lived STS credentials |
+| 🟢 Green | Model invocation | ⑤ Claude Code calls Bedrock with the issued credentials |
+| 🟣 Purple | Usage feedback loop | ⑥ Bedrock Invocation Logging → S3 → SQS → stream Lambda → DynamoDB (authoritative usage & cost) |
+| 🔴 Admin | Control plane | ALB-hosted admin panel manages policies, pricing, unblock, enable/disable |
+
+**Key properties**
+- **Fail-closed enforcement.** Every credential issuance goes through TVM; over-quota or disabled users get a 403 instead of credentials.
+- **Server-side usage.** Token counts and cost come from Bedrock Invocation Logging, not client-reported OTEL — tampering with the client cannot bypass quotas.
+- **One DynamoDB source of truth.** Both the TVM and the admin panel read/write the same policy, usage, pricing, and user-PROFILE records.
+
+See [Cost Management](docs/cost-management.md) for the full pipeline details.
 
 ## Prerequisites
 
