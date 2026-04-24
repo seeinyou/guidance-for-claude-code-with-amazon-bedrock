@@ -49,15 +49,27 @@ class TVMUnreachableError(Exception):
     """Raised when the TVM endpoint is unreachable over the network (timeout / DNS / TLS)."""
 
 
+class TVMAuthRejectedError(Exception):
+    """Raised when TVM returns 401 (id_token rejected by API Gateway)."""
+
+
+class TVMAccessDeniedError(Exception):
+    """Raised when TVM returns 403 (non-quota policy denial)."""
+
+
+class TVMServiceError(Exception):
+    """Raised when TVM returns 5xx or malformed 200 (service-side problem)."""
+
+
 class QuotaExceededError(Exception):
     """Raised when TVM returns 429 due to quota limits."""
 
-    # Map TVM reason codes to user-friendly templates
+    # Map TVM reason codes to user-friendly templates (label, prefix, is_cost)
     _REASON_LABELS = {
-        "daily_cost_exceeded": ("Daily cost limit", "$", True),
-        "monthly_cost_exceeded": ("Monthly cost limit", "$", True),
-        "daily_tokens_exceeded": ("Daily token limit", "", False),
-        "monthly_tokens_exceeded": ("Monthly token limit", "", False),
+        "daily_cost_exceeded": ("日额度（金额）", "$", True),
+        "monthly_cost_exceeded": ("月额度（金额）", "$", True),
+        "daily_tokens_exceeded": ("日额度（tokens）", "", False),
+        "monthly_tokens_exceeded": ("月额度（tokens）", "", False),
     }
 
     def __init__(self, reason: str, usage=None, limit=None, raw_message: str = ""):
@@ -79,10 +91,10 @@ class QuotaExceededError(Exception):
                 used = f"{int(self.usage):,}"
                 cap = f"{int(self.limit):,}"
             return (
-                f"{label} exceeded — you have used {used} out of {cap}. "
-                "Please wait for the quota to reset or contact your administrator."
+                f"已超出{label}：已使用 {used}，额度上限 {cap}。"
+                "请等待下个周期重置，或联系管理员。"
             )
-        return self.raw_message or f"Quota exceeded ({self.reason})"
+        return self.raw_message or f"已超出额度（{self.reason}）"
 
 # OIDC Provider Configurations
 PROVIDER_CONFIGS = {
@@ -682,7 +694,9 @@ class MultiProviderAuth:
                 helper_path = Path.home() / "claude-code-with-bedrock" / "otel-helper"
 
         if not helper_path.exists():
-            print(f"Warning: otel-helper binary not found at {helper_path}", file=sys.stderr)
+            # Log only — this status is also sent to TVM via header, and is a
+            # soft warning; no need to surface it in Claude Code's error bubble.
+            self._log(f"otel-helper binary not found at {helper_path}")
             return "missing"
 
         # Compute SHA256
@@ -693,7 +707,9 @@ class MultiProviderAuth:
         actual_hash = sha256.hexdigest()
 
         if actual_hash != expected_hash:
-            print(f"Warning: otel-helper hash mismatch (expected={expected_hash[:16]}..., actual={actual_hash[:16]}...)", file=sys.stderr)
+            self._log(
+                f"otel-helper hash mismatch (expected={expected_hash[:16]}..., actual={actual_hash[:16]}...)"
+            )
             return "hash-mismatch"
 
         self._debug_print("otel-helper integrity check passed")
@@ -735,7 +751,7 @@ class MultiProviderAuth:
         """
         tvm_endpoint = self.config.get("tvm_endpoint")
         if not tvm_endpoint:
-            raise Exception("tvm_endpoint not configured — cannot obtain Bedrock credentials")
+            raise Exception("配置文件缺少 tvm_endpoint，无法获取 Bedrock 凭证。请联系管理员重新部署或重新下载安装包")
 
         timeout = self.config.get("tvm_request_timeout", 5)
 
@@ -753,12 +769,14 @@ class MultiProviderAuth:
                 result = response.json()
                 credentials = result.get("credentials")
                 if not credentials:
-                    raise Exception(f"TVM returned no credentials: {result.get('message', 'unknown error')}")
+                    raise TVMServiceError(
+                        f"200 but no credentials: {result.get('message', 'unknown error')}"
+                    )
                 # Ensure Version field is present
                 credentials.setdefault("Version", 1)
                 return credentials
             elif response.status_code == 401:
-                raise Exception("TVM authentication failed — id_token rejected by API Gateway")
+                raise TVMAuthRejectedError("id_token rejected by API Gateway")
             elif response.status_code == 429:
                 result = response.json()
                 raise QuotaExceededError(
@@ -771,9 +789,11 @@ class MultiProviderAuth:
                 result = response.json()
                 reason = result.get("reason", "unknown")
                 message = result.get("message", "Access denied")
-                raise Exception(f"TVM denied: {reason} — {message}")
+                raise TVMAccessDeniedError(f"{reason} — {message}")
             else:
-                raise Exception(f"TVM returned HTTP {response.status_code}: {response.text[:200]}")
+                raise TVMServiceError(
+                    f"HTTP {response.status_code}: {response.text[:200]}"
+                )
         except requests.exceptions.Timeout as e:
             # Raise a dedicated type so run() can print a user-friendly message
             # while the technical detail still lands in the log file.
@@ -1118,11 +1138,19 @@ class MultiProviderAuth:
             self._debug_print(f"Error parsing expiration: {e}")
             return True  # Assume expired on parse error
 
+    # Browser-auth overall timeout: how long we wait for the user to finish
+    # sign-in in the browser before giving up. Lower = faster retry after a
+    # closed browser, higher = tolerates slow enterprise MFA. 3 min is a
+    # compromise: most SSO completes in < 60s; slow MFA (push notifications
+    # that time out, SMS retries) still fits.
+    _BROWSER_AUTH_TIMEOUT_SECONDS = 180
+
     # Browser-auth global lock: prevent spawning a second browser window while
     # a previous credential-process is still waiting for the user to log in.
     # Without this, every IDE extension / AWS SDK call that hits an unauthenticated
     # profile opens yet another window on top of the unanswered one.
-    _BROWSER_LOCK_TTL_SECONDS = 600  # 10 minutes — matches the 5-min server timeout with headroom
+    # TTL must be >= _BROWSER_AUTH_TIMEOUT_SECONDS with headroom.
+    _BROWSER_LOCK_TTL_SECONDS = 600  # 10 minutes
 
     def _browser_lock_path(self) -> Path:
         session_dir = Path.home() / ".claude-code-session"
@@ -1284,7 +1312,7 @@ class MultiProviderAuth:
         # Start server in background — handle multiple requests (login redirect + callback)
         def _serve_until_done():
             server.timeout = 5  # per-request timeout
-            deadline = time.time() + 300  # 5 minute overall timeout
+            deadline = time.time() + self._BROWSER_AUTH_TIMEOUT_SECONDS
             while not auth_result["code"] and not auth_result["error"] and time.time() < deadline:
                 server.handle_request()
 
@@ -1297,8 +1325,8 @@ class MultiProviderAuth:
             except Exception:
                 pass
             raise BrowserAuthInProgressError(
-                "Another login window is already waiting. Please complete the login "
-                "in the existing browser tab, or close it and retry."
+                "已有一个登录窗口在等待你完成登录。请先在已打开的浏览器标签页中完成登录，"
+                "或关闭后重试。"
             )
 
         try:
@@ -1317,19 +1345,27 @@ class MultiProviderAuth:
                 except Exception:
                     pass
 
-            if not browser_opened:
+            if browser_opened:
+                mins = self._BROWSER_AUTH_TIMEOUT_SECONDS // 60
+                hint = (
+                    "\n已为你打开浏览器进行登录。\n"
+                    f"若未在约 {mins} 分钟内完成，或浏览器已关闭，请退出 Claude Code 后重试。\n"
+                )
+                print(hint, file=sys.stderr, flush=True)
+            else:
                 msg = (
                     "\n" + "=" * 60 + "\n"
-                    "Open this URL in a browser to authenticate:\n\n"
+                    "请在浏览器中打开以下地址完成登录：\n\n"
                     f"  http://localhost:{self.redirect_port}\n\n"
-                    "Waiting for callback...\n"
-                    "Tip: ssh -L 8400:localhost:8400 <host>\n"
+                    "等待登录回调...\n"
+                    f"提示：远程机器可用 ssh -L {self.redirect_port}:localhost:{self.redirect_port} <host> 做端口转发\n"
                     + "=" * 60 + "\n"
                 )
                 print(msg, file=sys.stderr, flush=True)
 
-            # Wait for callback
-            server_thread.join(timeout=300)  # 5 minute timeout
+            # Wait for callback. Slightly longer than server-side deadline so
+            # the server loop exits on its own before join times out.
+            server_thread.join(timeout=self._BROWSER_AUTH_TIMEOUT_SECONDS + 5)
         finally:
             self._release_browser_lock()
 
@@ -1337,10 +1373,12 @@ class MultiProviderAuth:
         # logs and ignores them, so the server keeps listening for the real
         # /callback. Any error here is a real IdP-side failure.
         if auth_result["error"]:
-            raise Exception(f"Authentication error: {auth_result['error']}")
+            self._log(f"IdP error on callback: {auth_result['error']}")
+            raise Exception(f"身份认证出错：{auth_result['error']}")
 
         if not auth_result["code"]:
-            raise Exception("Authentication timeout - no authorization code received")
+            self._log("Browser auth timeout: no authorization code received within 5 minutes")
+            raise Exception("登录超时：浏览器未在 5 分钟内完成登录")
 
         # Exchange code for tokens
         token_data = {
@@ -1366,14 +1404,16 @@ class MultiProviderAuth:
         )
 
         if not token_response.ok:
-            raise Exception(f"Token exchange failed: {token_response.text}")
+            self._log(f"Token exchange failed: HTTP {token_response.status_code} body={token_response.text[:200]}")
+            raise Exception("登录凭证换取失败，请稍后重试或联系管理员")
 
         tokens = token_response.json()
 
         # Validate nonce in ID token (if provider includes it)
         id_token_claims = jwt.decode(tokens["id_token"], options={"verify_signature": False})
         if "nonce" in id_token_claims and id_token_claims.get("nonce") != nonce:
-            raise Exception("Invalid nonce in ID token")
+            self._log("Invalid nonce in ID token — possible replay or IdP misconfiguration")
+            raise Exception("登录校验失败（nonce 不匹配），请重试；如持续失败请联系管理员")
 
         # Enhanced debug logging for claims
         if self.debug:
@@ -1432,27 +1472,27 @@ class MultiProviderAuth:
 
                 if query.get("error"):
                     result_container["error"] = query.get("error_description", ["Unknown error"])[0]
-                    self._send_response(400, "Authentication failed")
+                    self._send_response(400, "登录失败")
                 elif query.get("state", [""])[0] == expected_state and "code" in query:
                     result_container["code"] = query["code"][0]
-                    self._send_response(200, "Authentication successful! You can close this window.")
+                    self._send_response(200, "登录成功！可以关闭此窗口。")
                 else:
                     # State mismatch — stale callback from a previous tab/session.
                     # Log and 400 but DO NOT set result_container["error"]:
                     # keep the server listening for the real /callback.
                     parent._debug_print(f"Stale callback ignored (expected={expected_state[:8]}...)")
-                    self._send_response(400, "Stale callback ignored. Please complete login in the latest tab.")
+                    self._send_response(400, "登录会话已过期，请在最新打开的登录标签页中完成。")
 
             def _send_response(self, code, message):
                 self.send_response(code)
-                self.send_header("Content-type", "text/html")
+                self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
                 html = f"""
-                <html>
-                <head><title>Authentication</title></head>
+                <html lang="zh-CN">
+                <head><meta charset="utf-8"><title>登录</title></head>
                 <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                     <h1>{message}</h1>
-                    <p>Return to your terminal to continue.</p>
+                    <p>请返回终端继续。</p>
                 </body>
                 </html>
                 """
@@ -1731,10 +1771,23 @@ class MultiProviderAuth:
                 ) from e
             raise Exception(f"Failed to get AWS credentials: {str(e)}") from None
 
+    # Process cmdlines we consider "ours" when checking port ownership.
+    # The installed wrapper on end-user machines is usually `credential-process`
+    # (dash), which execs `python .../credential_provider/__main__.py`; the latter
+    # is what ends up in the cmdline after exec on POSIX. Windows keeps the
+    # wrapper visible as credential-process.exe.
+    _CCWB_CMDLINE_MARKERS = ("credential_provider", "credential-process", "ccwb")
+
     def _is_port_held_by_ccwb(self) -> bool:
         """Check if the redirect port is held by another credential-provider process.
 
-        Uses /proc on Linux (no external tools needed), falls back to lsof on macOS.
+        Detection backends (first that works wins):
+          - Linux: /proc/net/tcp + /proc/<pid>/fd (no external tools).
+          - Windows: netstat -ano + tasklist.
+          - macOS / Linux with lsof: lsof -i :PORT + ps.
+
+        Falls back to True (fail-safe) so a sibling ccwb process is not
+        mistaken for a stranger when detection is impossible.
         """
         try:
             import subprocess
@@ -1776,11 +1829,16 @@ class MultiProviderAuth:
                                     # Check command line
                                     with open(f"/proc/{pid_dir}/cmdline") as f:
                                         cmdline = f.read()
-                                    if "credential_provider" in cmdline or "ccwb" in cmdline:
+                                    if any(m in cmdline for m in self._CCWB_CMDLINE_MARKERS):
                                         return True
                     except (PermissionError, FileNotFoundError, ProcessLookupError):
                         continue
                 return False
+
+            # Windows: use netstat -ano + tasklist (no lsof). Both ship with
+            # every Windows install, no dependencies.
+            if platform.system() == "Windows":
+                return self._is_port_held_by_ccwb_windows(port)
 
             # Fallback: lsof (macOS, or Linux with lsof installed)
             result = subprocess.run(
@@ -1796,31 +1854,108 @@ class MultiProviderAuth:
                     capture_output=True, text=True, timeout=3,
                 )
                 cmd = cmd_result.stdout.strip()
-                if "credential_provider" in cmd or "ccwb" in cmd:
+                if any(m in cmd for m in self._CCWB_CMDLINE_MARKERS):
                     return True
             return False
         except Exception:
             # If we can't determine, assume it's ours (safer — avoids false negatives)
             return True
 
-    def _wait_for_auth_completion(self, timeout=60):
-        """Wait for another process to complete authentication using port-based detection."""
+    def _is_port_held_by_ccwb_windows(self, port: int) -> bool:
+        """Windows-specific port ownership check using netstat + tasklist.
+
+        netstat -ano output columns (space-separated, Listening state):
+          Proto  Local-Address       Foreign-Address  State     PID
+          TCP    0.0.0.0:8400        0.0.0.0:0        LISTENING 12345
+
+        We scan for rows ending in LISTENING whose local address ends in :<port>,
+        extract the PID, then ask tasklist for the image name and match against
+        our ccwb markers. errors=replace on decode so PowerShell 5.x's
+        Windows-1252 / non-UTF-8 output doesn't crash us.
+        """
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, timeout=5,
+            )
+            if out.returncode != 0:
+                # netstat gone or blocked — fail-safe
+                return True
+            text = out.stdout.decode("utf-8", errors="replace")
+        except Exception:
+            return True
+
+        suffix = f":{port}"
+        pids = set()
+        for line in text.splitlines():
+            parts = line.split()
+            # Minimum columns: Proto Local Foreign State PID
+            if len(parts) < 5:
+                continue
+            if parts[0].upper() != "TCP":
+                continue
+            if parts[-2].upper() != "LISTENING":
+                continue
+            local = parts[1]
+            if not local.endswith(suffix):
+                continue
+            try:
+                pids.add(int(parts[-1]))
+            except ValueError:
+                continue
+
+        if not pids:
+            return False
+
+        for pid in pids:
+            try:
+                tl = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True, timeout=5,
+                )
+                if tl.returncode != 0:
+                    continue
+                image = tl.stdout.decode("utf-8", errors="replace").strip()
+                # tasklist CSV row: "credential-process.exe","12345","Console","1","12,345 K"
+                if any(m in image for m in self._CCWB_CMDLINE_MARKERS):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # Must cover the full browser-auth deadline plus token exchange + save
+    # so a second CC that lands mid-sign-in doesn't give up before the first
+    # one finishes. Derived from _BROWSER_AUTH_TIMEOUT_SECONDS + headroom.
+    _WAIT_FOR_AUTH_TIMEOUT_SECONDS = _BROWSER_AUTH_TIMEOUT_SECONDS + 30
+
+    def _wait_for_auth_completion(self, timeout: int | None = None):
+        """Wait for another process to complete authentication using port-based detection.
+
+        Sets self._last_wait_result to one of:
+          - "cached": cached creds became available.
+          - "third_party": port held by a non-ccwb application (caller already got
+            a user-facing message printed here).
+          - "timeout": a ccwb process was holding the port but didn't finish in time.
+        """
+        if timeout is None:
+            timeout = self._WAIT_FOR_AUTH_TIMEOUT_SECONDS
         start_time = time.time()
 
         # Check if port is actually held by another ccwb process
         if not self._is_port_held_by_ccwb():
+            self._last_wait_result = "third_party"
             port = self.redirect_port
             self._log(f"PORT BUSY: port={port} not held by a ccwb/credential-process — occupied by a third-party app")
             msg = (
-                f"\nCannot complete sign-in: port {port} on your computer is already in use.\n\n"
-                f"Something else on your machine is listening on that port — often a local\n"
-                f"web server you started for another project.\n\n"
-                f"Quick fixes:\n"
-                f"  • Stop that other app, then run your command again.\n"
-                f"  • To find what's using the port:\n"
+                f"\n无法完成登录：本机端口 {port} 已被占用。\n\n"
+                f"通常是你自己启动的开发服务器（如本地 Web 服务、调试工具）占用了这个端口。\n\n"
+                f"解决办法：\n"
+                f"  • 关掉占用该端口的程序，然后重新运行命令。\n"
+                f"  • 查看是哪个程序占用的：\n"
                 f"      macOS / Linux:   lsof -i :{port}\n"
                 f"      Windows (cmd):   netstat -ano | findstr :{port}\n\n"
-                f"If the port keeps getting grabbed, contact your administrator.\n"
+                f"如果端口反复被占用，请联系管理员。\n"
             )
             print(msg, file=sys.stderr, flush=True)
             return None
@@ -1836,9 +1971,11 @@ class MultiProviderAuth:
                 # Check for cached credentials
                 cached = self.get_cached_credentials()
                 if cached:
+                    self._last_wait_result = "cached"
                     return cached
                 else:
                     # Auth failed or was cancelled
+                    self._last_wait_result = "timeout"
                     return None
             except OSError as e:
                 if e.errno == errno.EADDRINUSE:
@@ -1853,6 +1990,10 @@ class MultiProviderAuth:
                 except Exception:
                     pass
 
+        self._last_wait_result = "timeout"
+        self._log(
+            f"WAIT TIMEOUT: another ccwb process still holding port {self.redirect_port} after {timeout}s"
+        )
         return None
 
     def authenticate_for_monitoring(self):
@@ -2050,9 +2191,21 @@ class MultiProviderAuth:
                     if cached:
                         print(json.dumps(cached))
                         return 0
-                    else:
-                        self._debug_print("Authentication timeout or failed in another process")
-                        return 1
+                    # third_party branch: _wait_for_auth_completion already
+                    # printed the port-busy message. timeout branch: another
+                    # Claude Code window is still in front-of-browser — tell
+                    # the user so they know to finish sign-in there.
+                    if getattr(self, "_last_wait_result", None) == "timeout":
+                        self._log("Authentication timeout waiting for another ccwb process")
+                        mins = self._BROWSER_AUTH_TIMEOUT_SECONDS // 60
+                        msg = (
+                            "\n另一个 Claude Code 进程正在等待登录（浏览器可能已被关闭）。\n"
+                            "你可以：\n"
+                            "  • 在那个进程的终端中完成登录；或\n"
+                            f"  • 等待它超时（最多约 {mins} 分钟）后，在此处重试。\n"
+                        )
+                        print(msg, file=sys.stderr, flush=True)
+                    return 1
                 else:
                     test_socket.close()
                     raise
@@ -2092,19 +2245,50 @@ class MultiProviderAuth:
                     f"TVM UNREACHABLE: endpoint={self.config.get('tvm_endpoint')} detail={e}"
                 )
                 msg = (
-                    "\nCannot reach the Bedrock sign-in service over the network.\n\n"
-                    "Common causes:\n"
-                    "  • You're offline or on a captive portal (hotel / airport wifi).\n"
-                    "  • Your VPN is disconnected.\n"
-                    "  • A firewall is blocking HTTPS to AWS.\n\n"
-                    "Please check your internet connection and try again.\n"
-                    "If the problem persists, contact your administrator.\n"
+                    "\n无法连接到 Bedrock 登录服务。\n\n"
+                    "可能的原因：\n"
+                    "  • 当前无网络连接，或处于需要登录的 WiFi 网络（酒店、机场等）。\n"
+                    "  • VPN 未连接。\n"
+                    "  • 防火墙拦截了访问 AWS 的 HTTPS 流量。\n\n"
+                    "请检查网络后重试。\n"
+                    "如果问题持续存在，请联系管理员。\n"
+                )
+                print(msg, file=sys.stderr, flush=True)
+                return 1
+            except TVMAuthRejectedError as e:
+                self._log(f"TVM AUTH REJECTED: {e}")
+                msg = (
+                    "\n登录凭证已失效。请重新登录。\n"
+                    "如果重试后仍失败，请联系管理员。\n"
+                )
+                print(msg, file=sys.stderr, flush=True)
+                return 1
+            except TVMAccessDeniedError as e:
+                self._log(f"TVM ACCESS DENIED: {e}")
+                msg = (
+                    "\n你的账号没有访问 Bedrock 的权限。\n"
+                    "请联系管理员确认你的账号配置。\n"
+                )
+                print(msg, file=sys.stderr, flush=True)
+                return 1
+            except TVMServiceError as e:
+                self._log(f"TVM SERVICE ERROR: endpoint={self.config.get('tvm_endpoint')} detail={e}")
+                msg = (
+                    "\nBedrock 登录服务暂时不可用。\n"
+                    "请稍后重试。如果问题持续存在，请联系管理员。\n"
                 )
                 print(msg, file=sys.stderr, flush=True)
                 return 1
             except Exception as e:
-                self._log(f"TVM ERROR: {e}")
-                print(f"ERROR: {e}", file=sys.stderr)
+                # Catch-all for unexpected errors from _call_tvm.
+                self._log(f"TVM ERROR (unclassified): {e}")
+                msg = (
+                    "\n获取 Bedrock 凭证时出错。\n"
+                    "请稍后重试；如果问题持续存在，请把日志文件\n"
+                    "  ~/claude-code-with-bedrock/logs/credential-process.log\n"
+                    "提供给管理员协助排查。\n"
+                )
+                print(msg, file=sys.stderr, flush=True)
                 return 1
 
             # 9. Cache and output credentials
@@ -2117,17 +2301,23 @@ class MultiProviderAuth:
             # Exit non-zero so the caller (boto3 / AWS CLI) gets a credential error
             # instead of hanging, but no stack trace.
             self._log(f"browser auth already in progress: {e}")
-            print(f"{e}", file=sys.stderr)
+            print(f"\n{e}\n", file=sys.stderr)
             return 1
         except QuotaExceededError as e:
             self._log(f"QUOTA EXCEEDED: {e}")
-            print(f"QUOTA EXCEEDED: {e}", file=sys.stderr)
+            print(f"\n额度超限：{e}\n", file=sys.stderr)
             return 1
         except KeyboardInterrupt:
-            print("\nAuthentication cancelled.", file=sys.stderr)
+            print("\n已取消登录。", file=sys.stderr)
             return 1
         except Exception as e:
-            print(f"Authentication failed: {e}", file=sys.stderr)
+            self._log(f"UNCLASSIFIED FAILURE: {type(e).__name__}: {e}")
+            msg = (
+                f"\n登录失败：{e}\n\n"
+                f"详细日志见：~/claude-code-with-bedrock/logs/credential-process.log\n"
+                f"如问题持续，请把该日志提供给管理员协助排查。\n"
+            )
+            print(msg, file=sys.stderr, flush=True)
             if self.debug:
                 traceback.print_exc()
             return 1
@@ -2164,18 +2354,18 @@ def main():
     try:
         auth = MultiProviderAuth(profile=args.profile)
     except Exception as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
+        print(f"配置错误：{e}", file=sys.stderr)
         sys.exit(1)
 
     # Handle cache clearing request
     if args.clear_cache:
         cleared = auth.clear_cached_credentials()
         if cleared:
-            print(f"Cleared cached credentials for profile '{args.profile}':", file=sys.stderr)
+            print(f"已清除 profile '{args.profile}' 的本地凭证缓存：", file=sys.stderr)
             for item in cleared:
                 print(f"  • {item}", file=sys.stderr)
         else:
-            print(f"No cached credentials found for profile '{args.profile}'", file=sys.stderr)
+            print(f"profile '{args.profile}' 没有可清除的本地凭证缓存", file=sys.stderr)
         sys.exit(0)
 
     # Handle monitoring token request
@@ -2202,17 +2392,17 @@ def main():
     if args.check_expiration:
         is_expired = auth.check_credentials_file_expiration(args.profile)
         if is_expired:
-            print(f"Credentials expired or missing for profile '{args.profile}'", file=sys.stderr)
+            print(f"profile '{args.profile}' 的凭证已过期或缺失", file=sys.stderr)
             sys.exit(1)
         else:
-            print(f"Credentials valid for profile '{args.profile}'", file=sys.stderr)
+            print(f"profile '{args.profile}' 的凭证仍有效", file=sys.stderr)
             sys.exit(0)
 
     # Handle refresh-if-needed request (for cron jobs with session storage)
     if args.refresh_if_needed:
         # Only works with session storage mode (credentials file)
         if auth.credential_storage != "session":
-            print("Error: --refresh-if-needed only works with session storage mode", file=sys.stderr)
+            print("错误：--refresh-if-needed 仅在 session 模式的凭证存储下可用", file=sys.stderr)
             sys.exit(1)
 
         is_expired = auth.check_credentials_file_expiration(args.profile)
