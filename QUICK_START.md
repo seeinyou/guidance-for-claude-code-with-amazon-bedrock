@@ -143,10 +143,13 @@ Linux additionally has a **slim** variant that uses the user's system
 Python 3.9+ for a ~30 MB download.
 
 ```bash
-# Interactive: pick platform(s) from a checkbox prompt
+# Build every supported platform in one shot (default). Fully non-interactive.
 poetry run ccwb package
 
-# Or build a specific platform non-interactively
+# Pick a subset interactively (checkbox prompt)
+poetry run ccwb package --pick
+
+# Or build a single platform
 poetry run ccwb package --target-platform=windows
 poetry run ccwb package --target-platform=macos-arm64
 poetry run ccwb package --target-platform=macos-intel
@@ -160,6 +163,11 @@ poetry run ccwb package --target-platform=linux-arm64 --slim
 # Drop the otel_helper/ payload to shrink the bundle (OTLP still works, but
 # CloudWatch metrics lose per-user attributes like email / team / cost_center)
 poetry run ccwb package --target-platform=macos-arm64 --no-otel-helper
+
+# Include 'Co-Authored-By: Claude' footer in end users' git commits.
+# Default is off; the flag opts in. In non-interactive shells (CI, pipes)
+# the prompt is skipped and this flag is the only way to turn it on.
+poetry run ccwb package --co-authored-by
 
 # Upload to landing page / presigned S3 (whichever was selected in init)
 poetry run ccwb distribute

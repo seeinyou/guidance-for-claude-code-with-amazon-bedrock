@@ -5,6 +5,7 @@
 
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -236,7 +237,18 @@ class PackageCommand(Command):
 
     options = [
         option(
-            "target-platform", description="Target platform for binary (macos, linux, all)", flag=False, default="all"
+            "target-platform",
+            description=(
+                "Target platform: 'all' (default, no prompt), or a single name "
+                "(macos-arm64, macos-intel, linux-x64, linux-arm64, windows, macos, linux)"
+            ),
+            flag=False,
+            default="all",
+        ),
+        option(
+            "pick",
+            description="Interactively choose which platforms to build (checkbox)",
+            flag=True,
         ),
         option(
             "profile", description="Configuration profile to use (defaults to active profile)", flag=False, default=None
@@ -250,6 +262,11 @@ class PackageCommand(Command):
         option(
             "no-otel-helper",
             description="Skip bundling otel_helper/ (smaller package; OTLP still works but user attributes won't tag CloudWatch metrics)",
+            flag=True,
+        ),
+        option(
+            "co-authored-by",
+            description="Include 'Co-Authored-By: Claude' footer in git commits made by installed Claude Code",
             flag=True,
         ),
     ]
@@ -268,13 +285,15 @@ class PackageCommand(Command):
             console.print("[red]No deployment found. Run 'poetry run ccwb init' first.[/red]")
             return 1
 
-        # Interactive prompts if not provided via CLI
+        # Resolve target platform. `all` is a non-interactive "build every
+        # supported platform" — matches the help text and lets CI / expect-free
+        # automation just pass --target-platform=all. Interactive picking is
+        # opt-in via --pick, not the side-effect of the default value.
         slim = bool(self.option("slim"))
         target_platform = self.option("target-platform")
-        if target_platform == "all":  # Default value, prompt user
-            # Build list of available platform choices
-            # Note: "macos" is omitted because it's just a smart alias for the current architecture
-            # Users should explicitly choose macos-arm64 or macos-intel for clarity
+        pick_interactive = bool(self.option("pick"))
+
+        if pick_interactive:
             platform_choices = [
                 "macos-arm64",
                 "macos-intel",
@@ -282,22 +301,31 @@ class PackageCommand(Command):
                 "linux-arm64",
                 "windows",
             ]
-
-            # Use checkbox for multiple selection (require at least one)
             selected_platforms = questionary.checkbox(
                 "Which platform(s) do you want to build for? (Use space to select, enter to confirm)",
                 choices=platform_choices,
                 validate=lambda x: len(x) > 0 or "You must select at least one platform",
             ).ask()
-
-            # Use the selected platforms (guaranteed to have at least one due to validation)
+            if not selected_platforms:
+                # User cancelled (Ctrl-C) — abort cleanly.
+                console.print("[yellow]Aborted: no platform selected.[/yellow]")
+                return 1
             target_platform = selected_platforms if len(selected_platforms) > 1 else selected_platforms[0]
 
-        # Prompt for co-authorship preference (default to No - opt-in approach)
-        include_coauthored_by = questionary.confirm(
-            "Include 'Co-Authored-By: Claude' in git commits?",
-            default=False,
-        ).ask()
+        # Co-authored-by preference. CLI flag wins; non-interactive shells
+        # (piped stdin, CI, --no-interaction) default to No instead of hanging
+        # on the questionary prompt.
+        if self.option("co-authored-by"):
+            include_coauthored_by = True
+        elif self.io.is_interactive() and sys.stdin.isatty():
+            include_coauthored_by = questionary.confirm(
+                "Include 'Co-Authored-By: Claude' in git commits?",
+                default=False,
+            ).ask()
+            if include_coauthored_by is None:
+                include_coauthored_by = False  # User cancelled
+        else:
+            include_coauthored_by = False
 
         # Validate platform
         valid_platforms = ["macos", "macos-arm64", "macos-intel", "linux", "linux-x64", "linux-arm64", "windows", "all"]
