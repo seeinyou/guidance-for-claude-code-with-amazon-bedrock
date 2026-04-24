@@ -291,7 +291,7 @@ class TestCallTvm:
     def test_no_tvm_endpoint_raises(self, auth_instance):
         """When tvm_endpoint not configured, should raise."""
         auth_instance.config.pop("tvm_endpoint", None)
-        with pytest.raises(Exception, match="tvm_endpoint not configured"):
+        with pytest.raises(Exception, match="tvm_endpoint"):
             auth_instance._call_tvm("fake-token", "not-configured")
 
     def test_successful_tvm_call(self, auth_instance):
@@ -306,13 +306,14 @@ class TestCallTvm:
             assert result["AccessKeyId"] == aws_creds["AccessKeyId"]
 
     def test_tvm_403_denied(self, auth_instance):
-        """When TVM returns 403, should raise with reason."""
+        """When TVM returns 403, should raise TVMAccessDeniedError with the reason embedded."""
+        from credential_provider.__main__ import TVMAccessDeniedError
         mock_response = MagicMock()
         mock_response.status_code = 403
         mock_response.json.return_value = {"reason": "quota_exceeded", "message": "Monthly quota exceeded"}
 
         with patch("credential_provider.__main__.requests.post", return_value=mock_response):
-            with pytest.raises(Exception, match="TVM denied"):
+            with pytest.raises(TVMAccessDeniedError, match="quota_exceeded"):
                 auth_instance._call_tvm("fake-token", "valid")
 
     def test_tvm_timeout(self, auth_instance):
@@ -322,3 +323,108 @@ class TestCallTvm:
         with patch("credential_provider.__main__.requests.post", side_effect=req.exceptions.Timeout()):
             with pytest.raises(TVMUnreachableError, match="timeout"):
                 auth_instance._call_tvm("fake-token", "valid")
+
+    def test_tvm_connection_error(self, auth_instance):
+        """DNS / captive-portal / TLS issues raise TVMUnreachableError."""
+        import requests as req
+        from credential_provider.__main__ import TVMUnreachableError
+        with patch(
+            "credential_provider.__main__.requests.post",
+            side_effect=req.exceptions.ConnectionError("NameResolutionError"),
+        ):
+            with pytest.raises(TVMUnreachableError):
+                auth_instance._call_tvm("fake-token", "valid")
+
+    def test_tvm_401_raises_auth_rejected(self, auth_instance):
+        """401 from TVM: id_token rejected — users must re-auth."""
+        from credential_provider.__main__ import TVMAuthRejectedError
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+
+        with patch("credential_provider.__main__.requests.post", return_value=mock_response):
+            with pytest.raises(TVMAuthRejectedError):
+                auth_instance._call_tvm("fake-token", "valid")
+
+    def test_tvm_403_non_quota_raises_access_denied(self, auth_instance):
+        """403 with a non-quota reason still routes to TVMAccessDeniedError.
+
+        QuotaExceededError is only for 429. A 403 with reason 'quota_exceeded'
+        is treated as a policy denial (matching current behavior — TVM emits
+        real quota denials as 429).
+        """
+        from credential_provider.__main__ import TVMAccessDeniedError
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.json.return_value = {
+            "reason": "group_not_allowed",
+            "message": "User not in any allowed group",
+        }
+        with patch("credential_provider.__main__.requests.post", return_value=mock_response):
+            with pytest.raises(TVMAccessDeniedError, match="group_not_allowed"):
+                auth_instance._call_tvm("fake-token", "valid")
+
+    def test_tvm_429_raises_quota_exceeded(self, auth_instance):
+        """Real quota denials come back as 429 → QuotaExceededError with usage/limit."""
+        from credential_provider.__main__ import QuotaExceededError
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.json.return_value = {
+            "reason": "daily_cost_exceeded",
+            "usage": 12.34,
+            "limit": 10.00,
+            "message": "Daily cost limit exceeded",
+        }
+        with patch("credential_provider.__main__.requests.post", return_value=mock_response):
+            with pytest.raises(QuotaExceededError) as exc:
+                auth_instance._call_tvm("fake-token", "valid")
+
+        # User-facing string must include Chinese label and the numbers.
+        assert "日额度（金额）" in str(exc.value)
+        assert "12.34" in str(exc.value)
+
+    def test_tvm_500_raises_service_error(self, auth_instance):
+        """5xx is a service-side problem — retry later."""
+        from credential_provider.__main__ import TVMServiceError
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal server error"
+
+        with patch("credential_provider.__main__.requests.post", return_value=mock_response):
+            with pytest.raises(TVMServiceError, match="500"):
+                auth_instance._call_tvm("fake-token", "valid")
+
+    def test_tvm_200_without_credentials_raises_service_error(self, auth_instance):
+        """Malformed 200 (missing credentials field) is classified as service error."""
+        from credential_provider.__main__ import TVMServiceError
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"message": "misconfigured policy"}
+
+        with patch("credential_provider.__main__.requests.post", return_value=mock_response):
+            with pytest.raises(TVMServiceError, match="no credentials"):
+                auth_instance._call_tvm("fake-token", "valid")
+
+
+class TestRefreshTokenExchange:
+    """Cognito /oauth2/token responses must be disambiguated in the log."""
+
+    def test_400_body_logged_for_diagnosis(self, auth_instance, caplog):
+        """A 400 from Cognito can mean invalid_grant, invalid_client, or
+        unauthorized_client — each needs a different fix. The response body
+        must land in the log so support can tell them apart."""
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 400
+        mock_response.text = '{"error":"invalid_grant","error_description":"Refresh Token has expired"}'
+
+        # Provide a cached refresh_token so _try_refresh_token actually calls the endpoint.
+        with patch.object(auth_instance, "_get_cached_refresh_token", return_value="stale-token"), \
+             patch.object(auth_instance, "_clear_cached_refresh_token"), \
+             patch("credential_provider.__main__.requests.post", return_value=mock_response), \
+             caplog.at_level("INFO", logger="credential-process"):
+            result = auth_instance._try_refresh_token()
+
+        assert result is None
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Refresh token exchange failed: 400" in m for m in messages)
+        assert any("invalid_grant" in m for m in messages)
