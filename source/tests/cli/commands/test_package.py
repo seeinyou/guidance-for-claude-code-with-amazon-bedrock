@@ -83,35 +83,9 @@ class TestPackageCommandCrossRegion:
             # Should default to 'us'
             assert config["ClaudeCode"]["cross_region_profile"] == "us"
 
-    def test_installer_script_preserves_region(self):
-        """Test that installer script correctly extracts region from config."""
-        command = PackageCommand()
-
-        profile = Profile(
-            name="test",
-            provider_domain="test.okta.com",
-            client_id="test-client",
-            credential_storage="session",
-            aws_region="us-west-2",  # Note: different from cross-region
-            identity_pool_name="test-pool",
-            allowed_bedrock_regions=["us-east-1", "us-east-2", "us-west-2"],
-            cross_region_profile="us",
-            monitoring_enabled=False,
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir)
-
-            # Create installer
-            installer_path = command._create_installer(
-                output_dir, profile, [("macos", Path("credential-process-macos"))], []
-            )
-
-            # Read installer and check region extraction
-            with open(installer_path) as f:
-                installer_content = f.read()
-
-            # Should extract region from Claude settings first, then fallback to profile region
-            assert "AWS_REGION" in installer_content or "aws_region" in installer_content
-            # The fallback should now have the interpolated region value
-            assert "us-west-2" in installer_content or "config.json" in installer_content
+    # test_installer_script_preserves_region: removed.
+    # PackageCommand no longer generates the installer script dynamically —
+    # install.sh / install.ps1 are now static templates in package.py and
+    # take their region from the runtime config.json, not from a rendered
+    # AWS_REGION placeholder. The old contract (_create_installer) does not
+    # exist anymore.

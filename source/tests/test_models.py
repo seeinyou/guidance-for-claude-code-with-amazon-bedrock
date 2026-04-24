@@ -35,6 +35,7 @@ class TestModelConfiguration:
     def test_claude_models_structure(self):
         """Test that CLAUDE_MODELS has the expected structure."""
         expected_models = {
+            "opus-4-7",
             "opus-4-6",
             "opus-4-1",
             "opus-4",

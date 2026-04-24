@@ -112,6 +112,24 @@ class TestCloudFormationCrossRegion:
         assert "us-east-2" in default_regions
         assert "us-west-2" in default_regions
 
+    def _flatten_statements(self, statements):
+        """Unwrap Fn::If-wrapped statements so tests can search by Sid.
+
+        The AllowBedrockInvoke statement is conditionally included via
+        `!If TVMDisabled [<stmt>, !Ref AWS::NoValue]` so it appears as
+        `{"Fn::If": [cond, stmt, "AWS::NoValue"]}` after YAML parse.
+        """
+        out = []
+        for stmt in statements:
+            if isinstance(stmt, dict) and "Fn::If" in stmt:
+                _, then_branch, else_branch = stmt["Fn::If"]
+                for branch in (then_branch, else_branch):
+                    if isinstance(branch, dict) and branch.get("Sid"):
+                        out.append(branch)
+            elif isinstance(stmt, dict):
+                out.append(stmt)
+        return out
+
     def test_iam_policy_allows_cross_region_resources(self):
         """Test that IAM policy allows cross-region inference resources."""
         template = self.get_template()
@@ -125,7 +143,7 @@ class TestCloudFormationCrossRegion:
 
         # Check policy document
         policy_doc = policy["Properties"]["PolicyDocument"]
-        statements = policy_doc["Statement"]
+        statements = self._flatten_statements(policy_doc["Statement"])
 
         # Find the AllowBedrockInvoke statement
         invoke_statement = None
@@ -164,7 +182,7 @@ class TestCloudFormationCrossRegion:
         resources = template.get("Resources", {})
         policy = resources["BedrockAccessPolicy"]
         policy_doc = policy["Properties"]["PolicyDocument"]
-        statements = policy_doc["Statement"]
+        statements = self._flatten_statements(policy_doc["Statement"])
 
         # Find the AllowBedrockInvoke statement
         for stmt in statements:

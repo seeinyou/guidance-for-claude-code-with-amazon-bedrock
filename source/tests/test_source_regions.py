@@ -165,7 +165,8 @@ class TestSourceRegionFunctionality:
     def test_source_regions_do_not_overlap_inappropriately(self):
         """Test that source regions are regionally appropriate."""
         regional_tests = {
-            "us": ["us-east-1", "us-east-2", "us-west-1", "us-west-2"],
+            # US inference profiles for Claude 4.6+ include ca-central-1 and ca-west-1 as source regions.
+            "us": ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1", "ca-west-1"],
             "europe": ["eu-central-1", "eu-north-1", "eu-south-1", "eu-south-2", "eu-west-1", "eu-west-3"],
             "apac": [
                 "ap-northeast-1",
