@@ -45,6 +45,10 @@ class BrowserAuthInProgressError(Exception):
     """Raised when another credential-process already has a browser auth window open."""
 
 
+class TVMUnreachableError(Exception):
+    """Raised when the TVM endpoint is unreachable over the network (timeout / DNS / TLS)."""
+
+
 class QuotaExceededError(Exception):
     """Raised when TVM returns 429 due to quota limits."""
 
@@ -770,10 +774,12 @@ class MultiProviderAuth:
                 raise Exception(f"TVM denied: {reason} — {message}")
             else:
                 raise Exception(f"TVM returned HTTP {response.status_code}: {response.text[:200]}")
-        except requests.exceptions.Timeout:
-            raise Exception(f"TVM Lambda unreachable (timeout={timeout}s)")
+        except requests.exceptions.Timeout as e:
+            # Raise a dedicated type so run() can print a user-friendly message
+            # while the technical detail still lands in the log file.
+            raise TVMUnreachableError(f"timeout after {timeout}s: {e}") from e
         except requests.exceptions.ConnectionError as e:
-            raise Exception(f"TVM Lambda unreachable: {e}")
+            raise TVMUnreachableError(str(e)) from e
 
     def _try_refresh_token(self) -> str | None:
         """Exchange refresh_token for new id_token via Cognito /oauth2/token.
@@ -1803,11 +1809,20 @@ class MultiProviderAuth:
 
         # Check if port is actually held by another ccwb process
         if not self._is_port_held_by_ccwb():
-            print(
-                f"\nError: Port {self.redirect_port} is in use by another application.\n"
-                f"Free the port or set REDIRECT_PORT to a different value.\n",
-                file=sys.stderr, flush=True,
+            port = self.redirect_port
+            self._log(f"PORT BUSY: port={port} not held by a ccwb/credential-process — occupied by a third-party app")
+            msg = (
+                f"\nCannot complete sign-in: port {port} on your computer is already in use.\n\n"
+                f"Something else on your machine is listening on that port — often a local\n"
+                f"web server you started for another project.\n\n"
+                f"Quick fixes:\n"
+                f"  • Stop that other app, then run your command again.\n"
+                f"  • To find what's using the port:\n"
+                f"      macOS / Linux:   lsof -i :{port}\n"
+                f"      Windows (cmd):   netstat -ano | findstr :{port}\n\n"
+                f"If the port keeps getting grabbed, contact your administrator.\n"
             )
+            print(msg, file=sys.stderr, flush=True)
             return None
 
         bind_host = os.getenv("REDIRECT_BIND", "127.0.0.1")
@@ -2070,6 +2085,23 @@ class MultiProviderAuth:
             try:
                 credentials = self._call_tvm(id_token, self.otel_helper_status)
                 self._log("TVM returned credentials successfully")
+            except TVMUnreachableError as e:
+                # Full technical detail (endpoint, exception class) goes to the log
+                # for support; the user sees a plain-language reason + next steps.
+                self._log(
+                    f"TVM UNREACHABLE: endpoint={self.config.get('tvm_endpoint')} detail={e}"
+                )
+                msg = (
+                    "\nCannot reach the Bedrock sign-in service over the network.\n\n"
+                    "Common causes:\n"
+                    "  • You're offline or on a captive portal (hotel / airport wifi).\n"
+                    "  • Your VPN is disconnected.\n"
+                    "  • A firewall is blocking HTTPS to AWS.\n\n"
+                    "Please check your internet connection and try again.\n"
+                    "If the problem persists, contact your administrator.\n"
+                )
+                print(msg, file=sys.stderr, flush=True)
+                return 1
             except Exception as e:
                 self._log(f"TVM ERROR: {e}")
                 print(f"ERROR: {e}", file=sys.stderr)

@@ -316,8 +316,9 @@ class TestCallTvm:
                 auth_instance._call_tvm("fake-token", "valid")
 
     def test_tvm_timeout(self, auth_instance):
-        """When TVM times out, should raise."""
+        """When TVM times out, should raise TVMUnreachableError."""
         import requests as req
+        from credential_provider.__main__ import TVMUnreachableError
         with patch("credential_provider.__main__.requests.post", side_effect=req.exceptions.Timeout()):
-            with pytest.raises(Exception, match="TVM Lambda unreachable"):
+            with pytest.raises(TVMUnreachableError, match="timeout"):
                 auth_instance._call_tvm("fake-token", "valid")
