@@ -433,11 +433,11 @@ class TestIsPortHeldByCcwbWindows:
         auth_instance.redirect_port = 8400
 
         netstat_out = (
-            "\r\nActive Connections\r\n\r\n"
-            "  Proto  Local Address          Foreign Address        State           PID\r\n"
-            "  TCP    0.0.0.0:8400           0.0.0.0:0              LISTENING       12345\r\n"
-            "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\r\n"
-        ).encode("utf-8")
+            b"\r\nActive Connections\r\n\r\n"
+            b"  Proto  Local Address          Foreign Address        State           PID\r\n"
+            b"  TCP    0.0.0.0:8400           0.0.0.0:0              LISTENING       12345\r\n"
+            b"  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\r\n"
+        )
         tasklist_out = b'"credential-process.exe","12345","Console","1","12,345 K"\r\n'
 
         calls = {"n": 0}
@@ -462,9 +462,9 @@ class TestIsPortHeldByCcwbWindows:
         auth_instance.redirect_port = 8400
 
         netstat_out = (
-            "  Proto  Local Address          Foreign Address        State           PID\r\n"
-            "  TCP    127.0.0.1:8400         0.0.0.0:0              LISTENING       98765\r\n"
-        ).encode("utf-8")
+            b"  Proto  Local Address          Foreign Address        State           PID\r\n"
+            b"  TCP    127.0.0.1:8400         0.0.0.0:0              LISTENING       98765\r\n"
+        )
         tasklist_out = b'"node.exe","98765","Console","1","45,678 K"\r\n'
 
         def fake_run(cmd, **kwargs):
@@ -482,9 +482,9 @@ class TestIsPortHeldByCcwbWindows:
         auth_instance.redirect_port = 8400
 
         netstat_out = (
-            "  Proto  Local Address          Foreign Address        State           PID\r\n"
-            "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\r\n"
-        ).encode("utf-8")
+            b"  Proto  Local Address          Foreign Address        State           PID\r\n"
+            b"  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\r\n"
+        )
 
         def fake_run(cmd, **kwargs):
             r = MagicMock()

@@ -48,7 +48,7 @@ def _make_config():
 
 def _make_aws_credentials(exp_offset=900):
     """Return fake AWS credentials dict."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     exp = datetime.now(timezone.utc) + timedelta(seconds=exp_offset)
     return {
@@ -124,7 +124,7 @@ class TestSilentRefresh:
 
     def test_silent_refresh_falls_back_to_refresh_token(self, auth_instance):
         """When id_token is expired but refresh_token is valid, should use refresh flow."""
-        new_id_token, new_claims = _make_id_token(exp_offset=3600)
+        new_id_token, _ = _make_id_token(exp_offset=3600)
         aws_creds = _make_aws_credentials()
 
         with patch.object(auth_instance, "get_monitoring_token", return_value=None), \
@@ -133,7 +133,7 @@ class TestSilentRefresh:
              patch.object(auth_instance, "save_credentials"), \
              patch.object(auth_instance, "save_monitoring_token"):
 
-            creds, returned_token, returned_claims = auth_instance._try_silent_refresh()
+            creds, returned_token, _ = auth_instance._try_silent_refresh()
 
             assert creds is not None
             assert returned_token == new_id_token
@@ -238,7 +238,7 @@ class TestOtelHelperIntegrity:
         result = auth_instance._check_otel_helper_integrity()
         assert result == "not-configured"
 
-    def test_binary_missing(self, auth_instance, tmp_path):
+    def test_binary_missing(self, auth_instance):
         """When binary doesn't exist, returns 'missing'."""
         auth_instance.config["otel_helper_hash"] = "abc123"
         with patch("credential_provider.__main__.Path") as mock_path_cls:
@@ -319,6 +319,7 @@ class TestCallTvm:
     def test_tvm_timeout(self, auth_instance):
         """When TVM times out, should raise TVMUnreachableError."""
         import requests as req
+
         from credential_provider.__main__ import TVMUnreachableError
         with patch("credential_provider.__main__.requests.post", side_effect=req.exceptions.Timeout()):
             with pytest.raises(TVMUnreachableError, match="timeout"):
@@ -327,6 +328,7 @@ class TestCallTvm:
     def test_tvm_connection_error(self, auth_instance):
         """DNS / captive-portal / TLS issues raise TVMUnreachableError."""
         import requests as req
+
         from credential_provider.__main__ import TVMUnreachableError
         with patch(
             "credential_provider.__main__.requests.post",

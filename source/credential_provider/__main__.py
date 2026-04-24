@@ -156,8 +156,7 @@ class MultiProviderAuth:
             # Fail clearly if provider type is unknown
             if self.provider_type not in PROVIDER_CONFIGS:
                 raise ValueError(
-                    f"Unknown provider type '{self.provider_type}'. "
-                    f"Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
+                    f"无法识别身份提供商类型 '{self.provider_type}'。请联系管理员确认配置。"
                 )
             self.provider_config = PROVIDER_CONFIGS[self.provider_type]
 
@@ -265,7 +264,7 @@ class MultiProviderAuth:
 
         if not config_path.exists():
             raise ValueError(
-                f"Configuration file not found in {binary_dir} or {Path.home() / 'claude-code-with-bedrock'}"
+                f"未找到配置文件（已尝试 {binary_dir} 和 {Path.home() / 'claude-code-with-bedrock'}）"
             )
 
         with open(config_path) as f:
@@ -276,7 +275,7 @@ class MultiProviderAuth:
             # New format
             profiles = file_config.get("profiles", {})
             if self.profile not in profiles:
-                raise ValueError(f"Profile '{self.profile}' not found in configuration")
+                raise ValueError(f"配置文件中未找到 profile '{self.profile}'")
             profile_config = profiles[self.profile]
 
             # Map new field names to expected ones
@@ -291,7 +290,9 @@ class MultiProviderAuth:
             profile_config["credential_storage"] = profile_config.get("credential_storage", "session")
         else:
             # Old format for backward compatibility
-            profile_config = file_config.get(self.profile, {})
+            if self.profile not in file_config:
+                raise ValueError(f"配置文件中未找到 profile '{self.profile}'")
+            profile_config = file_config[self.profile]
 
         # Auto-detect federation type based on configuration
         self._detect_federation_type(profile_config)
@@ -304,7 +305,7 @@ class MultiProviderAuth:
 
         missing = [k for k in required if not profile_config.get(k)]
         if missing:
-            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
+            raise ValueError(f"缺少必需的配置项：{', '.join(missing)}")
 
         # Set defaults
         profile_config.setdefault("aws_region", "us-east-1")
@@ -345,11 +346,8 @@ class MultiProviderAuth:
 
         # Secure provider detection using proper URL parsing
         if not domain:
-            # Fail with clear error for unknown providers
             raise ValueError(
-                "Unable to auto-detect provider type for empty domain. "
-                "Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool. "
-                "Please check your provider domain configuration."
+                "配置文件中身份提供商地址为空。请联系管理员确认配置。"
             )
 
         # Handle both full URLs and domain-only inputs
@@ -360,11 +358,8 @@ class MultiProviderAuth:
             hostname = parsed.hostname
 
             if not hostname:
-                # Fail with clear error for unknown providers
                 raise ValueError(
-                    f"Unable to auto-detect provider type for domain '{domain}'. "
-                    f"Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool. "
-                    f"Please check your provider domain configuration."
+                    f"身份提供商地址 '{domain}' 格式不正确。请联系管理员确认配置。"
                 )
 
             hostname_lower = hostname.lower()
@@ -383,17 +378,13 @@ class MultiProviderAuth:
                 # Cognito User Pool domain format: my-domain.auth.{region}.amazoncognito.com
                 return "cognito"
             else:
-                # Fail with clear error for unknown providers
                 raise ValueError(
-                    f"Unable to auto-detect provider type for domain '{domain}'. "
-                    f"Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool. "
-                    f"Please check your provider domain configuration."
+                    f"无法识别身份提供商 '{domain}'。请联系管理员确认配置。"
                 )
         except ValueError:
             raise
         except Exception as e:
-            # Fail with clear error for unknown providers
-            raise ValueError(f"Unable to auto-detect provider type for domain '{domain}': {e}") from e
+            raise ValueError(f"身份提供商地址 '{domain}' 无法解析。请联系管理员确认配置。") from e
 
     def _init_credential_storage(self):
         """Initialize secure credential storage"""
@@ -537,7 +528,7 @@ class MultiProviderAuth:
                     )
             except Exception as e:
                 self._debug_print(f"Error saving credentials to keyring: {e}")
-                raise Exception(f"Failed to save credentials to keyring: {str(e)}") from e
+                raise Exception("无法将登录凭证保存到系统钥匙串。请稍后重试；如果问题持续，请联系管理员。") from e
         else:
             # Session storage uses ~/.aws/credentials file
             self.save_to_credentials_file(credentials, self.profile)
@@ -1054,7 +1045,7 @@ class MultiProviderAuth:
                     pass
                 raise
         except Exception as e:
-            raise Exception(f"Failed to save credentials to file: {str(e)}") from e
+            raise Exception("无法保存登录凭证到本地文件。请检查 ~/.aws 目录的写入权限后重试。") from e
 
     def read_from_credentials_file(self, profile="ClaudeCode"):
         """Read credentials from ~/.aws/credentials file
@@ -1276,11 +1267,8 @@ class MultiProviderAuth:
             # We need the User Pool domain (configured separately in Cognito console)
             # For now, we'll use the domain as provided, which should be the User Pool domain
             if "amazoncognito.com" not in provider_domain:
-                # If it's the identity pool format, we need the actual User Pool domain
                 raise ValueError(
-                    "For Cognito User Pool, please provide the User Pool domain "
-                    "(e.g., 'my-domain.auth.us-east-1.amazoncognito.com'), "
-                    "not the identity pool endpoint."
+                    "Cognito 登录域名配置不正确。请联系管理员确认配置。"
                 )
             base_url = f"https://{provider_domain}"
         else:
@@ -1498,8 +1486,8 @@ class MultiProviderAuth:
                 """
                 self.wfile.write(html.encode())
 
-            def log_message(self, _format, *_args):
-                pass  # Suppress logs
+            def log_message(self, format, *args):  # noqa: A002 - match BaseHTTPRequestHandler signature
+                del format, args  # Suppress logs
 
         return CallbackHandler
 
@@ -1532,7 +1520,7 @@ class MultiProviderAuth:
             # Get the federated role ARN from config
             federated_role_arn = self.config.get("federated_role_arn")
             if not federated_role_arn:
-                raise ValueError("federated_role_arn is required for direct STS federation")
+                raise ValueError("配置文件缺少必要项，无法获取 Bedrock 凭证。请联系管理员重新下载安装包。")
 
             # Create STS client
             sts_client = boto3.client("sts", region_name=self.config["aws_region"])
@@ -1624,13 +1612,8 @@ class MultiProviderAuth:
             ):
                 self._debug_print("Detected invalid credentials, clearing cache...")
                 self.clear_cached_credentials()
-                # Add helpful message for user
-                raise Exception(
-                    f"Authentication failed - cached credentials were invalid and have been cleared.\n"
-                    f"Please try again to re-authenticate.\n"
-                    f"Original error: {error_str}"
-                ) from e
-            raise Exception(f"Failed to get AWS credentials via Direct STS: {str(e)}") from None
+                raise Exception("本地登录凭证已失效，已为你清除缓存。请重新运行命令。") from e
+            raise Exception("获取 Bedrock 凭证失败。请稍后重试；如果问题持续，请联系管理员。") from None
         finally:
             # Restore environment variables
             for var, value in saved_env.items():
@@ -1682,7 +1665,7 @@ class MultiProviderAuth:
                     # Fallback: construct from config
                     user_pool_id = self.config.get("cognito_user_pool_id")
                     if not user_pool_id:
-                        raise ValueError("cognito_user_pool_id is required for Cognito User Pool authentication")
+                        raise ValueError("配置文件缺少必要项，无法完成 Cognito 登录。请联系管理员重新下载安装包。")
                     login_key = f"cognito-idp.{self.config['aws_region']}.amazonaws.com/{user_pool_id}"
                     self._debug_print(f"Cognito User Pool ID from config: {user_pool_id}")
             else:
@@ -1763,13 +1746,8 @@ class MultiProviderAuth:
             ):
                 self._debug_print("Detected invalid credentials, clearing cache...")
                 self.clear_cached_credentials()
-                # Add helpful message for user
-                raise Exception(
-                    f"Authentication failed - cached credentials were invalid and have been cleared.\n"
-                    f"Please try again to re-authenticate.\n"
-                    f"Original error: {error_str}"
-                ) from e
-            raise Exception(f"Failed to get AWS credentials: {str(e)}") from None
+                raise Exception("本地登录凭证已失效，已为你清除缓存。请重新运行命令。") from e
+            raise Exception("获取 Bedrock 凭证失败。请稍后重试；如果问题持续，请联系管理员。") from None
 
     # Process cmdlines we consider "ours" when checking port ownership.
     # The installed wrapper on end-user machines is usually `credential-process`
