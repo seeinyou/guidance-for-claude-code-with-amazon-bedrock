@@ -151,7 +151,7 @@ Same as L4, for the reconciler Lambda (`index.py:43`).
 | bedrock_usage_stream Lambda | `lambda-functions/bedrock_usage_stream/index.py` | All 17 requirements met |
 | bedrock_logging_config Lambda | `lambda-functions/bedrock_logging_config/index.py` | All 5 requirements met (incl. S3 notification) |
 | Config dataclass | `source/claude_code_with_bedrock/config.py` | All 5 fields correct |
-| Cognito User Pool setup | `cognito-user-pool-setup.yaml` | `RefreshTokenValidity: 720` present |
+| Cognito User Pool setup | `cognito-user-pool-setup.yaml` | `RefreshTokenValidity: 1440` present |
 | Package command | `cli/commands/package.py` | SHA256 hash + config write correct |
 | TVM adaptive session duration | `lambda-functions/tvm/index.py` | All 4 tiers + two-layer enforcement correct |
 | TVM profile upsert | `lambda-functions/tvm/index.py` | `if_not_exists` + status check correct |

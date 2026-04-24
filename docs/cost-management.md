@@ -88,7 +88,7 @@ client-side `/check` path).
 
 - The credential process stores the Cognito `refresh_token` in the OS
   keyring (or session file, per profile config).
-- Cognito User Pool `RefreshTokenValidity` is 12h (720 minutes). On
+- Cognito User Pool `RefreshTokenValidity` is 24h (1440 minutes). On
   `id_token` expiry the client attempts a silent refresh; only a hard
   refresh-token failure prompts the browser flow again.
 - Refresh token is wiped on `--clear-cache`.

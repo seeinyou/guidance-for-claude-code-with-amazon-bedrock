@@ -125,7 +125,7 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
       # Token validity as specified in the guide
       AuthSessionValidity: 3         # 3 minutes
-      RefreshTokenValidity: 720      # 720 minutes (12 hours)
+      RefreshTokenValidity: 1440     # 1440 minutes (24 hours)
       AccessTokenValidity: 10        # 10 minutes
       IdTokenValidity: 60           # 60 minutes
       TokenValidityUnits:
