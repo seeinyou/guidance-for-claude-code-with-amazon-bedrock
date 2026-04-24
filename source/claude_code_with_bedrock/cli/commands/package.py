@@ -413,39 +413,46 @@ class PackageCommand(Command):
         console.print("\n[bold]Building package...[/bold]")
 
         # Portable Python bundles cross-build from any host (no PyInstaller/Docker).
-        if isinstance(target_platform, list):
-            platforms_to_build = []
-            for platform_choice in target_platform:
-                if platform_choice == "all":
-                    platforms_to_build.extend(
-                        ["macos-arm64", "macos-intel", "linux-x64", "linux-arm64", "windows"]
-                    )
-                elif platform_choice not in platforms_to_build:
-                    platforms_to_build.append(platform_choice)
-        elif target_platform == "all":
-            platforms_to_build = ["macos-arm64", "macos-intel", "linux-x64", "linux-arm64", "windows"]
-        else:
-            platforms_to_build = [target_platform]
+        # Each build task is (platform_name, is_slim) so `all` can emit both
+        # the Linux portable and Linux slim variants side-by-side.
+        ALL_PORTABLE = ["macos-arm64", "macos-intel", "linux-x64", "linux-arm64", "windows"]
+        ALL_SLIM_EXTRAS = [("linux-x64", True), ("linux-arm64", True)]
 
-        built_executables = []
+        def _expand(choice: str) -> list[tuple[str, bool]]:
+            if choice == "all":
+                # `all` means everything: portable for every platform, plus
+                # slim for the two Linux arches (so users get a choice).
+                return [(p, False) for p in ALL_PORTABLE] + ALL_SLIM_EXTRAS
+            return [(choice, slim)]
+
+        if isinstance(target_platform, list):
+            build_tasks: list[tuple[str, bool]] = []
+            for platform_choice in target_platform:
+                for task in _expand(platform_choice):
+                    if task not in build_tasks:
+                        build_tasks.append(task)
+        else:
+            build_tasks = _expand(target_platform)
+
+        built_executables: list[tuple[str, Path, bool]] = []
 
         console.print()
         if slim:
-            non_linux = [p for p in platforms_to_build if not p.startswith("linux")]
+            non_linux = [p for p, s in build_tasks if s and not p.startswith("linux")]
             if non_linux:
                 console.print(
                     f"[red]--slim is Linux-only; got non-Linux targets: {', '.join(non_linux)}.[/red]"
                 )
                 return 1
 
-        for platform_name in platforms_to_build:
-            variant = " (slim)" if slim else ""
+        for platform_name, is_slim in build_tasks:
+            variant = " (slim)" if is_slim else ""
             console.print(f"[cyan]Building credential process for {platform_name}{variant}...[/cyan]")
             try:
-                executable_path = self._build_executable(output_dir, platform_name, slim=slim)
-                built_executables.append((platform_name, executable_path))
+                executable_path = self._build_executable(output_dir, platform_name, slim=is_slim)
+                built_executables.append((platform_name, executable_path, is_slim))
             except Exception as e:
-                console.print(f"[yellow]Warning: Could not build credential process for {platform_name}: {e}[/yellow]")
+                console.print(f"[yellow]Warning: Could not build credential process for {platform_name}{variant}: {e}[/yellow]")
 
         # OTEL helper is bundled as Python source inside each portable bundle (no
         # separate compiled binary), so the per-platform hash dict is empty now.
@@ -478,12 +485,12 @@ class PackageCommand(Command):
         # Copy config.json + claude-settings/ into each bundle so the bundled
         # installer (install.ps1 / install.sh) finds them via its own directory.
         include_otel_helper = profile.monitoring_enabled and not bool(self.option("no-otel-helper"))
-        if any(p == "windows" for p, _ in built_executables):
+        if any(p == "windows" for p, _, _ in built_executables):
             self._finalize_windows_portable(output_dir)
-        for platform_name, _ in built_executables:
+        for platform_name, _, is_slim in built_executables:
             if platform_name in self.POSIX_PYTHON_URLS:
                 self._finalize_posix_portable(
-                    output_dir, platform_name, include_otel_helper, slim=slim
+                    output_dir, platform_name, include_otel_helper, slim=is_slim
                 )
 
         # Summary
@@ -491,11 +498,11 @@ class PackageCommand(Command):
         console.print(f"\nOutput directory: [cyan]{output_dir}[/cyan]")
         console.print("\nPackage contents:")
 
-        suffix = "-slim" if slim else "-portable"
-        for platform_name, _ in built_executables:
+        for platform_name, _, is_slim in built_executables:
+            suffix = "-slim" if is_slim else "-portable"
             if platform_name == "windows":
                 console.print("  • windows-portable/ - Portable Python distribution for Windows")
-            elif slim:
+            elif is_slim:
                 console.print(f"  • {platform_name}{suffix}/ - Slim bundle for {platform_name} (system Python 3.9+)")
             else:
                 console.print(
@@ -505,8 +512,9 @@ class PackageCommand(Command):
         console.print("  • config.json - Configuration")
         if (output_dir / "windows-portable" / "install.bat").exists():
             console.print("  • windows-portable/install.bat - Installation script for Windows")
-        for platform_name, _ in built_executables:
+        for platform_name, _, is_slim in built_executables:
             if platform_name in self.POSIX_PYTHON_URLS:
+                suffix = "-slim" if is_slim else "-portable"
                 console.print(f"  • {platform_name}{suffix}/install.sh - Installation script")
         console.print("  • README.md - Installation instructions")
         if profile.monitoring_enabled and (output_dir / "claude-settings" / "settings.json").exists():
