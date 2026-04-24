@@ -41,6 +41,10 @@ from botocore.config import Config
 __version__ = "1.0.0"
 
 
+class BrowserAuthInProgressError(Exception):
+    """Raised when another credential-process already has a browser auth window open."""
+
+
 class QuotaExceededError(Exception):
     """Raised when TVM returns 429 due to quota limits."""
 
@@ -1108,6 +1112,110 @@ class MultiProviderAuth:
             self._debug_print(f"Error parsing expiration: {e}")
             return True  # Assume expired on parse error
 
+    # Browser-auth global lock: prevent spawning a second browser window while
+    # a previous credential-process is still waiting for the user to log in.
+    # Without this, every IDE extension / AWS SDK call that hits an unauthenticated
+    # profile opens yet another window on top of the unanswered one.
+    _BROWSER_LOCK_TTL_SECONDS = 600  # 10 minutes — matches the 5-min server timeout with headroom
+
+    def _browser_lock_path(self) -> Path:
+        session_dir = Path.home() / ".claude-code-session"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir / f"{self.profile}-browser.lock"
+
+    def _is_pid_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if platform.system() == "Windows":
+            # os.kill(pid, 0) on Windows terminates the process rather than probing.
+            # Use OpenProcess with PROCESS_QUERY_LIMITED_INFORMATION (Vista+).
+            try:
+                import ctypes
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+                )
+                if not handle:
+                    return False
+                ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+                return True
+            except Exception:
+                # ctypes/kernel32 not available → fail-safe: assume alive so we don't
+                # steal a legitimately held lock. TTL will still recover.
+                return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # pid exists but owned by another user — still alive.
+            return True
+        except Exception:
+            return False
+
+    def _acquire_browser_lock(self) -> bool:
+        """Try to acquire the browser-auth lock. Returns True on success.
+
+        Lock is considered valid only if BOTH: the recorded PID is alive AND
+        the file mtime is within the TTL. Either stale condition triggers
+        takeover — so a crashed credential-process never strands users.
+        """
+        lock_path = self._browser_lock_path()
+        try:
+            if lock_path.exists():
+                try:
+                    data = json.loads(lock_path.read_text())
+                    holder_pid = int(data.get("pid", 0))
+                except Exception:
+                    holder_pid = 0
+                mtime = lock_path.stat().st_mtime
+                age = time.time() - mtime
+                alive = self._is_pid_alive(holder_pid)
+                if alive and age < self._BROWSER_LOCK_TTL_SECONDS and holder_pid != os.getpid():
+                    self._log(
+                        f"browser lock held by pid={holder_pid} age={int(age)}s — "
+                        "skipping browser open"
+                    )
+                    return False
+                self._log(
+                    f"browser lock stale (pid={holder_pid} alive={alive} age={int(age)}s), taking over"
+                )
+            payload = json.dumps({"pid": os.getpid(), "profile": self.profile, "ts": int(time.time())})
+            # Atomic write: write to a tmp file then rename. Path.replace is atomic
+            # on POSIX and Windows (ReplaceFile/MoveFileEx). Avoids partial-write
+            # races when another instance is racing to take over a stale lock.
+            tmp_path = lock_path.with_suffix(lock_path.suffix + f".{os.getpid()}.tmp")
+            tmp_path.write_text(payload)
+            try:
+                tmp_path.chmod(0o600)  # No-op semantics on Windows, harmless.
+            except Exception:
+                pass
+            tmp_path.replace(lock_path)
+            self._log(f"acquired browser lock pid={os.getpid()} path={lock_path}")
+            return True
+        except Exception as e:
+            # Fail-open: if the lock file itself is broken, don't block the user.
+            self._log(f"browser lock acquire failed, proceeding without lock: {e}")
+            return True
+
+    def _release_browser_lock(self):
+        try:
+            lock_path = self._browser_lock_path()
+            if not lock_path.exists():
+                return
+            # Only remove if we own it, to avoid racing with a takeover.
+            try:
+                data = json.loads(lock_path.read_text())
+                if int(data.get("pid", 0)) != os.getpid():
+                    return
+            except Exception:
+                pass
+            lock_path.unlink()
+            self._log("released browser lock")
+        except Exception as e:
+            self._log(f"browser lock release failed: {e}")
+
     def authenticate_oidc(self):
         """Perform OIDC authentication with PKCE"""
         state = secrets.token_urlsafe(16)
@@ -1174,41 +1282,54 @@ class MultiProviderAuth:
             while not auth_result["code"] and not auth_result["error"] and time.time() < deadline:
                 server.handle_request()
 
-        server_thread = threading.Thread(target=_serve_until_done)
-        server_thread.daemon = True
-        server_thread.start()
-
-        # Open browser - detect headless environment first
-        is_headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY") and sys.platform not in ("darwin", "win32")
-        browser_opened = False
-
-        if not is_headless:
-            self._debug_print(f"Opening browser for {self.provider_config['name']} authentication...")
+        # Acquire the browser-auth global lock BEFORE starting the callback
+        # server / opening a browser. If another credential-process already
+        # has an auth window waiting, refuse to open a second one.
+        if not self._acquire_browser_lock():
             try:
-                browser_opened = webbrowser.open(auth_url)
+                server.server_close()
             except Exception:
                 pass
-
-        if not browser_opened:
-            msg = (
-                "\n" + "=" * 60 + "\n"
-                "Open this URL in a browser to authenticate:\n\n"
-                f"  http://localhost:{self.redirect_port}\n\n"
-                "Waiting for callback...\n"
-                "Tip: ssh -L 8400:localhost:8400 <host>\n"
-                + "=" * 60 + "\n"
+            raise BrowserAuthInProgressError(
+                "Another login window is already waiting. Please complete the login "
+                "in the existing browser tab, or close it and retry."
             )
-            print(msg, file=sys.stderr, flush=True)
 
-        # Wait for callback
-        server_thread.join(timeout=300)  # 5 minute timeout
+        try:
+            server_thread = threading.Thread(target=_serve_until_done)
+            server_thread.daemon = True
+            server_thread.start()
 
-        if auth_result["error"] == "stale_callback":
-            # Stale callback from previous session — retry once
-            self._debug_print("Stale callback received, retrying authentication...")
-            print("Stale session detected, retrying...\n", file=sys.stderr, flush=True)
-            return self.authenticate_oidc()
+            # Open browser - detect headless environment first
+            is_headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY") and sys.platform not in ("darwin", "win32")
+            browser_opened = False
 
+            if not is_headless:
+                self._debug_print(f"Opening browser for {self.provider_config['name']} authentication...")
+                try:
+                    browser_opened = webbrowser.open(auth_url)
+                except Exception:
+                    pass
+
+            if not browser_opened:
+                msg = (
+                    "\n" + "=" * 60 + "\n"
+                    "Open this URL in a browser to authenticate:\n\n"
+                    f"  http://localhost:{self.redirect_port}\n\n"
+                    "Waiting for callback...\n"
+                    "Tip: ssh -L 8400:localhost:8400 <host>\n"
+                    + "=" * 60 + "\n"
+                )
+                print(msg, file=sys.stderr, flush=True)
+
+            # Wait for callback
+            server_thread.join(timeout=300)  # 5 minute timeout
+        finally:
+            self._release_browser_lock()
+
+        # Note: stale callbacks are no longer treated as errors — the handler
+        # logs and ignores them, so the server keeps listening for the real
+        # /callback. Any error here is a real IdP-side failure.
         if auth_result["error"]:
             raise Exception(f"Authentication error: {auth_result['error']}")
 
@@ -1291,6 +1412,16 @@ class MultiProviderAuth:
                     self.end_headers()
                     return
 
+                # Only /callback is allowed to terminate the auth loop.
+                # Probes from browsers (favicon.ico), IDE extensions, or port
+                # scanners used to land in the else-branch below and get tagged
+                # as "stale_callback", which terminated the server and (prior
+                # to this fix) triggered a recursive browser reopen.
+                if path != "/callback":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
                 query = parse_qs(urlparse(self.path).query)
 
                 if query.get("error"):
@@ -1300,10 +1431,11 @@ class MultiProviderAuth:
                     result_container["code"] = query["code"][0]
                     self._send_response(200, "Authentication successful! You can close this window.")
                 else:
-                    # State mismatch — stale callback from a previous session.
-                    parent._debug_print(f"Stale callback with mismatched state (expected={expected_state[:8]}...)")
-                    result_container["error"] = "stale_callback"
-                    self._send_response(400, "Stale callback — please try again.")
+                    # State mismatch — stale callback from a previous tab/session.
+                    # Log and 400 but DO NOT set result_container["error"]:
+                    # keep the server listening for the real /callback.
+                    parent._debug_print(f"Stale callback ignored (expected={expected_state[:8]}...)")
+                    self._send_response(400, "Stale callback ignored. Please complete login in the latest tab.")
 
             def _send_response(self, code, message):
                 self.send_response(code)
@@ -1948,6 +2080,13 @@ class MultiProviderAuth:
             print(json.dumps(credentials))
             return 0
 
+        except BrowserAuthInProgressError as e:
+            # Lock held by another process — don't open a second browser window.
+            # Exit non-zero so the caller (boto3 / AWS CLI) gets a credential error
+            # instead of hanging, but no stack trace.
+            self._log(f"browser auth already in progress: {e}")
+            print(f"{e}", file=sys.stderr)
+            return 1
         except QuotaExceededError as e:
             self._log(f"QUOTA EXCEEDED: {e}")
             print(f"QUOTA EXCEEDED: {e}", file=sys.stderr)
