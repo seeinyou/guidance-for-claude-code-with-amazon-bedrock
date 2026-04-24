@@ -172,6 +172,10 @@ class MultiProviderAuth:
             self._logger.setLevel(logging.DEBUG)
             self._logger.addHandler(handler)
             self._log(f"--- session start (pid={os.getpid()}) ---")
+            self._log(
+                f"platform={platform.system()} release={platform.release()} "
+                f"arch={platform.machine()} python={platform.python_version()}"
+            )
         except Exception:
             self._logger = None  # Non-fatal: logging is best-effort
 
@@ -395,6 +399,9 @@ class MultiProviderAuth:
                     meta_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-meta")
 
                     if not all([keys_json, token1, token2, meta_json]):
+                        missing = [n for n, v in [("keys", keys_json), ("token1", token1),
+                                                   ("token2", token2), ("meta", meta_json)] if not v]
+                        self._log(f"cache miss: storage=keyring reason=partial_windows_entries missing={','.join(missing)}")
                         return None
                     assert keys_json is not None and token1 is not None and token2 is not None and meta_json is not None
 
@@ -414,6 +421,7 @@ class MultiProviderAuth:
                     creds_json = keyring.get_password("claude-code-with-bedrock", f"{self.profile}-credentials")
 
                     if not creds_json:
+                        self._log("cache miss: storage=keyring reason=entry_not_found")
                         return None
 
                     creds = json.loads(creds_json)
@@ -421,44 +429,56 @@ class MultiProviderAuth:
                 # Check for dummy/cleared credentials first
                 # These are set when credentials are cleared to maintain keychain permissions
                 if creds.get("AccessKeyId") == "EXPIRED":
-                    self._debug_print("Found cleared dummy credentials, need re-authentication")
+                    self._debug_print("cache miss: storage=keyring reason=dummy_expired")
                     return None
 
                 # Validate expiration for real credentials
                 exp_str = creds.get("Expiration")
-                if exp_str:
-                    exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                    now = datetime.now(timezone.utc)
+                if not exp_str:
+                    self._log("cache miss: storage=keyring reason=missing_expiration_field")
+                    return None
+                exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                ttl = int((exp_time - now).total_seconds())
 
-                    # Use credentials if they expire in more than 30 seconds
-                    if (exp_time - now).total_seconds() > 30:
-                        return creds
+                # Use credentials if they expire in more than 30 seconds
+                if ttl > 30:
+                    self._log(f"cache hit: storage=keyring ttl={ttl}s")
+                    return creds
+                self._log(f"cache miss: storage=keyring reason=expired ttl={ttl}s")
+                return None
 
             except Exception as e:
-                self._debug_print(f"Error retrieving credentials from keyring: {e}")
+                self._log(f"cache miss: storage=keyring reason=exception err={e}")
                 return None
         else:
             # Session storage uses ~/.aws/credentials file
+            creds_path = Path.home() / ".aws" / "credentials"
             credentials = self.read_from_credentials_file(self.profile)
 
             if not credentials:
+                self._log(f"cache miss: storage=session reason=profile_not_found path={creds_path} exists={creds_path.exists()}")
                 return None
 
             # Check for dummy/cleared credentials first
             if credentials.get("AccessKeyId") == "EXPIRED":
-                self._debug_print("Found cleared dummy credentials in credentials file, need re-authentication")
+                self._debug_print("cache miss: storage=session reason=dummy_expired")
                 return None
 
             # Validate expiration
             exp_str = credentials.get("Expiration")
-            if exp_str:
-                exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                now = datetime.now(timezone.utc)
+            if not exp_str:
+                self._log("cache miss: storage=session reason=missing_expiration_field")
+                return None
+            exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            ttl = int((exp_time - now).total_seconds())
 
-                # Use credentials if they expire in more than 30 seconds
-                if (exp_time - now).total_seconds() > 30:
-                    return credentials
-
+            # Use credentials if they expire in more than 30 seconds
+            if ttl > 30:
+                self._log(f"cache hit: storage=session ttl={ttl}s")
+                return credentials
+            self._log(f"cache miss: storage=session reason=expired ttl={ttl}s")
             return None
 
     def save_credentials(self, credentials):
@@ -792,7 +812,13 @@ class MultiProviderAuth:
                     self._debug_print("Refresh response missing id_token")
                     return None
             else:
-                self._debug_print(f"Refresh token exchange failed: {response.status_code}")
+                # Log response body so we can distinguish invalid_grant (expired/revoked)
+                # vs invalid_client (client_secret mismatch) vs unauthorized_client
+                # (ALLOW_REFRESH_TOKEN_AUTH disabled). They need different fixes.
+                body = response.text[:200] if response.text else ""
+                self._debug_print(
+                    f"Refresh token exchange failed: {response.status_code} body={body}"
+                )
                 self._clear_cached_refresh_token()
                 return None
         except Exception as e:
@@ -813,6 +839,15 @@ class MultiProviderAuth:
                     json.dump(token_data, f)
                 token_file.chmod(0o600)
             self._debug_print("Saved refresh token")
+            # Verify round-trip: if the storage backend silently drops writes
+            # (keyring ACL denied, read-only volume, etc.) the next invocation
+            # will hit "No cached refresh_token" and trigger browser auth.
+            readback = self._get_cached_refresh_token()
+            if readback != refresh_token:
+                self._log(
+                    f"WARN refresh_token save did not round-trip: storage={self.credential_storage} "
+                    f"readback={'missing' if not readback else 'mismatch'}"
+                )
         except Exception as e:
             self._debug_print(f"Warning: Could not save refresh token: {e}")
 
@@ -1830,6 +1865,17 @@ class MultiProviderAuth:
         """Main execution flow"""
         try:
             self._log(f"run() profile={self.profile} provider={self.provider_type} federation={self.config.get('federation_type')}")
+            # Environment fingerprint: surfaces HOME / AWS_PROFILE / storage / platform drift across invocations
+            try:
+                self._log(
+                    f"env platform={platform.system()} release={platform.release()} "
+                    f"python={platform.python_version()} arch={platform.machine()} "
+                    f"home={Path.home()} storage={getattr(self, 'credential_storage', 'unknown')} "
+                    f"aws_profile={os.getenv('AWS_PROFILE', '')} "
+                    f"user={os.getenv('USER') or os.getenv('USERNAME', '')}"
+                )
+            except Exception:
+                pass  # Diagnostic log must never break the run
 
             # 1. Check otel-helper integrity (records status, does NOT exit)
             self.otel_helper_status = self._check_otel_helper_integrity()
