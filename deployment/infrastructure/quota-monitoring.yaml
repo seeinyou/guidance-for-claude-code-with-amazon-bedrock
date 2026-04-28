@@ -58,6 +58,19 @@ Parameters:
       - 'false'
     Description: Enable fine-grained quota policies (user/group/default levels)
 
+  AdaptiveEnforcement:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      When true, TVM shortens session duration and attaches an inline
+      aws:EpochTime-scoped policy as the user approaches quota. Disabled by
+      default because the inline policy can invalidate credentials before
+      the client's next 15-minute refresh. Hard quota blocks at token
+      issuance still apply regardless.
+
   # JWT Authentication Parameters for Quota Check API
   OidcIssuerUrl:
     Type: String
@@ -501,6 +514,7 @@ Resources:
           PRICING_TABLE: !Ref BedrockPricing
           BEDROCK_USER_ROLE_ARN: !GetAtt BedrockUserRole.Arn
           TVM_SESSION_DURATION: '900'
+          TVM_ADAPTIVE_ENFORCEMENT: !Ref AdaptiveEnforcement
           REQUIRE_OTEL_HELPER: 'false'
       Code: ./lambda-functions/tvm/
 

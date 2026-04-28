@@ -34,6 +34,12 @@ PRICING_TABLE = os.environ.get("PRICING_TABLE", "BedrockPricing")
 BEDROCK_USER_ROLE_ARN = os.environ.get("BEDROCK_USER_ROLE_ARN", "")
 TVM_SESSION_DURATION = int(os.environ.get("TVM_SESSION_DURATION", "900"))
 REQUIRE_OTEL_HELPER = os.environ.get("REQUIRE_OTEL_HELPER", "false").lower() == "true"
+# When true, shorten session duration and attach a time-scoped inline session
+# policy (aws:EpochTime) as the user approaches their quota. Disabled by
+# default because the inline policy makes credentials appear invalid before
+# the next 15-minute refresh, which surprises clients. With it off, hard
+# quota blocks still apply at token-issuance time.
+TVM_ADAPTIVE_ENFORCEMENT = os.environ.get("TVM_ADAPTIVE_ENFORCEMENT", "false").lower() == "true"
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
 # ---------------------------------------------------------------------------
@@ -146,8 +152,11 @@ def lambda_handler(event, context):
             if block:
                 return _error(429, block["reason"], block["message"])
 
-        # -- 10. Compute adaptive session duration ----------------------------
-        max_duration, effective_seconds = _compute_session_duration(usage, policy)
+        # -- 10. Compute session duration -------------------------------------
+        if TVM_ADAPTIVE_ENFORCEMENT:
+            _, effective_seconds = _compute_session_duration(usage, policy)
+        else:
+            effective_seconds = TVM_SESSION_DURATION
 
         # Cap to unblock remaining time (min 60s, max 900s)
         if is_unblocked and unblock_remaining < effective_seconds:
@@ -155,7 +164,9 @@ def lambda_handler(event, context):
             print(f"[TVM] Capped session to {effective_seconds}s (unblock expiry)")
 
         # -- 11. Assume role and return credentials ---------------------------
-        credentials = _assume_role_for_user(email, effective_seconds)
+        credentials = _assume_role_for_user(
+            email, effective_seconds, scoped=TVM_ADAPTIVE_ENFORCEMENT
+        )
 
         return _success(200, {
             "credentials": credentials,
@@ -681,60 +692,73 @@ def _compute_session_duration(usage: dict, policy: dict | None) -> tuple[int, in
 #  STS ASSUME ROLE
 # ===================================================================
 
-def _assume_role_for_user(email: str, effective_seconds: int) -> dict:
+def _assume_role_for_user(email: str, effective_seconds: int, scoped: bool = False) -> dict:
     """
-    Assume the Bedrock user role with a time-scoped inline session policy.
+    Assume the Bedrock user role and return credentials.
 
-    The session policy restricts ``bedrock:InvokeModel*`` to expire at
-    ``now + effective_seconds`` via an ``aws:EpochTime`` condition, even
-    though the STS token itself may live longer (STS minimum is 900 s).
+    When ``scoped`` is True (adaptive enforcement mode), attach an inline
+    session policy that restricts ``bedrock:InvokeModel*`` to expire at
+    ``now + effective_seconds`` via an ``aws:EpochTime`` condition, and
+    override the returned ``Expiration`` to reflect that shorter window.
+
+    When ``scoped`` is False (default), no inline session policy is attached
+    and the native STS ``Expiration`` is returned, so credentials stay valid
+    for the full STS duration and the client's normal 15-minute refresh
+    cycle is not disrupted.
 
     Returns a credential dict compatible with the AWS credential_process
     contract (Version 1).
     """
-    now_epoch = int(time.time())
-    expiration_epoch = now_epoch + effective_seconds
-
     # Sanitize email for RoleSessionName (max 64 chars, limited charset)
     sanitized = re.sub(r"[^\w+=,.@-]", "-", email)[:59]
     session_name = f"ccwb-{sanitized}"
 
-    session_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": "bedrock:InvokeModel*",
-                "Resource": "*",
-                "Condition": {
-                    "NumericLessThan": {
-                        "aws:EpochTime": expiration_epoch,
-                    }
-                },
-            }
-        ],
+    sts_duration = max(900, effective_seconds)
+    expiration_epoch = int(time.time()) + effective_seconds
+
+    assume_kwargs = {
+        "RoleArn": BEDROCK_USER_ROLE_ARN,
+        "RoleSessionName": session_name,
+        "DurationSeconds": sts_duration,
     }
 
-    sts_duration = max(900, effective_seconds)
+    if scoped:
+        session_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock:InvokeModel*",
+                    "Resource": "*",
+                    "Condition": {
+                        "NumericLessThan": {
+                            "aws:EpochTime": expiration_epoch,
+                        }
+                    },
+                }
+            ],
+        }
+        assume_kwargs["Policy"] = json.dumps(session_policy)
 
-    resp = sts_client.assume_role(
-        RoleArn=BEDROCK_USER_ROLE_ARN,
-        RoleSessionName=session_name,
-        DurationSeconds=sts_duration,
-        Policy=json.dumps(session_policy),
-    )
-
+    resp = sts_client.assume_role(**assume_kwargs)
     creds = resp["Credentials"]
 
-    # Override Expiration to reflect the *effective* (shorter) window
-    effective_expiration = datetime.fromtimestamp(
-        expiration_epoch, tz=timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if scoped:
+        expiration = datetime.fromtimestamp(
+            expiration_epoch, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        sts_expiration = creds["Expiration"]
+        expiration = (
+            sts_expiration.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if isinstance(sts_expiration, datetime)
+            else sts_expiration
+        )
 
     return {
         "Version": 1,
         "AccessKeyId": creds["AccessKeyId"],
         "SecretAccessKey": creds["SecretAccessKey"],
         "SessionToken": creds["SessionToken"],
-        "Expiration": effective_expiration,
+        "Expiration": expiration,
     }

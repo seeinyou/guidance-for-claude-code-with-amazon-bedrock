@@ -79,3 +79,52 @@ class TestComputeSessionDuration:
         sts_dur, effective = self._compute(usage, policy)
         assert sts_dur >= 900
         assert effective <= sts_dur
+
+
+class TestAssumeRoleScoped:
+    """Tests for _assume_role_for_user scoped vs unscoped behavior."""
+
+    def _call(self, scoped, effective_seconds=900):
+        """Invoke _assume_role_for_user with a mocked STS client."""
+        from unittest.mock import patch
+        from datetime import datetime, timezone
+
+        import index
+
+        fake_creds = {
+            "AccessKeyId": "AKIA",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+            "Expiration": datetime(2030, 1, 1, tzinfo=timezone.utc),
+        }
+
+        captured = {}
+
+        def fake_assume_role(**kwargs):
+            captured["kwargs"] = kwargs
+            return {"Credentials": fake_creds}
+
+        with patch.object(index.sts_client, "assume_role", side_effect=fake_assume_role):
+            with patch.object(index, "BEDROCK_USER_ROLE_ARN", "arn:aws:iam::123:role/r"):
+                result = index._assume_role_for_user("alice@example.com", effective_seconds, scoped=scoped)
+        return captured["kwargs"], result
+
+    def test_unscoped_omits_policy(self):
+        """Default (non-adaptive) mode does not send an inline Policy."""
+        kwargs, result = self._call(scoped=False, effective_seconds=900)
+        assert "Policy" not in kwargs
+        # Native STS expiration preserved (year 2030 from the mock)
+        assert result["Expiration"].startswith("2030-")
+
+    def test_scoped_attaches_policy(self):
+        """Adaptive mode attaches an aws:EpochTime-scoped inline policy."""
+        import json as _json
+
+        kwargs, result = self._call(scoped=True, effective_seconds=60)
+        assert "Policy" in kwargs
+        policy = _json.loads(kwargs["Policy"])
+        stmt = policy["Statement"][0]
+        assert stmt["Action"] == "bedrock:InvokeModel*"
+        assert "aws:EpochTime" in stmt["Condition"]["NumericLessThan"]
+        # Scoped expiration reflects the shorter window, not the STS default
+        assert not result["Expiration"].startswith("2030-")

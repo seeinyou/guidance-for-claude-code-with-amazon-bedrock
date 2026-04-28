@@ -910,6 +910,7 @@ class DeployCommand(Command):
                 daily_limit = getattr(profile, "daily_token_limit", None)
                 daily_enforcement = getattr(profile, "daily_enforcement_mode", "alert")
                 monthly_enforcement = getattr(profile, "monthly_enforcement_mode", "block")
+                adaptive_enforcement = "true" if getattr(profile, "adaptive_enforcement", False) else "false"
                 warning_80 = getattr(profile, "warning_threshold_80", int(monthly_limit * 0.8))
                 warning_90 = getattr(profile, "warning_threshold_90", int(monthly_limit * 0.9))
 
@@ -940,6 +941,7 @@ class DeployCommand(Command):
                     f"DailyTokenLimit={daily_limit or 0}",
                     f"DailyEnforcementMode={daily_enforcement}",
                     f"MonthlyEnforcementMode={monthly_enforcement}",
+                    f"AdaptiveEnforcement={adaptive_enforcement}",
                     f"OidcIssuerUrl={oidc_issuer_url}",
                     f"OidcClientId={oidc_client_id}",
                     f"AlertEmail={getattr(profile, 'admin_emails', '').split(',')[0].strip()}",
