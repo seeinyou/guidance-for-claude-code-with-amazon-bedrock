@@ -261,7 +261,12 @@ class PackageCommand(Command):
         ),
         option(
             "with-otel-helper",
-            description="Bundle otel_helper/ so CloudWatch metrics carry per-user attributes. Off by default to keep bundles small; OTLP metrics still flow without it.",
+            description=(
+                "Enable OTLP telemetry end-to-end: write the CLAUDE_CODE_ENABLE_TELEMETRY / "
+                "OTEL_EXPORTER_* env vars into claude-settings and bundle otel_helper/ for "
+                "per-user CloudWatch attributes. Off by default — bundles ship without "
+                "OTLP env vars so Claude Code does not send any telemetry."
+            ),
             flag=True,
         ),
         option(
@@ -479,12 +484,19 @@ class PackageCommand(Command):
         console.print("[cyan]Creating documentation...[/cyan]")
         self._create_documentation(output_dir, profile, timestamp)
 
+        # --with-otel-helper gates both the OTLP env block in settings.json and
+        # whether otel_helper/ ships inside each bundle. Default off means the
+        # end user's Claude Code never initializes OTLP at all.
+        include_otel_helper = profile.monitoring_enabled and bool(self.option("with-otel-helper"))
+
         console.print("[cyan]Creating Claude Code settings...[/cyan]")
-        self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name)
+        self._create_claude_settings(
+            output_dir, profile, include_coauthored_by, profile_name,
+            include_otel_helper=include_otel_helper,
+        )
 
         # Copy config.json + claude-settings/ into each bundle so the bundled
         # installer (install.ps1 / install.sh) finds them via its own directory.
-        include_otel_helper = profile.monitoring_enabled and bool(self.option("with-otel-helper"))
         if any(p == "windows" for p, _, _ in built_executables):
             self._finalize_windows_portable(output_dir)
         for platform_name, _, is_slim in built_executables:
@@ -1678,9 +1690,19 @@ Available metrics include:
             f.write(readme_content)
 
     def _create_claude_settings(
-        self, output_dir: Path, profile, include_coauthored_by: bool = True, profile_name: str = "ClaudeCode"
+        self,
+        output_dir: Path,
+        profile,
+        include_coauthored_by: bool = True,
+        profile_name: str = "ClaudeCode",
+        include_otel_helper: bool = False,
     ):
-        """Create Claude Code settings.json with Bedrock and optional monitoring configuration."""
+        """Create Claude Code settings.json with Bedrock and optional monitoring configuration.
+
+        include_otel_helper also gates the OTLP env block: when False, settings
+        ship without CLAUDE_CODE_ENABLE_TELEMETRY / OTEL_EXPORTER_* so Claude
+        Code never opens an OTLP pipeline on the end user's machine.
+        """
         console = Console()
 
         try:
@@ -1722,8 +1744,10 @@ Available metrics include:
                     # For other models, use same model as small/fast (or could use Haiku)
                     settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"] = profile.selected_model
 
-            # If monitoring is enabled, add telemetry configuration
-            if profile.monitoring_enabled:
+            # Telemetry config is ALSO gated on include_otel_helper so bundles
+            # opt out of OTLP entirely (no env vars, no collector traffic) unless
+            # the operator explicitly asked for it via --with-otel-helper.
+            if profile.monitoring_enabled and include_otel_helper:
                 # Get monitoring stack outputs
                 monitoring_stack = profile.stack_names.get("monitoring", f"{profile.identity_pool_name}-otel-collector")
                 cmd = [
