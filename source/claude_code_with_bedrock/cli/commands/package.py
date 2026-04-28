@@ -136,6 +136,30 @@ if (-not ($templateObj.PSObject.Properties.Name -contains 'otelHeadersHelper') -
     $merged.Remove('otelHeadersHelper')
 }
 
+# Clear stale OTLP env vars left behind by a previous install when the current
+# bundle ships without telemetry. Without this, upgrading from a with-telemetry
+# bundle to a no-telemetry bundle leaves Claude Code still emitting OTLP.
+$ccwbOtlpKeys = @(
+    'CLAUDE_CODE_ENABLE_TELEMETRY',
+    'OTEL_METRICS_EXPORTER',
+    'OTEL_LOGS_EXPORTER',
+    'OTEL_EXPORTER_OTLP_PROTOCOL',
+    'OTEL_EXPORTER_OTLP_ENDPOINT',
+    'OTEL_RESOURCE_ATTRIBUTES'
+)
+$tplEnvNames = @()
+if ($templateObj.PSObject.Properties.Name -contains 'env' -and $templateObj.env -is [PSCustomObject]) {
+    $tplEnvNames = @($templateObj.env.PSObject.Properties.Name)
+}
+if ($merged.Contains('env') -and $merged['env'] -is [PSCustomObject]) {
+    foreach ($k in $ccwbOtlpKeys) {
+        if ($tplEnvNames -notcontains $k -and
+            $merged['env'].PSObject.Properties.Name -contains $k) {
+            $merged['env'].PSObject.Properties.Remove($k)
+        }
+    }
+}
+
 $json = [PSCustomObject]$merged | ConvertTo-Json -Depth 20
 [System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Updated $settingsPath"
@@ -826,6 +850,22 @@ for key, value in tpl.items():
 # Clear stale helper path from an earlier install if this bundle opted out.
 if "otelHeadersHelper" not in tpl:
     merged.pop("otelHeadersHelper", None)
+# Clear stale OTLP env vars left behind by a previous install when the current
+# bundle ships without telemetry. Without this, upgrading from a with-telemetry
+# bundle to a no-telemetry bundle leaves Claude Code still emitting OTLP.
+CCWB_OTLP_KEYS = (
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_RESOURCE_ATTRIBUTES",
+)
+tpl_env = tpl.get("env") or {}
+if isinstance(merged.get("env"), dict):
+    for k in CCWB_OTLP_KEYS:
+        if k not in tpl_env and k in merged["env"]:
+            del merged["env"][k]
 with open(out_path, "w") as f:
     json.dump(merged, f, indent=2)
 PY
@@ -1204,6 +1244,21 @@ for key, value in tpl.items():
 # Clear stale helper path from an earlier install if this bundle opted out.
 if "otelHeadersHelper" not in tpl:
     merged.pop("otelHeadersHelper", None)
+# Clear stale OTLP env vars left behind by a previous install when the current
+# bundle ships without telemetry.
+CCWB_OTLP_KEYS = (
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_RESOURCE_ATTRIBUTES",
+)
+tpl_env = tpl.get("env") or {}
+if isinstance(merged.get("env"), dict):
+    for k in CCWB_OTLP_KEYS:
+        if k not in tpl_env and k in merged["env"]:
+            del merged["env"][k]
 with open(out_path, "w") as f:
     json.dump(merged, f, indent=2)
 PY
