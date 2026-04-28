@@ -2301,8 +2301,29 @@ class MultiProviderAuth:
             return 1
 
 
+def _force_utf8_streams():
+    """Force stdout/stderr to UTF-8.
+
+    When Claude Code spawns credential-process it captures stderr via a pipe.
+    On Windows Python then falls back to the system ANSI codepage (CP936/GBK,
+    CP1252, ...) for non-console streams, which mangles our Chinese prompts
+    once Node decodes the bytes as UTF-8. Reconfigure to UTF-8 so the login
+    hints render correctly regardless of the host locale.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def main():
     """CLI entry point"""
+    _force_utf8_streams()
+
     import argparse
 
     parser = argparse.ArgumentParser(description="AWS credential provider for OIDC + Cognito Identity Pool")
