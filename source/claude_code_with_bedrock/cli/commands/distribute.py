@@ -68,6 +68,15 @@ class DistributeCommand(Command):
         option("build-profile", description="Select build by profile name", flag=False),
         option("timestamp", description="Select build by timestamp (YYYY-MM-DD-HHMMSS)", flag=False),
         option("latest", description="Auto-select latest build without wizard", flag=True),
+        option(
+            "archive-all",
+            description=(
+                "presigned-s3 only: bundle every {platform}-portable/ and -slim/ "
+                "directory into a single claude-code-package.zip. Off by default; "
+                "distribute per-platform bundles instead."
+            ),
+            flag=True,
+        ),
     ]
 
     def _check_old_flat_structure(self, dist_dir: Path) -> bool:
@@ -592,67 +601,28 @@ class DistributeCommand(Command):
             console.print("Run 'poetry run ccwb package' first to build packages.")
             return 1
 
-        # Check what's in the package directory
+        # Check what's in the package directory. Each bundle is a self-contained
+        # directory ({platform}-portable or {platform}-slim) produced by `ccwb package`.
         console.print("\n[bold]Package contents:[/bold]")
-        found_platforms = []
+        found_bundles: list[str] = []
+        for bundle_name, s3_key in self._BUNDLE_TO_KEY.items():
+            bundle_path = package_path / bundle_name
+            if bundle_path.is_dir():
+                mod_time = datetime.fromtimestamp(bundle_path.stat().st_mtime)
+                console.print(f"  ✓ {bundle_name}/ (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
+                found_bundles.append(s3_key)
 
-        # Check for macOS executables
-        macos_arm = package_path / "credential-process-macos-arm64"
-        macos_intel = package_path / "credential-process-macos-intel"
-        if macos_arm.exists():
-            mod_time = datetime.fromtimestamp(macos_arm.stat().st_mtime)
-            console.print(f"  ✓ macOS ARM64 executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
-            found_platforms.append("macos-arm64")
-        if macos_intel.exists():
-            mod_time = datetime.fromtimestamp(macos_intel.stat().st_mtime)
-            console.print(f"  ✓ macOS Intel executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
-            found_platforms.append("macos-intel")
-
-        # Check for Windows portable package
-        windows_portable = package_path / "windows-portable"
-        if windows_portable.exists():
-            mod_time = datetime.fromtimestamp(windows_portable.stat().st_mtime)
-            console.print(f"  ✓ Windows portable package (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
-            found_platforms.append("windows")
-        else:
-            console.print("  ✗ Windows portable package [red](not built)[/red]")
-
-        # Check for Linux executables
-        linux_x64 = package_path / "credential-process-linux-x64"
-        linux_arm64 = package_path / "credential-process-linux-arm64"
-        linux_generic = package_path / "credential-process-linux"  # Native Linux build
-
-        if linux_x64.exists():
-            mod_time = datetime.fromtimestamp(linux_x64.stat().st_mtime)
-            found_platforms.append("linux-x64")
-            console.print(f"  ✓ Linux x64 executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
-
-        if linux_arm64.exists():
-            mod_time = datetime.fromtimestamp(linux_arm64.stat().st_mtime)
-            found_platforms.append("linux-arm64")
-            console.print(f"  ✓ Linux ARM64 executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
-
-        if linux_generic.exists() and not linux_x64.exists() and not linux_arm64.exists():
-            # Show generic Linux build if no architecture-specific versions exist
-            mod_time = datetime.fromtimestamp(linux_generic.stat().st_mtime)
-            console.print(f"  ✓ Linux executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
-            found_platforms.append("linux")
-
-        # Check for installers and config
-        if (package_path / "install.sh").exists():
-            console.print("  ✓ Unix installer script")
-        if (package_path / "install.bat").exists():
-            console.print("  ✓ Windows installer script")
         if (package_path / "config.json").exists():
             console.print("  ✓ Configuration file")
+        if (package_path / "claude-settings" / "settings.json").exists():
+            console.print("  ✓ Claude Code settings template")
 
-        # Warn if missing critical platforms
-        if not found_platforms:
-            console.print("\n[red]No platform executables found![/red]")
+        if not found_bundles:
+            console.print("\n[red]No platform bundles found![/red]")
             console.print("Run: [cyan]poetry run ccwb package --target-platform all[/cyan]")
             return 1
 
-        if "windows" not in found_platforms:
+        if "windows" not in found_bundles:
             console.print("\n[yellow]Warning: Windows support not included in this distribution[/yellow]")
             from questionary import confirm
 
@@ -661,7 +631,18 @@ class DistributeCommand(Command):
                 console.print("Distribution cancelled.")
                 return 0
 
-        console.print(f"\n[green]Ready to distribute for: {', '.join(found_platforms)}[/green]")
+        console.print(f"\n[green]Ready to distribute for: {', '.join(found_bundles)}[/green]")
+
+        # Default is to stop here: presigned-s3 / local combined-zip behavior is
+        # opt-in because users usually distribute bundles per-platform (landing
+        # page, manual handoff, internal mirror) rather than a fat 500MB zip.
+        if not self.option("archive-all"):
+            console.print(
+                "\n[dim]Per-platform bundles ready under[/dim] "
+                f"[cyan]{package_path}[/cyan][dim]. Pass --archive-all to build a single "
+                "claude-code-package.zip for presigned-s3 distribution.[/dim]"
+            )
+            return 0
 
         # Validate expiration hours (max 7 days for IAM user presigned URLs)
         try:
@@ -905,63 +886,39 @@ class DistributeCommand(Command):
         return 0
 
     def _create_archive(self, package_path: Path) -> Path:
-        """Create a zip archive of the package directory."""
+        """Create a zip archive containing every per-platform bundle dir.
+
+        Bundles are the {platform}-portable / {platform}-slim directories that
+        `ccwb package` emits. The zip wraps them under a single
+        `claude-code-package/` top-level so extraction doesn't scatter files
+        into the user's cwd.
+        """
         import zipfile
 
-        # Create temp directory for archive
         temp_dir = Path(tempfile.mkdtemp())
         archive_path = temp_dir / "claude-code-package.zip"
 
-        # Create a clean package directory with only necessary files
-        package_temp_dir = temp_dir / "claude-code-package"
-        package_temp_dir.mkdir(exist_ok=True)
+        # Entries to bundle: platform dirs discovered via _BUNDLE_TO_KEY, plus
+        # the shared top-level artifacts that aren't platform-specific.
+        to_include: list[Path] = []
+        for bundle_name in self._BUNDLE_TO_KEY:
+            bundle_path = package_path / bundle_name
+            if bundle_path.is_dir():
+                to_include.append(bundle_path)
+        for top_name in ("config.json", "README.md", "claude-settings"):
+            p = package_path / top_name
+            if p.exists():
+                to_include.append(p)
 
-        # Files to include in the package
-        required_files = [
-            # Executables for each platform
-            "credential-process-macos-arm64",
-            "credential-process-macos-intel",
-            "credential-process-linux-x64",
-            "credential-process-linux-arm64",
-            "credential-process-windows.exe",
-            # OTEL helpers
-            "otel-helper-macos-arm64",
-            "otel-helper-macos-intel",
-            "otel-helper-linux-x64",
-            "otel-helper-linux-arm64",
-            "otel-helper-windows.exe",
-            # Installation scripts
-            "install.sh",
-            "install.bat",
-            # Configuration
-            "config.json",
-            "README.md",
-        ]
-
-        # Also include claude-settings directory if it exists
-        settings_dir = package_path / "claude-settings"
-        if settings_dir.exists() and settings_dir.is_dir():
-            shutil.copytree(settings_dir, package_temp_dir / "claude-settings")
-
-        # Copy only the required files
-        for filename in required_files:
-            source_file = package_path / filename
-            if source_file.exists():
-                shutil.copy2(source_file, package_temp_dir / filename)
-
-        # Create zip archive with contents at root level
-        # When extracted, it will create claude-code-package/ with files directly inside
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Add all files from the package directory
-            for file in package_temp_dir.rglob("*"):
-                if file.is_file():
-                    # Get relative path from package_temp_dir (not temp_dir) to avoid nested directories
-                    # This creates paths like "config.json", "install.sh" instead of "claude-code-package/config.json"
-                    arcname = f"claude-code-package/{file.relative_to(package_temp_dir)}"
-                    zf.write(file, arcname)
-
-        # Clean up temp package directory
-        shutil.rmtree(package_temp_dir)
+            for entry in to_include:
+                if entry.is_file():
+                    zf.write(entry, f"claude-code-package/{entry.name}")
+                else:
+                    for file in entry.rglob("*"):
+                        if file.is_file():
+                            arcname = f"claude-code-package/{file.relative_to(package_path)}"
+                            zf.write(file, arcname)
 
         return archive_path
 

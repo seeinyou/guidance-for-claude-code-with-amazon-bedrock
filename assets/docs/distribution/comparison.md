@@ -223,13 +223,15 @@ A: No, they use the same CloudFormation stack name. Choose one per deployment.
 A: Run `ccwb init` to reconfigure, then `ccwb deploy distribution` to update the stack.
 
 **Q: Do both types work with the same `ccwb distribute` command?**
-A: Yes! The publish process is identical. Only the download method differs.
+A: Yes, same command. The default is to list per-platform bundles and exit.
+Landing-page uploads each bundle separately by default; presigned-s3 requires
+`--archive-all` to build and upload a combined zip plus a presigned URL.
 
 **Q: Can users download without authentication on the landing page?**
 A: No, ALB requires IdP authentication before users can access the landing page.
 
 **Q: What happens if presigned URLs expire?**
-A: For presigned-s3: Generate new URLs with `ccwb distribute`. For landing-page: URLs regenerate automatically when users visit.
+A: For presigned-s3: regenerate by running `ccwb distribute --archive-all`. For landing-page: URLs regenerate automatically when users visit.
 
 **Q: Can I use a custom domain?**
 A: Landing page supports custom domains via Route53. Presigned-s3 uses S3 URLs directly.

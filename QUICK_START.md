@@ -160,9 +160,9 @@ poetry run ccwb package --target-platform=linux-arm64
 poetry run ccwb package --target-platform=linux-x64 --slim
 poetry run ccwb package --target-platform=linux-arm64 --slim
 
-# Drop the otel_helper/ payload to shrink the bundle (OTLP still works, but
-# CloudWatch metrics lose per-user attributes like email / team / cost_center)
-poetry run ccwb package --target-platform=macos-arm64 --no-otel-helper
+# otel_helper/ is off by default to keep bundles small. Opt in when you need
+# per-user attributes (email / team / cost_center) on CloudWatch metrics.
+poetry run ccwb package --target-platform=macos-arm64 --with-otel-helper
 
 # Include 'Co-Authored-By: Claude' footer in end users' git commits.
 # Default is off; the flag opts in. In non-interactive shells (CI, pipes)
@@ -251,10 +251,19 @@ zip -r claude-code-packages.zip .
 Automated distribution via time-limited S3 URLs:
 
 ```bash
+# Default: no combined-zip is produced. The command only prints the
+# per-platform bundle list so you can share directories / per-platform zips.
 poetry run ccwb distribute
+
+# Opt in to the legacy single-zip upload + presigned URL flow:
+poetry run ccwb distribute --archive-all
 ```
 
-Generates presigned URLs (default 48-hour expiry) that you share with users via email or messaging.
+`--archive-all` zips every `{platform}-portable/` and `-slim/` directory into
+one `claude-code-package.zip`, uploads it, and stores a presigned URL (default
+48-hour expiry) in Parameter Store. Off by default because combined bundles
+get large (all 5 portable variants ≈ hundreds of MB) and most teams hand out
+the specific per-platform bundle a user needs.
 
 **Best for:** Automated distribution without authentication requirements
 

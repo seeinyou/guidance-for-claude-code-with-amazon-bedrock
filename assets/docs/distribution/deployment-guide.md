@@ -120,11 +120,10 @@ poetry run ccwb package --target-platform=linux-arm64
 poetry run ccwb package --target-platform=linux-x64 --slim
 poetry run ccwb package --target-platform=linux-arm64 --slim
 
-# Skip otel_helper/ to shrink the bundle. OTLP metrics still ship, but they
-# arrive without per-user attributes (email / team / cost_center), so the
-# dashboard can't split usage by user. Useful when those dimensions aren't
-# needed downstream.
-poetry run ccwb package --target-platform=macos-arm64 --no-otel-helper
+# otel_helper/ is off by default to keep bundles small. Opt in when you need
+# per-user attributes (email / team / cost_center) on CloudWatch metrics so
+# the dashboard can split usage by user. OTLP metrics still flow without it.
+poetry run ccwb package --target-platform=macos-arm64 --with-otel-helper
 ```
 
 This creates one portable (or slim) bundle directory per platform under `dist/<profile>/<timestamp>/`:
@@ -138,18 +137,29 @@ Each bundle ships `install.sh` / `install.bat`, `config.json`, `claude-settings/
 
 ### Step 4: Distribute Packages
 
-Upload packages and generate presigned URLs:
+By default `ccwb distribute` only lists the per-platform bundles it found and
+exits — no combined zip, no S3 upload, no presigned URL. Share the specific
+`{platform}-portable/` or `-slim/` directories the user needs (or zip each one
+yourself).
+
+To reproduce the legacy single-zip + presigned-URL flow, opt in explicitly:
 
 ```bash
-poetry run ccwb distribute
+poetry run ccwb distribute --archive-all
 ```
 
+`--archive-all` bundles every `{platform}-portable/` and `-slim/` directory
+into one `claude-code-package.zip`, uploads it, and stores a presigned URL.
 Output includes:
 
-- **Presigned URL**: Valid for 7 days (or custom expiry via `--expires-hours`)
+- **Presigned URL**: Valid for 48 hours by default (up to 168 via `--expires-hours`)
 - **SHA256 Checksum**: For package integrity verification
 - **Download Instructions**: For macOS/Linux and Windows
 - **File Size**: Package size information
+
+Combined zips are intentionally opt-in because they get large (all five
+portable variants ≈ hundreds of MB) and most teams hand each user only the
+specific bundle for their platform.
 
 ### Step 5: Share with Users
 
@@ -722,47 +732,48 @@ poetry run ccwb package --target-platform linux
 
 Packages are created in `dist/` directory:
 
-- Credential process executables for each platform
-- OTEL helper executables (if monitoring enabled)
-- Installation scripts (`install.sh`, `install.bat`)
-- Configuration file (`config.json`)
-- Claude Code settings directory (if configured)
+- One self-contained directory per platform (`{platform}-portable/`,
+  `{platform}-slim/`) with embedded Python, `credential_provider/`,
+  `credential-process` wrapper, `install.sh` / `install.bat` + `install.ps1`
+- Optional `otel_helper/` inside a bundle (opt-in via `--with-otel-helper`)
+- Top-level `config.json` and `claude-settings/` copied into each bundle
 
 ### Distribute Packages
-
-Upload packages and generate distribution URLs:
 
 ```bash
 poetry run ccwb distribute
 ```
 
-**For presigned-s3**:
+**Default behavior** (both distribution types):
 
-- Uploads package to S3
-- Generates presigned URL (7-day expiry)
-- Displays URL and download instructions
-- Admin shares URL with users
+- Scans the package directory and prints the per-platform bundles it found
+- Does **not** build a combined zip
+- For `landing-page`, uploads each bundle separately (one S3 object per
+  platform) and prints the landing page URL
+- For `presigned-s3`, exits after listing the bundles — no upload, no URL
 
-**For landing-page**:
+**Opt in to the legacy single-zip flow** (presigned-s3 only):
 
-- Uploads packages to S3
-- Displays landing page URL
-- Admin shares landing page URL with users
-- Users authenticate and download
+```bash
+poetry run ccwb distribute --archive-all
+```
 
-### Custom Expiry (Presigned-S3 Only)
+`--archive-all` bundles every `{platform}-portable/` and `-slim/` directory
+into one `claude-code-package.zip`, uploads it, and stores a presigned URL.
+
+### Custom Expiry (Presigned-S3 Only, requires `--archive-all`)
 
 Set custom expiry time (1-168 hours):
 
 ```bash
 # 48 hours (default)
-poetry run ccwb distribute --expires-hours 48
+poetry run ccwb distribute --archive-all --expires-hours 48
 
 # 1 hour (minimum)
-poetry run ccwb distribute --expires-hours 1
+poetry run ccwb distribute --archive-all --expires-hours 1
 
 # 7 days (168 hours, maximum)
-poetry run ccwb distribute --expires-hours 168
+poetry run ccwb distribute --archive-all --expires-hours 168
 ```
 
 **Note**: IAM user presigned URLs have a maximum lifetime of 7 days (168 hours).

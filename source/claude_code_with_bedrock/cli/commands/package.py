@@ -260,8 +260,8 @@ class PackageCommand(Command):
             flag=True,
         ),
         option(
-            "no-otel-helper",
-            description="Skip bundling otel_helper/ (smaller package; OTLP still works but user attributes won't tag CloudWatch metrics)",
+            "with-otel-helper",
+            description="Bundle otel_helper/ so CloudWatch metrics carry per-user attributes. Off by default to keep bundles small; OTLP metrics still flow without it.",
             flag=True,
         ),
         option(
@@ -484,7 +484,7 @@ class PackageCommand(Command):
 
         # Copy config.json + claude-settings/ into each bundle so the bundled
         # installer (install.ps1 / install.sh) finds them via its own directory.
-        include_otel_helper = profile.monitoring_enabled and not bool(self.option("no-otel-helper"))
+        include_otel_helper = profile.monitoring_enabled and bool(self.option("with-otel-helper"))
         if any(p == "windows" for p, _, _ in built_executables):
             self._finalize_windows_portable(output_dir)
         for platform_name, _, is_slim in built_executables:

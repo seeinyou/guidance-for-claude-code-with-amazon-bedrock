@@ -35,15 +35,23 @@ The package created by `ccwb package` contains everything needed for end-user in
 Explore the distribution directory:
 
 ```bash
-ls -la dist/
+ls -la dist/<profile>/<timestamp>/
 ```
 
-You'll find platform-specific executables (credential-process-macos and credential-process-linux), the configuration file with your organization's settings, and the intelligent installer script. If monitoring is enabled, you'll also see OTEL helper executables and Claude Code settings.
+Each build produces one self-contained directory per platform —
+`windows-portable/`, `macos-arm64-portable/`, `macos-intel-portable/`,
+`linux-x64-portable/`, `linux-arm64-portable/`, plus optional
+`linux-x64-slim/` / `linux-arm64-slim/`. Inside each you'll find an embedded
+Python runtime (for portable variants), `credential_provider/` source, the
+`credential-process` wrapper, the installer (`install.sh` or
+`install.bat` + `install.ps1`), a copy of `config.json`, and the
+`claude-settings/` template. `otel_helper/` is only included when
+`--with-otel-helper` was passed to `ccwb package`.
 
 The configuration file contains your OIDC provider details and the Cognito Identity Pool ID:
 
 ```bash
-cat dist/config.json | jq .
+cat dist/<profile>/<timestamp>/config.json | jq .
 ```
 
 This configuration gets copied to the user's home directory during installation, where the credential process reads it at runtime.

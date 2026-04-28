@@ -113,14 +113,21 @@ With a tested package in hand, you're ready for the final phase: getting the aut
 Generate a presigned URL for easy, secure distribution without requiring AWS credentials:
 
 ```bash
-# Create distribution with 48-hour expiration
+# Default: just lists the per-platform bundles that were built. No combined
+# zip, no S3 upload, no presigned URL.
 poetry run ccwb distribute
 
-# Or specify custom expiration (up to 7 days)
-poetry run ccwb distribute --expires-hours=72
+# Opt in to build a single combined zip, upload it, and get a presigned URL
+# (48-hour expiration by default; up to 7 days):
+poetry run ccwb distribute --archive-all
+poetry run ccwb distribute --archive-all --expires-hours=72
 ```
 
-The command uploads your package to S3 and generates a secure, time-limited URL. Share this URL with developers via email, Slack, or your internal wiki. Users download and run the installer - no AWS credentials required.
+`--archive-all` is required because a combined zip contains every platform
+bundle (hundreds of MB with all five portable variants) and most teams hand
+each user only the specific bundle for their platform. Share the presigned
+URL with developers via email, Slack, or your internal wiki. Users download
+and run the installer — no AWS credentials required.
 
 ### Option 2: Manual Distribution
 
